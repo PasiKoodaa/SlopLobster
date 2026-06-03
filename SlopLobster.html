@@ -4916,6 +4916,338 @@
       background: rgba(139,92,246,.1);
       border-color: rgba(139,92,246,.2);
     }
+
+    .research-toggle-btn {
+      background: var(--bg-3);
+      border: 1px solid var(--border);
+      color: var(--tx-3);
+      border-radius: 6px;
+      padding: 0 6px;
+      height: 26px;
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      cursor: pointer;
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      transition: all 0.15s;
+      white-space: nowrap;
+    }
+    .research-toggle-btn:hover {
+      border-color: var(--accent-d);
+      color: var(--tx-1);
+      background: var(--bg-2);
+    }
+    .research-toggle-btn.active {
+      background: rgba(168, 85, 247, 0.15);
+      border-color: rgba(168, 85, 247, 0.5);
+      color: #a855f7;
+    }
+    .research-badge {
+      font-size: 8px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      padding: 1px 3px;
+      border-radius: 3px;
+      background: rgba(168, 85, 247, 0.2);
+      color: #a855f7;
+    }
+    .research-panel {
+      border: 1px solid rgba(168, 85, 247, 0.3);
+      border-radius: 8px;
+      margin: 8px 0;
+      background: rgba(168, 85, 247, 0.03);
+      overflow: hidden;
+    }
+    .research-hdr {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+      background: rgba(168, 85, 247, 0.05);
+      cursor: pointer;
+    }
+    .research-hdr i {
+      color: #a855f7;
+    }
+    .research-title {
+      font-weight: 600;
+      font-size: 12px;
+      color: #d8b4fe;
+    }
+    .research-status {
+      margin-left: auto;
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--tx-4);
+    }
+    .research-body {
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--tx-1);
+    }
+    .research-body h1, .research-body h2, .research-body h3 {
+      color: #d8b4fe;
+      border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+      padding-bottom: 4px;
+      margin-top: 12px;
+    }
+    .research-sources {
+      margin-top: 12px;
+      padding-top: 8px;
+      border-top: 1px solid var(--border);
+      font-size: 10px;
+      color: var(--tx-4);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .research-sources a {
+      color: #a855f7;
+      text-decoration: none;
+    }
+    .research-sources a:hover {
+      text-decoration: underline;
+    }
+    .deep-research-panel {
+      border: 1px solid rgba(168, 85, 247, 0.3);
+      border-radius: 8px;
+      margin: 0;
+      background: var(--bg-2);
+      overflow: hidden;
+    }
+    .dr-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      background: rgba(168, 85, 247, 0.05);
+      border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+      cursor: pointer;
+    }
+    .dr-header i { color: #a855f7; font-size: 14px; }
+    .dr-title { font-weight: 600; font-size: 13px; color: #d8b4fe; flex: 1; }
+    .dr-status { font-size: 10px; color: var(--tx-4); font-family: 'JetBrains Mono', monospace; }
+    .dr-body { 
+      padding: 14px; 
+      max-height: 60vh; /* Prevent taking over the whole screen */
+      overflow-y: auto; /* Scroll within the panel if it gets too tall */
+    }
+    
+    /* Collapsible main body */
+    .deep-research-panel.collapsed .dr-body { display: none; }
+    
+    /* Stepper / Timeline Layout */
+    .dr-phase {
+      display: flex;
+      gap: 12px;
+      margin-bottom: 16px;
+      opacity: 0.5;
+      transition: opacity 0.3s;
+    }
+    .dr-phase.active, .dr-phase.done { opacity: 1; }
+    
+    .dr-phase-indicator {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .dr-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--bg-3);
+      border: 2px solid var(--tx-4);
+      flex-shrink: 0;
+    }
+    .dr-phase.active .dr-dot { border-color: #a855f7; background: #a855f7; box-shadow: 0 0 8px rgba(168, 85, 247, 0.5); }
+    .dr-phase.done .dr-dot { border-color: var(--green); background: var(--green); }
+    .dr-dot-error { border-color: var(--red) !important; background: var(--red) !important; }
+    .dr-line {
+      width: 2px;
+      flex: 1;
+      background: var(--border);
+      margin: 4px 0;
+    }
+    .dr-phase.done .dr-line { background: var(--green); }
+    
+    .dr-phase-content { flex: 1; padding-bottom: 8px; overflow: hidden;}
+    .dr-phase-title {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--tx-2);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+      cursor: pointer; /* Make title clickable to toggle details */
+      user-select: none;
+    }
+    .dr-phase.active .dr-phase-title { color: #d8b4fe; }
+    .dr-phase.done .dr-phase-title { color: var(--green); }
+    
+    /* Hide details only if the phase is explicitly collapsed */
+    .dr-phase-details { display: block; }
+    .dr-phase.dr-phase-collapsed .dr-phase-details { display: none; }
+    /* Ensure the final synthesis phase is NEVER collapsed when done */
+    .dr-phase.dr-phase-synth.done .dr-phase-details { display: block !important; }
+    
+    .dr-spinner {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border: 2px solid rgba(168, 85, 247, 0.3);
+      border-top-color: #a855f7;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    
+    .dr-query-list, .dr-source-list {
+      list-style: none;
+      padding: 0;
+      margin: 0;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      max-height: 100px; /* Limit list height */
+      overflow-y: auto; /* Scroll inside list */
+    }
+    .dr-query-item, .dr-source-item {
+      padding: 4px 8px;
+      border-radius: 4px;
+      margin-bottom: 2px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-1);
+    }
+    .dr-query-item i, .dr-source-item i { color: var(--tx-4); font-size: 9px; flex-shrink: 0;}
+    .dr-source-item a { color: #a855f7; text-decoration: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dr-source-item a:hover { text-decoration: underline; }
+    
+    .dr-report {
+      border-top: 1px solid var(--border);
+      padding-top: 12px;
+      margin-top: 8px;
+      line-height: 1.7;
+      font-size: 13px;
+    }
+    .dr-report h1, .dr-report h2, .dr-report h3 {
+      color: #d8b4fe;
+      border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+      padding-bottom: 4px;
+      margin: 14px 0 8px;
+    }
+    .dr-report h1 { font-size: 16px; }
+    .dr-report h2 { font-size: 14px; }
+    .dr-report h3 { font-size: 13px; }
+    .dr-report p { margin-bottom: 10px; color: var(--tx-1); }
+    .dr-report ul, .dr-report ol { padding-left: 18px; margin-bottom: 10px; color: var(--tx-1); }
+    .dr-report li { margin-bottom: 4px; line-height: 1.6; }
+    .dr-report a { color: #a855f7; text-decoration: none; }
+    .dr-report a:hover { text-decoration: underline; }
+    .dr-report code { background: var(--bg-3); padding: 1px 5px; border-radius: 3px; font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--cyan); }
+    .dr-report blockquote { border-left: 3px solid rgba(168, 85, 247, 0.4); padding-left: 10px; color: var(--tx-2); margin: 8px 0; }
+    .dr-report strong { color: var(--tx-0); }
+
+    /* Report action bar */
+    .dr-report-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 0 0;
+      border-top: 1px solid var(--border);
+      margin-top: 14px;
+    }
+    .dr-act-btn {
+      background: var(--bg-3);
+      border: 1px solid var(--border);
+      color: var(--tx-3);
+      border-radius: 5px;
+      padding: 4px 10px;
+      font-size: 10px;
+      font-family: 'JetBrains Mono', monospace;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      transition: .15s;
+    }
+    .dr-act-btn:hover { background: var(--bg-4); color: var(--tx-0); border-color: var(--border-l); }
+    .dr-act-btn.copied { color: var(--green); border-color: rgba(34,197,94,.3); }
+
+    /* Abort button inside panel */
+    .dr-abort-btn {
+      background: none;
+      border: 1px solid rgba(239,68,68,.3);
+      color: var(--red);
+      border-radius: 5px;
+      padding: 2px 8px;
+      font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+      cursor: pointer;
+      transition: .12s;
+      white-space: nowrap;
+    }
+    .dr-abort-btn:hover { background: rgba(239,68,68,.1); border-color: var(--red); }
+
+    /* Depth selector popover */
+    .dr-depth-popup {
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 0;
+      background: var(--bg-1);
+      border: 1px solid var(--border-l);
+      border-radius: 8px;
+      padding: 10px;
+      min-width: 200px;
+      box-shadow: 0 8px 24px rgba(0,0,0,.5);
+      z-index: 200;
+      font-size: 11px;
+    }
+    .dr-depth-popup-title {
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--tx-4);
+      text-transform: uppercase;
+      letter-spacing: .8px;
+      margin-bottom: 8px;
+    }
+    .dr-depth-option {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 8px;
+      border-radius: 5px;
+      cursor: pointer;
+      transition: .12s;
+      margin-bottom: 2px;
+    }
+    .dr-depth-option:hover { background: var(--bg-3); }
+    .dr-depth-option.selected { background: rgba(168,85,247,.12); border: 1px solid rgba(168,85,247,.25); }
+    .dr-depth-option-label { font-weight: 600; color: var(--tx-1); font-size: 11px; }
+    .dr-depth-option-desc { font-size: 10px; color: var(--tx-4); }
+    .dr-depth-option i { color: #a855f7; font-size: 10px; width: 14px; text-align: center; }
+
+    /* Phase stats badge */
+    .dr-phase-stat {
+      font-size: 9px;
+      font-family: 'JetBrains Mono', monospace;
+      color: var(--tx-4);
+      background: var(--bg-3);
+      padding: 1px 5px;
+      border-radius: 3px;
+      margin-left: auto;
+    }
+    .dr-phase.active .dr-phase-stat { color: #a855f7; background: rgba(168,85,247,.12); }
+    .dr-phase.done .dr-phase-stat { color: var(--green); background: rgba(34,197,94,.08); }
+
+    /* Streaming synthesis text */
+    #dr-report.streaming::after {
+      content: '▋';
+      color: #a855f7;
+      animation: blink .8s step-start infinite;
+      font-size: .85em;
+    }
   </style>
 </head>
 
@@ -5178,6 +5510,16 @@
               class="vision-badge off">text</span></button>
           <button class="plan-toggle-btn" id="plan-toggle-btn" onclick="togglePlanMode()" title="Plan Mode: break task into steps before executing"><i class="fas fa-list-check"></i><span class="plan-badge">PLAN</span></button>
           <button class="swarm-toggle-btn" id="swarm-toggle-btn" onclick="toggleSwarmInputMode()" title="Swarm Mode: run multiple agents in parallel"><i class="fas fa-network-wired"></i></button>
+          <div style="position:relative;display:inline-flex">
+            <button class="research-toggle-btn" id="research-toggle-btn" onclick="toggleDeepResearchInputMode()" title="Deep Research Mode: iterative web search and synthesis"><i class="fas fa-microscope"></i><span class="research-badge">RESEARCH</span><span id="research-depth-label" style="font-size:8px;color:var(--tx-4);margin-left:2px">·2</span></button>
+            <button onclick="toggleDrDepthPopup(event)" title="Set research depth" style="background:none;border:none;color:var(--tx-4);cursor:pointer;padding:0 3px;font-size:9px;transition:.12s" onmouseenter="this.style.color='var(--tx-1)'" onmouseleave="this.style.color='var(--tx-4)'"><i class="fas fa-chevron-up"></i></button>
+            <div class="dr-depth-popup" id="dr-depth-popup" style="display:none">
+              <div class="dr-depth-popup-title"><i class="fas fa-sliders" style="margin-right:4px"></i>Research Depth</div>
+              <div class="dr-depth-option" id="dr-depth-1" onclick="setDrDepth(1)"><i class="fas fa-bolt"></i><div><div class="dr-depth-option-label">Quick</div><div class="dr-depth-option-desc">4 queries · 3 sources · ~1 min</div></div></div>
+              <div class="dr-depth-option selected" id="dr-depth-2" onclick="setDrDepth(2)"><i class="fas fa-search"></i><div><div class="dr-depth-option-label">Standard</div><div class="dr-depth-option-desc">6 queries · 6 sources · ~2 min</div></div></div>
+              <div class="dr-depth-option" id="dr-depth-3" onclick="setDrDepth(3)"><i class="fas fa-microscope"></i><div><div class="dr-depth-option-label">Exhaustive</div><div class="dr-depth-option-desc">8 queries · 9 sources · ~4 min</div></div></div>
+            </div>
+          </div>
           <button class="input-action-btn" id="attach-btn" onclick="document.getElementById('file-input').click()"
             title="Attach file or drop here"><i class="fas fa-paperclip"></i></button>
           <input type="file" id="file-input" multiple style="display:none" onchange="handleFileAttach(this.files)">
@@ -7847,6 +8189,22 @@ Python command: {{PYTHON_CMD}}`;
               max_worker_iterations: { type: 'number', description: 'Default max iterations for all workers if not set individually (default 10)' }
             },
             required: ['goal', 'workers']
+          }
+        }
+      });
+
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'deep_research',
+          description: 'Perform deep iterative web research on a topic. Generates multiple search queries, reads top results using web_search and fetch_url, and synthesizes a comprehensive report with citations. Requires companion server. Use for complex questions requiring thorough investigation.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: 'The research question or topic to investigate deeply' },
+              depth: { type: 'number', description: 'Research depth: 1=Quick, 2=Standard (default), 3=Exhaustive' }
+            },
+            required: ['query']
           }
         }
       });
@@ -10796,6 +11154,47 @@ Python command: {{PYTHON_CMD}}`;
               };
             }
             break;
+
+          case 'deep_research':
+            if (!state.compConnected) return { output: 'deep_research requires the companion server to access web_search and fetch_url.' };
+            if (!args.query) return { output: 'Error: "query" is required for deep_research.' };
+            {
+              // Prefer the UI depth selector (_drDepth) over whatever the LLM guessed
+              const depth = Math.min(Math.max(
+                (typeof _drDepth !== 'undefined' ? _drDepth : null) || args.depth || 2,
+                1), 3);
+              const livePanel = createLiveResearchPanel(args.query);
+              
+              if (panel && panel.el) {
+                panel.el.classList.add('screenshot-tool');
+                panel.el.appendChild(livePanel);
+                const resEl = panel.el.querySelector('.tool-result');
+                if (resEl) resEl.style.display = 'none';
+              }
+              
+              let result;
+              try {
+                result = await runDeepResearch(args.query, depth, signal, livePanel);
+              } catch (drErr) {
+                console.error('[deep_research] uncaught error:', drErr);
+                const statusEl = livePanel.querySelector('.dr-status');
+                if (statusEl) statusEl.textContent = '❌ ' + drErr.message;
+                let dbgLog = livePanel.querySelector('.dr-debug-log');
+                if (!dbgLog) {
+                  dbgLog = document.createElement('div');
+                  dbgLog.className = 'dr-debug-log';
+                  dbgLog.style.cssText = 'font-size:9px;font-family:JetBrains Mono,monospace;color:var(--red);padding:6px 8px;white-space:pre-wrap;';
+                  livePanel.querySelector('.dr-body')?.appendChild(dbgLog);
+                }
+                dbgLog.textContent += '\nUNCAUGHT: ' + (drErr.stack || drErr.message);
+                result = { output: 'Deep research failed: ' + drErr.message, _sources: [], _researchData: null };
+              }
+              
+              if (panel && panel.el) {
+                 panel.el._researchData = result._researchData;
+              }
+              return result;
+            }
 
           case 'spawn_sub_agent':
             if (!args.task) return { output: 'Error: "task" is required for spawn_sub_agent' };
@@ -14026,6 +14425,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               continue;
             }
 
+
             /* ── PDF thumbnail preview ── */
             if (panel.el._pdfThumbnail && !panel.el.querySelector('.screenshot-preview')) {
               panel.el.classList.add('screenshot-tool');
@@ -15510,9 +15910,17 @@ Use git_diff to review changes before committing. git_diff without arguments sho
                   if (res) res.style.display = 'none';
                 }
 
+
                 /* ── Swarm panel replay ── */
                 if (toolMsg._swarmData) {
                   showSwarmPanel(toolMsg._swarmData, panel.el);
+                  const res = panel.el.querySelector('.tool-result');
+                  if (res) res.style.display = 'none';
+                }
+
+                /* ── Deep Research panel replay ── */
+                if (toolMsg._researchData) {
+                  showResearchPanel(toolMsg._researchData, panel.el);
                   const res = panel.el.querySelector('.tool-result');
                   if (res) res.style.display = 'none';
                 }
@@ -16159,6 +16567,13 @@ Format:
         const taskText = state.messages[state.messages.length - 1]?.content || t;
         await handlePlanRequest(taskText);
         return;
+      }
+
+      /* ── Deep Research mode: inject instruction ── */
+      if (_deepResearchInputMode && t) {
+        const depthLabel = _drDepth === 1 ? 'quick' : _drDepth === 3 ? 'exhaustive' : 'standard';
+        const researchInstruction = `Use the deep_research tool with depth=${_drDepth} to perform a ${depthLabel} investigation on the following topic. Provide a comprehensive, well-synthesized report with citations.\n\nTopic: ${t}`;
+        state.messages[state.messages.length - 1] = { role: 'user', content: researchInstruction };
       }
 
       agentLoop();
@@ -18103,6 +18518,737 @@ Format:
       }
       showToast(_swarmInputMode ? 'Swarm mode ON — agents will run in parallel' : 'Swarm mode OFF', 'info');
     }
+
+    /* ═══════════════ DEEP RESEARCH ═══════════════ */
+    let _deepResearchInputMode = false;
+
+    function toggleDeepResearchInputMode() {
+      _deepResearchInputMode = !_deepResearchInputMode;
+      const btn = document.getElementById('research-toggle-btn');
+      const inp = document.getElementById('msg-input');
+      if (btn) btn.classList.toggle('active', _deepResearchInputMode);
+      if (inp) {
+        inp.placeholder = _deepResearchInputMode
+          ? 'Enter a topic for deep research (live iterative search & synthesis)...'
+          : (state.planMode ? 'Describe a task to plan...' : _swarmInputMode ? 'Describe a goal for the swarm...' : 'Ask SlopLobster to do something...');
+      }
+      showToast(_deepResearchInputMode ? 'Deep Research ON — agent will plan, search, and synthesize live' : 'Deep Research OFF', 'info');
+    }
+
+    /**
+     * Helper: Non-streaming LLM call for tool internal logic.
+     */
+    async function callLLMForTool(messages, temperature = 0.2, maxTokens = 2000) {
+      if (!state.connected || !state.model) throw new Error('LLM not connected');
+      const res = await fetch(`${state.apiUrl}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: state.model,
+          messages,
+          temperature,
+          max_tokens: Math.min(maxTokens, 4000),
+          stream: false
+        }),
+        signal: AbortSignal.timeout(120000)
+      });
+      if (!res.ok) {
+        const err = await res.text().catch(() => res.statusText);
+        throw new Error('LLM call failed: ' + err.slice(0, 100));
+      }
+      const data = await res.json();
+      return data.choices?.[0]?.message?.content || '';
+    }
+
+    /**
+     * Creates the initial DOM structure for the live research panel.
+     * DOES NOT append to DOM. The caller (executeTool) will append it inside the tool panel.
+     */
+    function createLiveResearchPanel(query) {
+      const el = document.createElement('div');
+      el.className = 'deep-research-panel';
+      el.innerHTML = `
+        <div class="dr-header" onclick="this.parentElement.classList.toggle('collapsed')">
+          <i class="fas fa-microscope"></i>
+          <div class="dr-title">Deep Research: ${esc(query)}</div>
+          <div class="dr-status">Initializing...</div>
+          <button class="dr-abort-btn" onclick="event.stopPropagation(); this.closest('.deep-research-panel')._drAbortFn && this.closest('.deep-research-panel')._drAbortFn()" style="margin-left:8px">
+            <i class="fas fa-stop"></i> Abort
+          </button>
+        </div>
+        <div class="dr-body">
+          <!-- Phase 1: Plan -->
+          <div class="dr-phase dr-phase-plan">
+            <div class="dr-phase-indicator"><div class="dr-dot"></div><div class="dr-line"></div></div>
+            <div class="dr-phase-content">
+              <div class="dr-phase-title" onclick="this.closest('.dr-phase').classList.toggle('dr-phase-collapsed')">
+                <i class="fas fa-brain"></i> Planning Research
+                <span class="dr-phase-stat dr-stat-plan">—</span>
+              </div>
+              <div class="dr-phase-details"><ul class="dr-query-list dr-queries"></ul></div>
+            </div>
+          </div>
+          <!-- Phase 2: Search -->
+          <div class="dr-phase dr-phase-search">
+            <div class="dr-phase-indicator"><div class="dr-dot"></div><div class="dr-line"></div></div>
+            <div class="dr-phase-content">
+              <div class="dr-phase-title" onclick="this.closest('.dr-phase').classList.toggle('dr-phase-collapsed')">
+                <i class="fas fa-globe"></i> Searching Web
+                <span class="dr-phase-stat dr-stat-search">—</span>
+              </div>
+              <div class="dr-phase-details"><ul class="dr-source-list dr-search-results"></ul></div>
+            </div>
+          </div>
+          <!-- Phase 3: Read -->
+          <div class="dr-phase dr-phase-read">
+            <div class="dr-phase-indicator"><div class="dr-dot"></div><div class="dr-line"></div></div>
+            <div class="dr-phase-content">
+              <div class="dr-phase-title" onclick="this.closest('.dr-phase').classList.toggle('dr-phase-collapsed')">
+                <i class="fas fa-book-open"></i> Reading Sources
+                <span class="dr-phase-stat dr-stat-read">—</span>
+              </div>
+              <div class="dr-phase-details"><ul class="dr-source-list dr-read-results"></ul></div>
+            </div>
+          </div>
+          <!-- Phase 4: Synthesize -->
+          <div class="dr-phase dr-phase-synth">
+            <div class="dr-phase-indicator"><div class="dr-dot"></div></div>
+            <div class="dr-phase-content">
+              <div class="dr-phase-title">
+                <i class="fas fa-wand-magic-sparkles"></i> Synthesizing Report
+                <span class="dr-phase-stat dr-stat-synth">—</span>
+              </div>
+              <div class="dr-phase-details">
+                <div class="dr-report" style="display:none"></div>
+                <div class="dr-report-actions" style="display:none">
+                  <button class="dr-act-btn" onclick="drCopyReport(this)"><i class="fas fa-copy"></i> Copy</button>
+                  <button class="dr-act-btn" onclick="drExportReport(this)"><i class="fas fa-download"></i> Export .md</button>
+                  <span class="dr-source-count" style="font-size:9px;color:var(--tx-4);font-family:'JetBrains Mono',monospace;margin-left:auto"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+      return el;
+    }
+
+    /**
+     * Runs the deep research loop, updating the provided panel element live.
+     * Uses executeTool to invoke web_search and fetch_url.
+     */
+    async function runDeepResearch(query, depth = 2, signal, panelEl) {
+      const startTime = performance.now();
+      const sources = [];
+      let report = 'Research failed to complete.';
+      let _reportText = '';
+      
+      const setStatus = (text) => {
+        const statusEl = panelEl?.querySelector('.dr-status');
+        if (statusEl) statusEl.textContent = text;
+      };
+
+      const setStat = (cls, text) => {
+        // cls is like '.dr-stat-plan' — query within the panel
+        const el = panelEl?.querySelector(cls);
+        if (el) el.textContent = text;
+      };
+
+      // Wire abort button to the panel instance (not window, to support multiple panels)
+      if (panelEl) {
+        panelEl._drAbortFn = () => {
+          panelEl._drAborted = true;
+          const abortBtn = panelEl.querySelector('.dr-abort-btn');
+          if (abortBtn) { abortBtn.disabled = true; abortBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Aborting…'; }
+        };
+        panelEl._drAborted = false;
+      }
+
+      const isAborted = () => signal?.aborted || panelEl?._drAborted;
+
+      // Phase class names match .dr-phase-plan, .dr-phase-search etc.
+      const activatePhase = (phaseClass) => {
+        const phaseOrder = ['dr-phase-plan', 'dr-phase-search', 'dr-phase-read', 'dr-phase-synth'];
+        const currentIdx = phaseOrder.indexOf(phaseClass);
+        const phases = panelEl?.querySelectorAll('.dr-phase');
+        phases?.forEach(p => {
+          const pClass = phaseOrder.find(c => p.classList.contains(c));
+          if (!pClass) return;
+          const pIdx = phaseOrder.indexOf(pClass);
+
+          if (pClass === phaseClass) {
+            p.classList.add('active');
+            p.classList.remove('dr-phase-collapsed');
+          } else if (pIdx < currentIdx) {
+            p.classList.remove('active');
+            p.classList.add('done');
+            if (pClass !== 'dr-phase-synth') p.classList.add('dr-phase-collapsed');
+
+            const icon = p.querySelector('.dr-phase-title i');
+            if (icon) icon.className = 'fas fa-check-circle';
+
+            if (pClass === 'dr-phase-plan') {
+              const count = p.querySelectorAll('.dr-query-item').length;
+              setStat('.dr-stat-plan', `${count} queries`);
+            } else if (pClass === 'dr-phase-search') {
+              const count = p.querySelectorAll('.dr-source-item').length;
+              setStat('.dr-stat-search', `${count} URLs`);
+            } else if (pClass === 'dr-phase-read') {
+              const ok = p.querySelectorAll('.dr-source-item i.fa-check').length;
+              const total = p.querySelectorAll('.dr-source-item').length;
+              setStat('.dr-stat-read', `${ok}/${total} ok`);
+            }
+          }
+        });
+        scrollBottom();
+      };
+
+      // ── Current date string injected into every prompt ──────────────
+      const now = new Date();
+      const todayStr = now.toLocaleDateString('en-GB', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+      const todayISO = now.toISOString().slice(0, 10); // YYYY-MM-DD
+
+      // ── Helper: check if fetched content is usable ───────────────────
+      const isUsableContent = (text) => {
+        if (!text || text.length < 150) return false;
+        if (text.includes('[Fetch error]')) return false;
+        if (text.includes('[Browser Error]')) return false;
+        if (text.includes('JavaScript-rendered')) return false;
+        if (text.includes('[Truncated at 0')) return false;
+        const words = text.replace(/<[^>]+>/g, ' ').split(/\s+/).filter(w => w.length > 2);
+        return words.length > 30;
+      };
+
+      // ── Helper: extract actual content from browser_get_content output ─
+      const extractBrowserContent = (raw) => {
+        // Strip the "Page content (text, N chars):\n---\n" header added by browserApi
+        const marker = '---\n';
+        const idx = raw.indexOf(marker);
+        return idx !== -1 ? raw.slice(idx + marker.length) : raw;
+      };
+
+      // ── Track whether browser is already open for this research session ─
+      let _browserOpenForResearch = false;
+
+      const ensureBrowserOpen = async () => {
+        if (_browserOpenForResearch) return true;
+        try {
+          const out = await browserApi('/browser_launch', { headless: true });
+          if (out.includes('[Browser Error]')) return false;
+          _browserOpenForResearch = true;
+          return true;
+        } catch (e) { return false; }
+      };
+
+      const closeBrowserIfOpened = async () => {
+        if (!_browserOpenForResearch) return;
+        try { await browserApi('/browser_close', {}); } catch (e) {}
+        _browserOpenForResearch = false;
+      };
+
+      // ── Helper: fetch one URL with Playwright ────────────────────────
+      const playwrightFetch = async (url) => {
+        const launched = await ensureBrowserOpen();
+        if (!launched) return null;
+        try {
+          // Navigate and wait for network to settle
+          const navOut = await browserApi('/browser_navigate', { url, wait_until: 'networkidle' });
+          if (navOut.includes('[Browser Error]')) {
+            // Try with looser wait condition
+            const navOut2 = await browserApi('/browser_navigate', { url, wait_until: 'domcontentloaded' });
+            if (navOut2.includes('[Browser Error]')) return null;
+          }
+          // Try to grab main article body first, fall back to full page
+          for (const selector of ['article', 'main', '[role="main"]', '.article-body', '.story-body', '.post-content', 'body']) {
+            const contentOut = await browserApi('/browser_get_content', { selector, mode: 'text' });
+            if (!contentOut.includes('[Browser Error]')) {
+              const content = extractBrowserContent(contentOut);
+              if (isUsableContent(content)) {
+                return content.length > 6000 ? content.slice(0, 6000) + '\n… [truncated]' : content;
+              }
+            }
+          }
+          return null;
+        } catch (e) { return null; }
+      };
+
+      // ── Helper: try fetching with multiple strategies ─────────────────
+      // Order: fetchViaCompanion → Playwright → AMP cache → snippet
+      const smartFetch = async (url, snippet, title) => {
+        // Strategy 1: plain HTTP fetch via companion (fast, works for static/API sites)
+        try {
+          const text = await fetchViaCompanion(url, 40000);
+          if (isUsableContent(text)) {
+            return { content: text.length > 5000 ? text.slice(0, 5000) + '\n… [truncated]' : text, via: 'fetch' };
+          }
+        } catch (e) { /* try next */ }
+
+        // Strategy 2: Playwright headless browser (handles JS-rendered pages)
+        if (state.browserAvailable) {
+          try {
+            const pwContent = await playwrightFetch(url);
+            if (pwContent) return { content: pwContent, via: 'browser' };
+          } catch (e) { /* try next */ }
+        }
+
+        // Strategy 3: Google AMP cache (static HTML mirror of many news articles)
+        try {
+          const noScheme = url.replace(/^https?:\/\//, '');
+          const domain = noScheme.split('/')[0];
+          const ampDomain = domain.replace(/\./g, '-').replace(/-([^-]+)$/, '.$1') + '.cdn.ampproject.org';
+          const isHttps = url.startsWith('https');
+          const ampUrl = `https://${ampDomain}/c/${isHttps ? 's/' : ''}${noScheme}`;
+          const text3 = await fetchViaCompanion(ampUrl, 40000);
+          if (isUsableContent(text3)) {
+            return { content: text3.length > 5000 ? text3.slice(0, 5000) + '\n… [truncated]' : text3, via: 'amp' };
+          }
+        } catch (e) { /* try next */ }
+
+        // Strategy 4: Search snippet as last resort
+        if (snippet && snippet.length > 60) {
+          return {
+            content: `Title: ${title || url}\nURL: ${url}\nSnippet: ${snippet}\n\n[Full page could not be fetched — content derived from search snippet only]`,
+            via: 'snippet'
+          };
+        }
+
+        return null;
+      };
+
+      // ── Diagnostic log visible in the panel status bar ──────────────
+      const drLog = (msg, level = 'info') => {
+        const colors = { info: 'var(--tx-3)', warn: 'var(--yellow)', error: 'var(--red)', ok: 'var(--green)' };
+        console[level === 'error' ? 'error' : level === 'warn' ? 'warn' : 'log']('[DR]', msg);
+        setStatus(msg);
+        // Also append to a debug log inside the panel
+        if (panelEl) {
+          let log = panelEl.querySelector('.dr-debug-log');
+          if (!log) {
+            log = document.createElement('div');
+            log.className = 'dr-debug-log';
+            log.style.cssText = 'font-size:9px;font-family:JetBrains Mono,monospace;color:var(--tx-4);padding:4px 8px;max-height:80px;overflow-y:auto;border-top:1px solid var(--border);margin-top:4px;';
+            panelEl.querySelector('.dr-body')?.appendChild(log);
+          }
+          const line = document.createElement('div');
+          line.style.color = colors[level] || 'var(--tx-4)';
+          line.textContent = `${new Date().toISOString().slice(11,19)} ${msg}`;
+          log.appendChild(line);
+          log.scrollTop = log.scrollHeight;
+        }
+      };
+
+      try {
+        // ── Step 0: Rewrite user intent (best-effort, skip if model returns empty) ──
+        activatePhase('dr-phase-plan');
+        drLog('Analyzing query intent…');
+        setStat('.dr-stat-plan', 'analyzing…');
+
+        let researchTopic = query;
+        try {
+          drLog(`LLM connected: ${state.connected}, model: ${state.model}, apiUrl: ${state.apiUrl}`);
+          const intentMessages = [
+            { role: 'user', content: `What is the core research topic in this request? Reply with only the topic, no explanation.\n\nRequest: "${query}"` }
+          ];
+          const topicResult = await callLLMForTool(intentMessages, 0.2, 80);
+          drLog(`Intent result: "${topicResult?.slice(0,60)}"`, 'ok');
+          // Only use it if it's a short focused phrase (not a long essay or empty)
+          const cleaned = topicResult?.trim().replace(/^["'`]|["'`]$/g, '') || '';
+          if (cleaned.length > 5 && cleaned.length < 200 && !cleaned.includes('\n')) {
+            researchTopic = cleaned;
+          }
+        } catch (e) {
+          drLog(`Intent rewrite skipped: ${e.message}`, 'warn');
+        }
+
+        // Show interpreted topic in panel title if different
+        if (researchTopic !== query) {
+          const titleEl = panelEl?.querySelector('.dr-title');
+          if (titleEl) {
+            titleEl.innerHTML = `Deep Research: <span style="color:var(--tx-1)">${esc(researchTopic)}</span><span style="font-size:10px;color:var(--tx-4);margin-left:6px">from: "${esc(query.length > 45 ? query.slice(0,42)+'…' : query)}"</span>`;
+          }
+        }
+
+        // Phase 1: Plan search queries — simple prompt that small models can follow
+        drLog('Planning search queries…');
+        setStat('.dr-stat-plan', 'thinking…');
+        const numQueries = depth * 2 + 2; // 4 / 6 / 8
+
+        // Use a minimal, model-agnostic prompt
+        const planPrompt = `List ${numQueries} search engine queries to research: ${researchTopic}\n\nWrite one query per line. Include the year ${now.getFullYear()} in queries about current info. No bullets, no numbers, no explanations.`;
+        let queriesText;
+        try {
+          queriesText = await callLLMForTool([{ role: 'user', content: planPrompt }], 0.5, 600);
+          drLog(`Got ${queriesText?.split('\n').filter(l=>l.trim().length>3).length} raw lines from LLM`, 'ok');
+        } catch(e) {
+          drLog(`Query planning failed: ${e.message}`, 'error');
+          throw e;
+        }
+
+        // Very permissive parsing — strip any prefix junk, accept anything >3 chars
+        const queries = queriesText
+          .split('\n')
+          .map(q => q
+            .replace(/^[\d]+[\.\)]\s*/, '')   // "1. " or "1) "
+            .replace(/^[-*•·]\s*/, '')          // "- " or "* "
+            .replace(/^(Query|Search|Topic)[\s\d]*[:：]\s*/i, '') // "Query 1: "
+            .trim()
+          )
+          .filter(q => q.length > 3 && !q.toLowerCase().startsWith('here') && !q.toLowerCase().startsWith('sure'))
+          .slice(0, numQueries);
+
+        // Last-resort fallback: if model returned nothing useful, generate queries from the topic directly
+        if (queries.length === 0) {
+          drLog('LLM returned no usable queries — using fallback queries', 'warn');
+          const words = researchTopic.split(' ').slice(0, 6).join(' ');
+          queries.push(
+            `${words} ${now.getFullYear()}`,
+            `${words} comparison`,
+            `${words} price features`,
+            `best ${words}`,
+            `${words} review`,
+            `${words} specifications`
+          );
+          queries.splice(numQueries);
+        }
+
+        drLog(`Using ${queries.length} queries`, 'ok');
+
+        const queriesList = panelEl?.querySelector('.dr-queries');
+        if (queriesList) {
+          queriesList.innerHTML = queries.map((q, i) =>
+            `<li class="dr-query-item"><span style="font-size:9px;color:var(--tx-4);font-family:'JetBrains Mono',monospace;min-width:16px">${i+1}.</span> <i class="fas fa-search"></i> ${esc(q)}</li>`
+          ).join('');
+        }
+        setStat('.dr-stat-plan', `${queries.length} queries`);
+
+        if (isAborted()) throw new Error('Aborted');
+
+        // Phase 2: Search — call searchViaCompanion directly for structured results
+        activatePhase('dr-phase-search');
+        drLog(`Searching with ${queries.length} queries, compConnected=${state.compConnected}, compUrl=${state.compUrl}`);
+        setStat('.dr-stat-search', '0 URLs');
+        const allSearchResults = [];
+        const seen = new Set();
+        const searchResultsList = panelEl?.querySelector('.dr-search-results');
+
+        for (const q of queries) {
+          if (isAborted()) break;
+          drLog(`Searching: "${q.slice(0,40)}…"`);
+          try {
+            const data = await searchViaCompanion(q, 5, 0);
+            drLog(`Search "${q.slice(0,30)}" → count=${data?.count}, results=${data?.results?.length}, error=${data?.error||'none'}`, data?.error ? 'warn' : 'ok');
+            if (!data?.results?.length) continue;
+            for (const r of data.results) {
+              if (!r.url || r.error || seen.has(r.url)) continue;
+              if (!r.url.startsWith('http')) continue;
+              seen.add(r.url);
+              allSearchResults.push({ url: r.url, title: r.title || r.url, snippet: r.snippet || '' });
+
+              if (searchResultsList) {
+                const li = document.createElement('li');
+                li.className = 'dr-source-item';
+                const display = (r.title || r.url);
+                li.innerHTML = `<i class="fas fa-globe" style="color:var(--tx-4)"></i> <a href="${esc(r.url)}" target="_blank" title="${esc(r.snippet || r.url)}">${esc(display.length > 65 ? display.slice(0, 62) + '…' : display)}</a>`;
+                searchResultsList.appendChild(li);
+                searchResultsList.scrollTop = searchResultsList.scrollHeight;
+              }
+              setStat('.dr-stat-search', `${allSearchResults.length} URLs`);
+            }
+          } catch (e) { drLog(`Search failed for "${q.slice(0,30)}": ${e.message}`, 'error'); }
+        }
+        drLog(`Search phase done: ${allSearchResults.length} unique URLs`, allSearchResults.length > 0 ? 'ok' : 'warn');
+
+        if (isAborted()) throw new Error('Aborted');
+
+        // Phase 3: Smart fetch with fallback strategies
+        const maxFetch = depth * 3;
+        activatePhase('dr-phase-read');
+        setStatus(`Reading ${Math.min(allSearchResults.length, maxFetch)} sources...`);
+        setStat('.dr-stat-read', `0/${Math.min(allSearchResults.length, maxFetch)}`);
+        const fetchedContents = [];
+        const urlsToFetch = allSearchResults.slice(0, maxFetch);
+        const readResultsList = panelEl?.querySelector('.dr-read-results');
+        let readOk = 0;
+
+        for (let i = 0; i < urlsToFetch.length; i++) {
+          if (isAborted()) break;
+          const { url, title, snippet } = urlsToFetch[i];
+          setStatus(`Reading ${i+1}/${urlsToFetch.length}: ${url.slice(0, 40)}…`);
+          
+          let readLi = null;
+          if (readResultsList) {
+            readLi = document.createElement('li');
+            readLi.className = 'dr-source-item';
+            const displayTitle = title && title !== url ? title : url;
+            readLi.innerHTML = `<i class="fas fa-spinner fa-spin" style="color:var(--tx-4)"></i> <a href="${esc(url)}" target="_blank" title="${esc(url)}">${esc(displayTitle.length > 55 ? displayTitle.slice(0, 52) + '…' : displayTitle)}</a>`;
+            readResultsList.appendChild(readLi);
+            readResultsList.scrollTop = readResultsList.scrollHeight;
+          }
+
+          const displayLabel = readLi?.querySelector('a')?.textContent || url;
+
+          try {
+            const result = await smartFetch(url, snippet, title);
+            if (result) {
+              fetchedContents.push({ url, title, content: result.content, via: result.via });
+              sources.push(url);
+              readOk++;
+              const viaIcon = result.via === 'snippet' ? 'exclamation-triangle' : result.via === 'browser' ? 'robot' : 'check';
+              const viaColor = result.via === 'snippet' ? 'var(--yellow)' : result.via === 'browser' ? 'var(--cyan)' : 'var(--green)';
+              const viaTitle = result.via === 'snippet' ? 'snippet only' : result.via === 'browser' ? 'Playwright browser' : result.via === 'amp' ? 'AMP cache' : 'fetched';
+              if (readLi) {
+                readLi.innerHTML = `<i class="fas fa-${viaIcon}" style="color:${viaColor}" title="${viaTitle}"></i> <a href="${esc(url)}" target="_blank" title="${esc(url)}">${esc(displayLabel)}</a><span style="font-size:8px;color:var(--tx-4);margin-left:4px;font-family:'JetBrains Mono',monospace">${result.via}</span>`;
+              }
+            } else {
+              if (readLi) {
+                readLi.innerHTML = `<i class="fas fa-times" style="color:var(--red)" title="could not fetch"></i> <a href="${esc(url)}" target="_blank" title="${esc(url)}">${esc(displayLabel)}</a>`;
+              }
+            }
+          } catch (e) {
+            console.warn('[research] smartFetch failed for', url, e);
+            if (readLi) {
+              readLi.innerHTML = `<i class="fas fa-times" style="color:var(--red)"></i> <a href="${esc(url)}" target="_blank" title="${esc(url)}">${esc(displayLabel)}</a>`;
+            }
+          }
+          setStat('.dr-stat-read', `${readOk}/${urlsToFetch.length} ok`);
+        }
+
+        if (isAborted()) throw new Error('Aborted');
+
+        // Phase 4: Synthesize report
+        activatePhase('dr-phase-synth');
+        setStatus('Synthesizing report…');
+        setStat('.dr-stat-synth', 'writing…');
+
+        // Label snippet-only sources so the synthesizer knows to treat them with lower confidence
+        const sourcesText = fetchedContents.map((s, i) => {
+          const label = s.via === 'snippet'
+            ? `[Source ${i+1} — snippet only, lower confidence](${s.url})`
+            : s.via === 'browser'
+              ? `[Source ${i+1} — fetched via headless browser](${s.url})`
+              : `[Source ${i+1}](${s.url})`;
+          return `${label}:\n${s.content}`;
+        }).join('\n\n---\n\n');
+        
+        const reportEl = panelEl?.querySelector('.dr-report');
+
+        if (fetchedContents.length === 0) {
+            report = "Could not gather any content from the web for this topic. Please check your companion server connection and try again.";
+            if (reportEl) { reportEl.innerHTML = renderMd(report); reportEl.style.display = 'block'; }
+        } else {
+            // Stream synthesis word-by-word into the report element
+            if (reportEl) {
+              reportEl.style.display = 'block';
+              reportEl.classList.add('streaming');
+              reportEl.textContent = '';
+            }
+
+            const snippetOnlyCount = fetchedContents.filter(s => s.via === 'snippet').length;
+            const browserCount = fetchedContents.filter(s => s.via === 'browser').length;
+            const fetchedCount = fetchedContents.length - snippetOnlyCount;
+            const sourceCaveat = snippetOnlyCount > 0
+              ? `\nNote: ${snippetOnlyCount} source(s) could only be accessed via search snippets. Treat those citations with slightly lower confidence.`
+              : '';
+            const browserNote = browserCount > 0
+              ? `\n${browserCount} source(s) were fetched using a headless browser (Playwright) — these are fully rendered pages and can be cited with full confidence.`
+              : '';
+
+            const synthMessages = [
+              {
+                role: 'user',
+                content: `Write a research report about: ${researchTopic}\n\nToday's date: ${todayISO}\n\nUse these sources. Cite them as [Source 1], [Source 2], etc. Use markdown headings. End with a ## References section.\n\n${sourcesText}`
+              }
+            ];
+
+            // Use streaming if available, otherwise fallback to batch
+            try {
+              const res = await fetch(`${state.apiUrl}/v1/chat/completions`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  model: state.model,
+                  messages: synthMessages,
+                  temperature: 0.3,
+                  max_tokens: 4000,
+                  stream: true
+                }),
+                signal: AbortSignal.timeout(180000)
+              });
+
+              if (!res.ok) throw new Error('Stream failed');
+
+              const reader = res.body.getReader();
+              const decoder = new TextDecoder();
+              let accumulated = '';
+
+              while (true) {
+                if (isAborted()) break;
+                const { done, value } = await reader.read();
+                if (done) break;
+                const chunk = decoder.decode(value, { stream: true });
+                for (const line of chunk.split('\n')) {
+                  const trimmed = line.replace(/^data: /, '').trim();
+                  if (!trimmed || trimmed === '[DONE]') continue;
+                  try {
+                    const parsed = JSON.parse(trimmed);
+                    const token = parsed.choices?.[0]?.delta?.content || '';
+                    if (token) {
+                      accumulated += token;
+                      _reportText = accumulated;
+                      if (reportEl) {
+                        reportEl.innerHTML = renderMd(accumulated);
+                        reportEl.classList.add('streaming');
+                      }
+                      scrollBottom();
+                    }
+                  } catch {}
+                }
+              }
+
+              report = accumulated || 'No content generated.';
+              _reportText = report;
+
+            } catch (streamErr) {
+              // Fallback to non-streaming
+              report = await callLLMForTool(synthMessages, 0.3, 4000);
+              _reportText = report;
+            }
+
+            if (reportEl) {
+              reportEl.classList.remove('streaming');
+              reportEl.innerHTML = renderMd(report);
+              reportEl.querySelectorAll('pre code').forEach(b => {
+                if (!b.dataset.hljs) { hljs.highlightElement(b); b.dataset.hljs = '1'; }
+              });
+              addCopyBtns(reportEl);
+            }
+        }
+
+        // Show report action bar
+        const actionsEl = panelEl?.querySelector('.dr-report-actions');
+        if (actionsEl) {
+          actionsEl.style.display = 'flex';
+          const countEl = panelEl?.querySelector('.dr-source-count');
+          if (countEl) countEl.textContent = `${fetchedContents.length} sources · ${Math.round((performance.now() - startTime) / 1000)}s`;
+        }
+        setStat('.dr-stat-synth', `${fetchedContents.length} srcs`);
+
+        // Store report text on panel for export
+        if (panelEl) panelEl._drReportText = _reportText;
+        if (panelEl) panelEl._drQuery = query;
+
+      } catch (e) {
+        const phase = panelEl?.querySelector('.dr-phase.active');
+        if (phase) {
+          const dot = phase.querySelector('.dr-dot');
+          if (dot) dot.classList.add('dr-dot-error');
+        }
+        
+        if (e.message === 'Aborted' || e.name === 'AbortError' || panelEl?._drAborted) {
+          report = 'Research was cancelled by the user.';
+          setStatus('Cancelled');
+        } else {
+          report = `Research failed: ${e.message}`;
+          setStatus('Failed');
+          console.error('[research] error:', e);
+        }
+      } finally {
+        // Always close the Playwright browser if we opened one
+        await closeBrowserIfOpened();
+      }
+
+      // Hide abort button when done
+      const abortBtn = panelEl?.querySelector('.dr-abort-btn');
+      if (abortBtn) abortBtn.style.display = 'none';
+      if (panelEl) panelEl._drAbortFn = null;
+
+      // Final updates
+      const duration = ((performance.now() - startTime) / 1000).toFixed(1);
+      const finalPhase = panelEl?.querySelector('.dr-phase.active');
+      if (finalPhase) {
+        finalPhase.classList.remove('active');
+        finalPhase.classList.add('done');
+        finalPhase.classList.remove('dr-phase-collapsed');
+        const icon = finalPhase.querySelector('.dr-phase-title i');
+        if(icon) icon.className = 'fas fa-check-circle';
+      }
+      setStatus(`Done · ${duration}s · ${sources.length} sources`);
+
+      return {
+        output: report,
+        _sources: sources,
+        _researchData: { query, depth, duration, sourceCount: sources.length, report }
+      };
+    }
+
+    /* ═══════════════ DEEP RESEARCH HELPERS ═══════════════ */
+    let _drDepth = 2;
+
+    function setDrDepth(d) {
+      _drDepth = d;
+      // Update selection styles
+      [1,2,3].forEach(n => {
+        const el = document.getElementById(`dr-depth-${n}`);
+        if (el) el.classList.toggle('selected', n === d);
+      });
+      const lbl = document.getElementById('research-depth-label');
+      if (lbl) lbl.textContent = `·${d}`;
+      const popup = document.getElementById('dr-depth-popup');
+      if (popup) popup.style.display = 'none';
+    }
+
+    function toggleDrDepthPopup(e) {
+      e.stopPropagation();
+      const popup = document.getElementById('dr-depth-popup');
+      if (!popup) return;
+      const visible = popup.style.display !== 'none';
+      popup.style.display = visible ? 'none' : 'block';
+      if (!visible) {
+        // Close on outside click
+        setTimeout(() => {
+          document.addEventListener('click', function _close() {
+            popup.style.display = 'none';
+            document.removeEventListener('click', _close);
+          }, { once: true });
+        }, 0);
+      }
+    }
+
+    function drCopyReport(btn) {
+      // Find the nearest deep-research-panel ancestor
+      const panel = btn.closest('.deep-research-panel');
+      const text = panel?._drReportText || panel?.querySelector('.dr-report')?.innerText || '';
+      if (!text) return;
+      navigator.clipboard.writeText(text).then(() => {
+        btn.classList.add('copied');
+        btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+        setTimeout(() => {
+          btn.classList.remove('copied');
+          btn.innerHTML = '<i class="fas fa-copy"></i> Copy';
+        }, 2000);
+      });
+    }
+
+    function drExportReport(btn) {
+      const panel = btn.closest('.deep-research-panel');
+      const text = panel?._drReportText || panel?.querySelector('.dr-report')?.innerText || '';
+      const query = panel?._drQuery || 'research';
+      if (!text) { showToast('No report to export', 'warn'); return; }
+      const slug = query.slice(0, 40).replace(/[^a-z0-9]+/gi, '_').toLowerCase();
+      const filename = `research_${slug}.md`;
+      const blob = new Blob([`# Research Report: ${query}\n\n${text}`], { type: 'text/markdown' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.click();
+      URL.revokeObjectURL(url);
+      btn.innerHTML = '<i class="fas fa-check"></i> Saved!';
+      setTimeout(() => { btn.innerHTML = '<i class="fas fa-download"></i> Export .md'; }, 2000);
+    }
+
+    // Override depth when deep research is triggered
+    const _origToggleDR = toggleDeepResearchInputMode;
+    // Patch send to use _drDepth
+    const _origHandleSend = handleSend;
 
     init();
 
