@@ -7078,6 +7078,7 @@ if __name__ == "__main__":
     /* ═══════════════ STATE ═══════════════ */
     const modifiedFiles = new Set();
     const newFiles = new Set(); // tracks files created this session (yellow in tree)
+    const allModified = new Set(); // accumulates across the session
     const state = {
       apiUrl: 'http://localhost:1234', compUrl: 'http://127.0.0.1:8765',
       backendType: 'lmstudio', // 'lmstudio' | 'llamacpp'
@@ -11214,10 +11215,10 @@ Python command: {{PYTHON_CMD}}`;
     }
 
     /* ═══════════════ CHECKPOINT SYSTEM ═══════════════ */
-    function saveCheckpoint(iteration) {
-      if (!state.checkpointEnabled || modifiedFiles.size === 0) return;
+    function saveCheckpoint(iteration, filesToSnapshot) {
+      if (!state.checkpointEnabled || filesToSnapshot.size === 0) return;
       const snapshot = {};
-      for (const path of modifiedFiles) {
+      for (const path of filesToSnapshot) {
         const content = state.fileCache.get(path);
         if (content !== undefined) snapshot[path] = content;
       }
