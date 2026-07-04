@@ -19,6 +19,7 @@ PORT = 8765
 DEFAULT_TIMEOUT = 60
 MAX_OUTPUT = 100000
 MAX_TIMEOUT = 600
+MAX_FETCH_LEN = 100000
 
 
 def kill_tree(pid):
@@ -28,9 +29,9 @@ def kill_tree(pid):
         else:
             pgid = os.getpgid(pid)
             if pgid > 0: os.killpg(pgid, signal.SIGKILL)
-    except: pass
+    except Exception: pass
     try: os.kill(pid, signal.SIGKILL)
-    except: pass
+    except Exception: pass
 
 
 def _find_bash():
@@ -69,7 +70,7 @@ def _pshell_invalidate():
     with _PSHELL_LOCK:
         if _pshell_proc:
             try: _pshell_proc.kill()
-            except: pass
+            except Exception: pass
         _pshell_proc = None
 
 def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
@@ -101,7 +102,7 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                                 out_done.set(); break
                             with lock: out_lines.append(line)
                             write_fn("o", line)
-                    except: out_done.set()
+                    except Exception: out_done.set()
 
                 def read_err():
                     try:
@@ -110,11 +111,11 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                                 err_done.set(); break
                             if sentinel_rc in line:
                                 try: rc_holder[0] = int(line.strip()[len(sentinel_rc):])
-                                except: pass
+                                except Exception: pass
                                 continue
                             with lock: err_lines.append(line)
                             write_fn("e", line)
-                    except: err_done.set()
+                    except Exception: err_done.set()
 
                 t_out = threading.Thread(target=read_out, daemon=True)
                 t_err = threading.Thread(target=read_err, daemon=True)
@@ -125,6 +126,14 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                 if not out_done.wait(timeout) or not err_done.wait(5):
                     write_fn("e", "\n[Timed out after " + str(timeout) + "s]\n")
                     _pshell_invalidate()
+                    try:
+                        proc.stdin.close()
+                        proc.stdout.close() 
+                        proc.stderr.close()
+                    except Exception: pass
+                    t_out.join(timeout=3)
+                    t_err.join(timeout=3)
+                    write_fn("e", "\n[Timed out]\n")
                     write_fn("d", "1")
                     return
 
@@ -155,7 +164,6 @@ def _translate_for_cmd(cmd):
     return cmd
 
 def _detect_python_cmd():
-    import shutil
     for cmd in ['python3', 'python']:
         if shutil.which(cmd):
             ver = ''
@@ -163,7 +171,7 @@ def _detect_python_cmd():
                 r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
                     ver = ' (' + r.stdout.strip().split('\n')[0] + ')'
-            except:
+            except Exception:
                 pass
             return cmd + ver
     return sys.executable + ' (sys.executable fallback)'
@@ -186,7 +194,7 @@ def _detect_python_env():
                     "executable": lines[1] if len(lines) > 1 else "",
                     "type": lines[2] if len(lines) > 2 else "none",
                     "is_venv": lines[3] == "venv" if len(lines) > 3 else False}
-    except: pass
+    except Exception: pass
     return {"prefix": "", "executable": sys.executable, "type": "none", "is_venv": False}
 
 
@@ -202,57 +210,13 @@ def _detect_node():
             lines = result.stdout.strip().split("\n")
             return {"path": lines[0] if len(lines) > 0 else "",
                     "version": lines[1] if len(lines) > 1 else ""}
-    except: pass
+    except Exception: pass
     return None
 
 
 PYTHON_ENV = _detect_python_env()
 NODE_ENV = _detect_node()
 
-
-def run_cmd(cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
-    base_cwd = cwd or os.getcwd()
-    # Auto-fallback: python3 → python and vice versa
-    stripped = cmd.strip()
-    first_word = stripped.split(None, 1)[0] if stripped else ''
-    if first_word in ('python', 'python3'):
-        import shutil
-        if not shutil.which(first_word):
-            alt = 'python3' if first_word == 'python' else 'python'
-            if shutil.which(alt):
-                cmd = alt + stripped[len(first_word):]
-    if WINDOWS_BASH:
-        # Use persistent shell — avoids spawning a new WSL/HyperV instance per call (0x800705aa)
-        out_parts = []; err_parts = []; rc_holder = [0]
-        def _wfn(kind, data):
-            if kind == "o": out_parts.append(data)
-            elif kind == "e": err_parts.append(data)
-            elif kind == "d":
-                try: rc_holder[0] = int(data)
-                except: pass
-        stream_cmd_persistent(_wfn, cmd, cwd=cwd, timeout=timeout)
-        parts = [p for p in ["".join(out_parts), "".join(err_parts)] if p]
-        output = "\n".join(parts)
-        if len(output) > MAX_OUTPUT:
-            output = output[:MAX_OUTPUT] + "\n[Truncated at " + str(MAX_OUTPUT) + "]"
-        return rc_holder[0], output or "(no output)"
-    elif platform.system() == "Windows":
-        translated = _translate_for_cmd(cmd)
-        kw = dict(shell=True, args=translated, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
-    else:
-        kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd, start_new_session=True)
-    proc = subprocess.Popen(**kw)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc.pid)
-        stdout, stderr = proc.communicate(timeout=5)
-        stderr = (stderr or "") + "\n[Timed out after " + str(timeout) + "s]"
-    parts = [p for p in [stdout, stderr] if p]
-    output = "\n".join(parts)
-    if len(output) > MAX_OUTPUT:
-        output = output[:MAX_OUTPUT] + "\n[Truncated at " + str(MAX_OUTPUT) + "]"
-    return proc.returncode, output or "(no output)"
 
 
 class TextExtractor(HTMLParser):
@@ -381,7 +345,7 @@ class TextExtractor(HTMLParser):
             return
         try:
             ch = chr(int(name[1:], 16)) if name.startswith('x') else chr(int(name))
-        except:
+        except Exception:
             ch = '?'
         if self._in_link():
             self._link_buf.append(ch)
@@ -486,15 +450,15 @@ def search_ddg(query, num=8):
     )
     try:
         with opener.open(req, timeout=15) as resp:
-            html = resp.read(500000).decode("utf-8", errors="replace")
+            page_html = resp.read(500000).decode("utf-8", errors="replace")
     except Exception as e:
         return [{"error": "Search request failed: " + str(e)}]
-    if "result__a" not in html:
+    if "result__a" not in page_html:
         return [{"error": "DDG returned no results (possibly blocked or CAPTCHA)."}]
     results = []
     link_tags = re.findall(
         r'<a\s[^>]*class=["\']result__a["\'][^>]*>',
-        html, re.IGNORECASE,
+        page_html, re.IGNORECASE,
     )
     for tag in link_tags[:num * 2]:
         href_m = re.search(r'href=["\']([^"\']+)["\']', tag)
@@ -507,13 +471,13 @@ def search_ddg(query, num=8):
             actual = urllib.parse.unquote(m.group(1))
         elif raw_url.startswith("/"):
             actual = "https://html.duckduckgo.com" + raw_url
-        tag_pos = html.find(tag)
+        tag_pos = page_html.find(tag)
         if tag_pos == -1:
             continue
-        close_pos = html.find("</a>", tag_pos + len(tag))
+        close_pos = page_html.find("</a>", tag_pos + len(tag))
         if close_pos == -1:
             continue
-        title = clean_html(html[tag_pos + len(tag):close_pos])
+        title = clean_html(page_html[tag_pos + len(tag):close_pos])
         if not title or not actual or not actual.startswith("http"):
             continue
         if "duckduckgo.com" in actual and "uddg=" not in raw_url:
@@ -525,7 +489,7 @@ def search_ddg(query, num=8):
             break
     snippets = re.findall(
         r'<a[^>]*class=["\']result__snippet["\'][^>]*>(.*?)</a>',
-        html, re.DOTALL | re.IGNORECASE,
+        page_html, re.DOTALL | re.IGNORECASE,
     )
     for i, s in enumerate(snippets):
         if i < len(results):
@@ -550,12 +514,11 @@ def _translate_for_cmd_bash(cmd):
         base = cmd_map[base]
 
     # Convert Windows /flags to Unix -flags: /s → -s, /b → -b, /a → -a
-    new_rest = re.sub(r'\s+/([a-zA-Z])', r' -\1', rest)
+    new_rest = re.sub(r'(?:^|\s+)/([a-zA-Z])', r' -\1', rest).lstrip()
 
     return base + " " + new_rest
 
 def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
-    base_cwd = cwd or os.getcwd()
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
     
@@ -566,7 +529,8 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                 cmd = alt + stripped[len(first_word):]
                 
     if WINDOWS_BASH:
-        kw = dict(args=[WINDOWS_BASH, "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
+        translated = _translate_for_cmd_bash(cmd)
+        kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     elif platform.system() == "Windows":
         translated = _translate_for_cmd(cmd)
         kw = dict(shell=True, args=translated, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
@@ -583,7 +547,7 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                     buf.append(line)
                     write_fn(kind, line)
             stream.close()
-        except: 
+        except Exception: 
             pass
             
     t1 = threading.Thread(target=reader, args=(proc.stdout, out_buf, 'o'))
@@ -763,26 +727,23 @@ def extract_generic_signatures(source, max_lines=300):
 
 def _close_browser():
     global _pw, _pw_browser, _pw_page, _pw_console, _pw_launch_time
-    try:
-        if _pw_page is not None:
-            try:
-                if not _pw_page.is_closed():
-                    _pw_page.close()
-            except: pass
-    except: pass
-    try:
-        if _pw_browser is not None:
-            try:
-                if _pw_browser.is_connected():
-                    _pw_browser.close()
-            except: pass
-    except: pass
+    if _pw_page is not None:
+        try:
+            if not _pw_page.is_closed():
+                _pw_page.close()
+        except Exception:
+            pass
+    if _pw_browser is not None:
+        try:
+            if _pw_browser.is_connected():
+                _pw_browser.close()
+        except Exception:
+            pass
     _pw_page = None
     _pw_browser = None
     _pw_console = []
     _pw_launch_time = None
 
-@staticmethod
 def _browser_error_hint():
     if not HAS_PLAYWRIGHT:
         return "Playwright not installed. Run: pip install playwright && playwright install chromium"
@@ -800,11 +761,11 @@ def _ensure_page():
     try:
         if _pw_page is not None and _pw_page.is_closed():
             _close_browser()
-    except: pass
+    except Exception: pass
     try:
         if _pw_browser is not None and _pw_browser.is_connected():
             return _pw_page
-    except: pass
+    except Exception: pass
     if _pw is None:
         _pw = sync_playwright().start()
     _pw_browser = _pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -837,17 +798,17 @@ def _start_dev_process(cmd, port, cwd):
             p = _dev_processes[port_s]
             if p['alive'][0]:
                 kill_tree(p['proc'].pid)
-        except: pass
+        except Exception: pass
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
     if first_word in ('python', 'python3'):
-        import shutil
         if not shutil.which(first_word):
             alt = 'python3' if first_word == 'python' else 'python'
             if shutil.which(alt):
                 cmd = alt + stripped[len(first_word):]
     if WINDOWS_BASH:
-        kw = dict(args=[WINDOWS_BASH, "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
+        translated = _translate_for_cmd_bash(cmd)
+        kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
     elif platform.system() == "Windows":
         kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
     else:
@@ -864,23 +825,25 @@ def _start_dev_process(cmd, port, cwd):
                     buf.append(kind + line)
                     if len(buf) > 2000:
                         buf.pop(0)
-        except: pass
+        except Exception: pass
     for s in (proc.stdout, proc.stderr):
         t = threading.Thread(target=reader, args=(s, 'o' if s is proc.stdout else 'e'), daemon=True)
         t.start()
     def monitor():
         try: proc.wait()
-        except: pass
+        except Exception: pass
         alive[0] = False
     threading.Thread(target=monitor, daemon=True).start()
     _dev_processes[port_s] = {'proc': proc, 'buf': buf, 'lock': lock, 'alive': alive, 'cmd': cmd, 'cwd': cwd or os.getcwd(), 'pid': proc.pid, 'start': time.time()}
     return {'ok': True, 'port': port, 'pid': proc.pid}
 
 def _check_dev_ready(port, timeout=3):
+    import socket
     try:
-        urllib.request.urlopen("http://127.0.0.1:" + str(port) + "/", timeout=timeout)
-        return True
-    except: return False    
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False    
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -936,7 +899,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     self.wfile.write((json.dumps({"t": kind, "d": data}, ensure_ascii=False) + "\n").encode("utf-8"))
                     self.wfile.flush()
-                except: pass
+                except Exception: pass
             try:
                 stream_cmd(wfn, command, cwd=cwd, timeout=timeout)
             except Exception as e:
@@ -1017,7 +980,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 import traceback
                 tb = traceback.format_exc()
                 err_msg = str(e) or 'Unknown error'
-                self.send_json(500, {"error": err_msg, "hint": self._browser_error_hint()})
+                self.send_json(500, {"error": err_msg, "traceback": tb, "hint": _browser_error_hint()})
         elif path == '/browser_navigate':
             try:
                 body = self.read_body()
@@ -1059,7 +1022,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     types = body["types"]
                 if body.get("since"):
                     since = body["since"]
-            except: pass
+            except Exception: pass
             msgs = _get_console_filtered(types=types, since=since, limit=200)
             errors = [m for m in msgs if m["type"] == "error"]
             warnings = [m for m in msgs if m["type"] == "warning"]
@@ -1116,7 +1079,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 page = _ensure_page()
                 selector = body.get("selector")
                 mode = body.get("mode", "text")
-                max_len = min(body.get("max_length", 30000), 100000)
+                max_len = min(body.get("max_length", 30000), MAX_FETCH_LEN)
                 if selector:
                     el = page.wait_for_selector(selector, timeout=5000)
                     content = el.inner_text() if mode == "text" else el.inner_html()
@@ -1285,7 +1248,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         kill_tree(ps['proc'].pid)
                         killed = True
-                    except: pass
+                    except Exception: pass
                     ps['alive'][0] = False
                     del _dev_processes[port_s]
                 self.send_json(200, {"ok": True, "killed": killed, "port": port})
