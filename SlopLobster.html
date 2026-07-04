@@ -160,6 +160,14 @@
       filter: drop-shadow(0 0 6px rgba(232, 160, 35, .25))
     }
 
+    .meta-text {
+      font-size: 9px;
+      color: var(--tx-4);
+      font-family: 'JetBrains Mono', monospace;
+      white-space: nowrap;
+    }
+
+
     .hdr-sep {
       width: 1px;
       height: 16px;
@@ -5305,8 +5313,7 @@
       <button class="hdr-btn" id="model-load-btn" onclick="manualModelLoad()"
         title="Load this model in LM Studio (unloads current)" style="display:none"><i
           class="fas fa-download"></i></button>
-      <span id="model-meta"
-        style="font-size:9px;color:var(--tx-4);font-family:'JetBrains Mono',monospace;white-space:nowrap"></span>
+      <span id="model-meta" class="meta-text"></span>
       <div class="hdr-sep"></div>
       <div class="hdr-status">
         <div class="status-dot off" id="llm-dot"></div><span id="llm-text">LLM</span>
@@ -5765,6 +5772,7 @@ PORT = 8765
 DEFAULT_TIMEOUT = 60
 MAX_OUTPUT = 100000
 MAX_TIMEOUT = 600
+MAX_FETCH_LEN = 100000
 
 
 def kill_tree(pid):
@@ -5774,9 +5782,9 @@ def kill_tree(pid):
         else:
             pgid = os.getpgid(pid)
             if pgid > 0: os.killpg(pgid, signal.SIGKILL)
-    except: pass
+    except Exception: pass
     try: os.kill(pid, signal.SIGKILL)
-    except: pass
+    except Exception: pass
 
 
 def _find_bash():
@@ -5815,7 +5823,7 @@ def _pshell_invalidate():
     with _PSHELL_LOCK:
         if _pshell_proc:
             try: _pshell_proc.kill()
-            except: pass
+            except Exception: pass
         _pshell_proc = None
 
 def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
@@ -5847,7 +5855,7 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                                 out_done.set(); break
                             with lock: out_lines.append(line)
                             write_fn("o", line)
-                    except: out_done.set()
+                    except Exception: out_done.set()
 
                 def read_err():
                     try:
@@ -5856,11 +5864,11 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                                 err_done.set(); break
                             if sentinel_rc in line:
                                 try: rc_holder[0] = int(line.strip()[len(sentinel_rc):])
-                                except: pass
+                                except Exception: pass
                                 continue
                             with lock: err_lines.append(line)
                             write_fn("e", line)
-                    except: err_done.set()
+                    except Exception: err_done.set()
 
                 t_out = threading.Thread(target=read_out, daemon=True)
                 t_err = threading.Thread(target=read_err, daemon=True)
@@ -5871,6 +5879,14 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                 if not out_done.wait(timeout) or not err_done.wait(5):
                     write_fn("e", "\\n[Timed out after " + str(timeout) + "s]\\n")
                     _pshell_invalidate()
+                    try:
+                        proc.stdin.close()
+                        proc.stdout.close() 
+                        proc.stderr.close()
+                    except Exception: pass
+                    t_out.join(timeout=3)
+                    t_err.join(timeout=3)
+                    write_fn("e", "\\n[Timed out]\\n")
                     write_fn("d", "1")
                     return
 
@@ -5901,7 +5917,6 @@ def _translate_for_cmd(cmd):
     return cmd
 
 def _detect_python_cmd():
-    import shutil
     for cmd in ['python3', 'python']:
         if shutil.which(cmd):
             ver = ''
@@ -5909,7 +5924,7 @@ def _detect_python_cmd():
                 r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
                     ver = ' (' + r.stdout.strip().split('\\n')[0] + ')'
-            except:
+            except Exception:
                 pass
             return cmd + ver
     return sys.executable + ' (sys.executable fallback)'
@@ -5932,7 +5947,7 @@ def _detect_python_env():
                     "executable": lines[1] if len(lines) > 1 else "",
                     "type": lines[2] if len(lines) > 2 else "none",
                     "is_venv": lines[3] == "venv" if len(lines) > 3 else False}
-    except: pass
+    except Exception: pass
     return {"prefix": "", "executable": sys.executable, "type": "none", "is_venv": False}
 
 
@@ -5948,57 +5963,13 @@ def _detect_node():
             lines = result.stdout.strip().split("\\n")
             return {"path": lines[0] if len(lines) > 0 else "",
                     "version": lines[1] if len(lines) > 1 else ""}
-    except: pass
+    except Exception: pass
     return None
 
 
 PYTHON_ENV = _detect_python_env()
 NODE_ENV = _detect_node()
 
-
-def run_cmd(cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
-    base_cwd = cwd or os.getcwd()
-    # Auto-fallback: python3 → python and vice versa
-    stripped = cmd.strip()
-    first_word = stripped.split(None, 1)[0] if stripped else ''
-    if first_word in ('python', 'python3'):
-        import shutil
-        if not shutil.which(first_word):
-            alt = 'python3' if first_word == 'python' else 'python'
-            if shutil.which(alt):
-                cmd = alt + stripped[len(first_word):]
-    if WINDOWS_BASH:
-        # Use persistent shell — avoids spawning a new WSL/HyperV instance per call (0x800705aa)
-        out_parts = []; err_parts = []; rc_holder = [0]
-        def _wfn(kind, data):
-            if kind == "o": out_parts.append(data)
-            elif kind == "e": err_parts.append(data)
-            elif kind == "d":
-                try: rc_holder[0] = int(data)
-                except: pass
-        stream_cmd_persistent(_wfn, cmd, cwd=cwd, timeout=timeout)
-        parts = [p for p in ["".join(out_parts), "".join(err_parts)] if p]
-        output = "\\n".join(parts)
-        if len(output) > MAX_OUTPUT:
-            output = output[:MAX_OUTPUT] + "\\n[Truncated at " + str(MAX_OUTPUT) + "]"
-        return rc_holder[0], output or "(no output)"
-    elif platform.system() == "Windows":
-        translated = _translate_for_cmd(cmd)
-        kw = dict(shell=True, args=translated, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
-    else:
-        kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd, start_new_session=True)
-    proc = subprocess.Popen(**kw)
-    try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        kill_tree(proc.pid)
-        stdout, stderr = proc.communicate(timeout=5)
-        stderr = (stderr or "") + "\\n[Timed out after " + str(timeout) + "s]"
-    parts = [p for p in [stdout, stderr] if p]
-    output = "\\n".join(parts)
-    if len(output) > MAX_OUTPUT:
-        output = output[:MAX_OUTPUT] + "\\n[Truncated at " + str(MAX_OUTPUT) + "]"
-    return proc.returncode, output or "(no output)"
 
 
 class TextExtractor(HTMLParser):
@@ -6127,7 +6098,7 @@ class TextExtractor(HTMLParser):
             return
         try:
             ch = chr(int(name[1:], 16)) if name.startswith('x') else chr(int(name))
-        except:
+        except Exception:
             ch = '?'
         if self._in_link():
             self._link_buf.append(ch)
@@ -6232,15 +6203,15 @@ def search_ddg(query, num=8):
     )
     try:
         with opener.open(req, timeout=15) as resp:
-            html = resp.read(500000).decode("utf-8", errors="replace")
+            page_html = resp.read(500000).decode("utf-8", errors="replace")
     except Exception as e:
         return [{"error": "Search request failed: " + str(e)}]
-    if "result__a" not in html:
+    if "result__a" not in page_html:
         return [{"error": "DDG returned no results (possibly blocked or CAPTCHA)."}]
     results = []
     link_tags = re.findall(
         r'<a\\s[^>]*class=["\\']result__a["\\'][^>]*>',
-        html, re.IGNORECASE,
+        page_html, re.IGNORECASE,
     )
     for tag in link_tags[:num * 2]:
         href_m = re.search(r'href=["\\']([^"\\']+)["\\']', tag)
@@ -6253,13 +6224,13 @@ def search_ddg(query, num=8):
             actual = urllib.parse.unquote(m.group(1))
         elif raw_url.startswith("/"):
             actual = "https://html.duckduckgo.com" + raw_url
-        tag_pos = html.find(tag)
+        tag_pos = page_html.find(tag)
         if tag_pos == -1:
             continue
-        close_pos = html.find("</a>", tag_pos + len(tag))
+        close_pos = page_html.find("</a>", tag_pos + len(tag))
         if close_pos == -1:
             continue
-        title = clean_html(html[tag_pos + len(tag):close_pos])
+        title = clean_html(page_html[tag_pos + len(tag):close_pos])
         if not title or not actual or not actual.startswith("http"):
             continue
         if "duckduckgo.com" in actual and "uddg=" not in raw_url:
@@ -6271,7 +6242,7 @@ def search_ddg(query, num=8):
             break
     snippets = re.findall(
         r'<a[^>]*class=["\\']result__snippet["\\'][^>]*>(.*?)</a>',
-        html, re.DOTALL | re.IGNORECASE,
+        page_html, re.DOTALL | re.IGNORECASE,
     )
     for i, s in enumerate(snippets):
         if i < len(results):
@@ -6296,12 +6267,11 @@ def _translate_for_cmd_bash(cmd):
         base = cmd_map[base]
 
     # Convert Windows /flags to Unix -flags: /s → -s, /b → -b, /a → -a
-    new_rest = re.sub(r'\\s+/([a-zA-Z])', r' -\\1', rest)
+    new_rest = re.sub(r'(?:^|\\s+)/([a-zA-Z])', r' -\\1', rest).lstrip()
 
     return base + " " + new_rest
 
 def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
-    base_cwd = cwd or os.getcwd()
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
     
@@ -6312,7 +6282,8 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                 cmd = alt + stripped[len(first_word):]
                 
     if WINDOWS_BASH:
-        kw = dict(args=[WINDOWS_BASH, "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
+        translated = _translate_for_cmd_bash(cmd)
+        kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     elif platform.system() == "Windows":
         translated = _translate_for_cmd(cmd)
         kw = dict(shell=True, args=translated, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
@@ -6329,7 +6300,7 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                     buf.append(line)
                     write_fn(kind, line)
             stream.close()
-        except: 
+        except Exception: 
             pass
             
     t1 = threading.Thread(target=reader, args=(proc.stdout, out_buf, 'o'))
@@ -6509,26 +6480,23 @@ def extract_generic_signatures(source, max_lines=300):
 
 def _close_browser():
     global _pw, _pw_browser, _pw_page, _pw_console, _pw_launch_time
-    try:
-        if _pw_page is not None:
-            try:
-                if not _pw_page.is_closed():
-                    _pw_page.close()
-            except: pass
-    except: pass
-    try:
-        if _pw_browser is not None:
-            try:
-                if _pw_browser.is_connected():
-                    _pw_browser.close()
-            except: pass
-    except: pass
+    if _pw_page is not None:
+        try:
+            if not _pw_page.is_closed():
+                _pw_page.close()
+        except Exception:
+            pass
+    if _pw_browser is not None:
+        try:
+            if _pw_browser.is_connected():
+                _pw_browser.close()
+        except Exception:
+            pass
     _pw_page = None
     _pw_browser = None
     _pw_console = []
     _pw_launch_time = None
 
-@staticmethod
 def _browser_error_hint():
     if not HAS_PLAYWRIGHT:
         return "Playwright not installed. Run: pip install playwright && playwright install chromium"
@@ -6546,11 +6514,11 @@ def _ensure_page():
     try:
         if _pw_page is not None and _pw_page.is_closed():
             _close_browser()
-    except: pass
+    except Exception: pass
     try:
         if _pw_browser is not None and _pw_browser.is_connected():
             return _pw_page
-    except: pass
+    except Exception: pass
     if _pw is None:
         _pw = sync_playwright().start()
     _pw_browser = _pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
@@ -6583,17 +6551,17 @@ def _start_dev_process(cmd, port, cwd):
             p = _dev_processes[port_s]
             if p['alive'][0]:
                 kill_tree(p['proc'].pid)
-        except: pass
+        except Exception: pass
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
     if first_word in ('python', 'python3'):
-        import shutil
         if not shutil.which(first_word):
             alt = 'python3' if first_word == 'python' else 'python'
             if shutil.which(alt):
                 cmd = alt + stripped[len(first_word):]
     if WINDOWS_BASH:
-        kw = dict(args=[WINDOWS_BASH, "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
+        translated = _translate_for_cmd_bash(cmd)
+        kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
     elif platform.system() == "Windows":
         kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
     else:
@@ -6610,23 +6578,25 @@ def _start_dev_process(cmd, port, cwd):
                     buf.append(kind + line)
                     if len(buf) > 2000:
                         buf.pop(0)
-        except: pass
+        except Exception: pass
     for s in (proc.stdout, proc.stderr):
         t = threading.Thread(target=reader, args=(s, 'o' if s is proc.stdout else 'e'), daemon=True)
         t.start()
     def monitor():
         try: proc.wait()
-        except: pass
+        except Exception: pass
         alive[0] = False
     threading.Thread(target=monitor, daemon=True).start()
     _dev_processes[port_s] = {'proc': proc, 'buf': buf, 'lock': lock, 'alive': alive, 'cmd': cmd, 'cwd': cwd or os.getcwd(), 'pid': proc.pid, 'start': time.time()}
     return {'ok': True, 'port': port, 'pid': proc.pid}
 
 def _check_dev_ready(port, timeout=3):
+    import socket
     try:
-        urllib.request.urlopen("http://127.0.0.1:" + str(port) + "/", timeout=timeout)
-        return True
-    except: return False    
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False    
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -6682,7 +6652,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 try:
                     self.wfile.write((json.dumps({"t": kind, "d": data}, ensure_ascii=False) + "\\n").encode("utf-8"))
                     self.wfile.flush()
-                except: pass
+                except Exception: pass
             try:
                 stream_cmd(wfn, command, cwd=cwd, timeout=timeout)
             except Exception as e:
@@ -6763,7 +6733,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 import traceback
                 tb = traceback.format_exc()
                 err_msg = str(e) or 'Unknown error'
-                self.send_json(500, {"error": err_msg, "hint": self._browser_error_hint()})
+                self.send_json(500, {"error": err_msg, "traceback": tb, "hint": _browser_error_hint()})
         elif path == '/browser_navigate':
             try:
                 body = self.read_body()
@@ -6805,7 +6775,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     types = body["types"]
                 if body.get("since"):
                     since = body["since"]
-            except: pass
+            except Exception: pass
             msgs = _get_console_filtered(types=types, since=since, limit=200)
             errors = [m for m in msgs if m["type"] == "error"]
             warnings = [m for m in msgs if m["type"] == "warning"]
@@ -6862,7 +6832,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 page = _ensure_page()
                 selector = body.get("selector")
                 mode = body.get("mode", "text")
-                max_len = min(body.get("max_length", 30000), 100000)
+                max_len = min(body.get("max_length", 30000), MAX_FETCH_LEN)
                 if selector:
                     el = page.wait_for_selector(selector, timeout=5000)
                     content = el.inner_text() if mode == "text" else el.inner_html()
@@ -7031,7 +7001,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     try:
                         kill_tree(ps['proc'].pid)
                         killed = True
-                    except: pass
+                    except Exception: pass
                     ps['alive'][0] = False
                     del _dev_processes[port_s]
                 self.send_json(200, {"ok": True, "killed": killed, "port": port})
@@ -7087,10 +7057,9 @@ if __name__ == "__main__":
     function stripThinkingBlocks(text) {
       if (!text) return '';
       text = text.replace(/<think>[\s\S]*?<\/think>/g, '');
-      // Gemma 4: opening tag is <|channel>thought, closing tag is <channel|>  (note: channel| not |channel)
       text = text.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, '');
-      // Fallback variant
-      text = text.replace(/<\|channel>thought[\s\S]*?<channel\|>/g, '');
+      // Handle unclosed thinking blocks (truncation)
+      text = text.replace(/<\|channel>thought[\s\S]*$/g, '');
       return text.trim();
     }
 
@@ -7154,6 +7123,17 @@ if __name__ == "__main__":
       devServer: null  // { port, command, pollInterval, ready }
     };
 
+    const LIMITS = {
+      MAX_SVG_SIZE: 5 * 1024 * 1024,
+      MAX_IMAGE_SIZE: 10 * 1024 * 1024,
+      MAX_PDF_SIZE: 100 * 1024 * 1024,
+      MAX_TEXT_SIZE: 5 * 1024 * 1024,
+      DIR_LIST_DEPTH: 8,
+      SEARCH_DEPTH: 6,
+      EMBEDDING_DEPTH: 5,
+      MAX_SUMMARY_TEXT: 100000,
+    };
+
     const inputHistory = [];
     let _prevHtmlPreviewUrl = null;
     let inputHistoryIdx = -1;
@@ -7164,10 +7144,7 @@ if __name__ == "__main__":
       clearTimeout(fileTreeRefreshTimer);
       fileTreeRefreshTimer = setTimeout(() => {
         refreshFileTree();
-        // Re-index if embeddings are ready
-        if (embeddingService.isReady() && state.dirHandle) {
-          startIndexing();
-        }
+        // Per-file embedding updates are handled by debouncedEmbedUpdate
       }, 300);
     }
     const DEFAULT_SYS = `You are SlopLobster, a local AI coding agent with direct filesystem access, shell execution, web search, and optional image understanding.
@@ -7533,13 +7510,13 @@ Python command: {{PYTHON_CMD}}`;
       const fill = document.getElementById('ctx-fill'), label = document.getElementById('ctx-label');
       if (!fill || !label) return;
       if (!state._sysPromptLength) state._sysPromptLength = estimateTokens(DEFAULT_SYS);
-      const pct = Math.min(100, ((estimateConvTokens() + state._sysPromptLength) / state.ctxWindow) * 100);
-      const fillCls = pct > 80 ? 'high' : pct > 50 ? 'mid' : 'low';
-      fill.style.width = pct + '%';
-      fill.className = 'ctx-fill ' + fillCls;
       const tok = tokenTracker.lastPromptTokens > 0
         ? tokenTracker.lastPromptTokens
         : estimateConvTokens() + state._sysPromptLength;
+      const pct = Math.min(100, (tok / state.ctxWindow) * 100);
+      const fillCls = pct > 80 ? 'high' : pct > 50 ? 'mid' : 'low';
+      fill.style.width = pct + '%';
+      fill.className = 'ctx-fill ' + fillCls;
       const remaining = state.ctxWindow - tok;
       const remainingPct = remaining / state.ctxWindow;
       // Show remaining tokens (red warning) when < 20% context left
@@ -8278,7 +8255,7 @@ Python command: {{PYTHON_CMD}}`;
       if (preservedText) {
         state.messages.push({
           role: 'assistant',
-          content: null
+          content: preservedText
         });
         state.messages.push({
           role: 'user',
@@ -8405,8 +8382,10 @@ Python command: {{PYTHON_CMD}}`;
         });
       } catch { /* ignore */ }
 
-      state.devServer = null;
       updateDevPreviewUI('stopped');
+      state.devServer = null;
+      // Then optionally hide after a delay:
+      setTimeout(() => { if (!state.devServer) updateDevPreviewUI('stopped'); }, 2000);
     }
 
     function updateDevPreviewUI(status) {
@@ -8511,7 +8490,9 @@ Python command: {{PYTHON_CMD}}`;
       constructor() { this.model = null; this.ready = false; this.loading = false; this.error = null; this._loadPromise = null; }
       async load() {
         if (this._loadPromise) return this._loadPromise;
-        this._loadPromise = this._doLoad();
+        this._loadPromise = this._doLoad().finally(() => {
+          if (!this.ready) this._loadPromise = null; // allow retry on failure
+        });
         return this._loadPromise;
       }
       async _doLoad() {
@@ -8718,7 +8699,7 @@ Python command: {{PYTHON_CMD}}`;
         const files = [];
         let skippedCount = 0;
         async function walk(h, pfx, d) {
-          if (d > 5) return;
+          if (d > LIMITS.EMBEDDING_DEPTH) return;
           try {
             for await (const [n, kh] of h.entries()) {
               if (SKIP.has(n)) { skippedCount++; continue; }
@@ -9111,14 +9092,18 @@ Python command: {{PYTHON_CMD}}`;
               if (cm) {
                 result.push(`L${j+1}: ${lines[j].match(/^(\s*)/)[1]}${cm[1] || ''}def ${cm[2]}(${cm[3].slice(0, 60)})`);
                 bodyCount++;
-                // Skip body of nested methods
-                let depth = 1;
-                for (let k = j + 1; k < lines.length && depth > 0; k++) {
-                  const nl = lines[k];
-                  if (/^(async\s+)?def\s|^class\s/.test(nl.trim()) && lines[k].match(/^(\s*)/)[1].length <= lines[j].match(/^(\s*)/)[1].length) depth++;
-                  if (depth > 5) break; // safety
+                // Skip body of the method
+                let k = j + 1;
+                const methodIndent = lines[j].match(/^(\s*)/)[1].length;
+                for (; k < lines.length; k++) {
+                  const trimmedLine = lines[k].trim();
+                  if (!trimmedLine) continue;
+                  const lineIndent = lines[k].match(/^(\s*)/)[1].length;
+                  if (lineIndent <= methodIndent) {
+                    break;
+                  }
                 }
-                j = Math.min(i + 60, lines.length) - 1; // let outer loop advance
+                j = k - 1;
                 continue;
               }
 
@@ -9277,7 +9262,7 @@ Python command: {{PYTHON_CMD}}`;
 
       /* ── PDF files: extract text via pdf.js ── */
       if (isPdfFile(f, rel)) {
-        const maxB = 100 * 1024 * 1024;
+        const maxB = LIMITS.MAX_PDF_SIZE;
         if (f.size > maxB) return { output: `PDF: ${rel}\nSize: ${(f.size / 1024 / 1024).toFixed(1)} MB\n⚠ Too large to extract (max 100 MB)` };
         try {
           const text = await extractPdfText(f);
@@ -9289,7 +9274,7 @@ Python command: {{PYTHON_CMD}}`;
 
       /* ── SVG files: return raw XML markup with rendered preview URL ── */
       if (f.type && f.type.includes('svg')) {
-        const maxB = 5 * 1024 * 1024;
+        const maxB = LIMITS.MAX_TEXT_SIZE;
         if (f.size > maxB) return { output: `SVG: ${rel}\nSize: ${(f.size / 1024).toFixed(1)} KB\n⚠ Too large to preview (max 5 MB). Use read_file_lines to read sections of the raw data.` };
         const text = await f.text();
         cacheSet(rel, text);
@@ -9304,7 +9289,7 @@ Python command: {{PYTHON_CMD}}`;
 
       /* ── Raster image files: compress and return base64 for vision ── */
       if (f.type && f.type.startsWith('image/') && !f.type.includes('svg')) {
-        const maxB = 10 * 1024 * 1024;
+        const maxB = LIMITS.MAX_IMAGE_SIZE;
         if (f.size > maxB) return { output: `Image: ${rel}\nType: ${f.type}\nSize: ${(f.size / 1024 / 1024).toFixed(1)} MB\n⚠ Too large to view (max 10 MB)...` };
         try {
           const dataUrl = await fileToBase64(f);
@@ -9380,7 +9365,7 @@ Python command: {{PYTHON_CMD}}`;
       const h = await resolvePath(rel);
       if (h.kind !== 'file') return { output: `"${rel}" is not a file` };
       const f = await h.getFile();
-      if (f.size > 5 * 1024 * 1024) return { output: `File too large for summary (${(f.size/1024/1024).toFixed(1)} MB)` };
+      if (f.size > LIMITS.MAX_TEXT_SIZE) return { output: `File too large for summary (${(f.size/1024/1024).toFixed(1)} MB)` };
       
       // For small files, just do it client-side
       if (f.size < 50000) {
@@ -9550,21 +9535,9 @@ Python command: {{PYTHON_CMD}}`;
       if (h.kind !== 'file') return { output: `"${rel}" is not a file` };
       const f = await h.getFile();
 
-      const isSvg = f.type && f.type.includes('svg');
-      const isRaster = f.type && f.type.startsWith('image/') && !isSvg;
-
-      if (!isSvg && !isRaster) {
-        return { output: `"${rel}" is not an image file (type: ${f.type || 'unknown'}). Use read_file for text files.` };
-      }
-
-      const maxB = 10 * 1024 * 1024;
-      if (f.size > maxB) {
-        return { output: `Image: ${rel}\nType: ${f.type}\nSize: ${(f.size / 1024 / 1024).toFixed(1)} MB\n⚠ Too large to preview (max 10 MB). Use read_file_lines to read sections of the raw data.` };
-      }
-
       /* ── PDF handling ── */
       if (isPdfFile(f, rel)) {
-        const maxB = 100 * 1024 * 1024;
+        const maxB = LIMITS.MAX_PDF_SIZE;
         if (f.size > maxB) return { output: `PDF: ${rel}\nToo large (max 100 MB)` };
         try {
           const text = await extractPdfText(f);
@@ -9577,6 +9550,18 @@ Python command: {{PYTHON_CMD}}`;
             _pdfFile: f
           };
         } catch (e) { return { output: `PDF: ${rel}\nError: ${e.message}` }; }
+      }
+
+      const isSvg = f.type && f.type.includes('svg');
+      const isRaster = f.type && f.type.startsWith('image/') && !isSvg;
+
+      if (!isSvg && !isRaster) {
+        return { output: `"${rel}" is not an image file (type: ${f.type || 'unknown'}). Use read_file for text files.` };
+      }
+
+      const maxB = LIMITS.MAX_IMAGE_SIZE;
+      if (f.size > maxB) {
+        return { output: `Image: ${rel}\nType: ${f.type}\nSize: ${(f.size / 1024 / 1024).toFixed(1)} MB\n⚠ Too large to preview (max 10 MB). Use read_file_lines to read sections of the raw data.` };
       }
 
       /* ── SVG: render preview + keep text for code toggle ── */
@@ -9773,8 +9758,7 @@ Python command: {{PYTHON_CMD}}`;
 
         // ── Tier 2: CRLF + trailing-whitespace normalisation ─────────────
         const norm = s => s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
-                           .split('\n').map(l => l.replace(/[^\S\n]+$/, '')).join('\n')
-                           .replace(/\n{3,}/g, '\n\n');
+                          .split('\n').map(l => l.replace(/[^\S\n]+$/, '')).join('\n');
         const normContent = norm(content);
         const normOld    = norm(old_text);
         idx = normContent.indexOf(normOld);
@@ -10066,7 +10050,7 @@ Python command: {{PYTHON_CMD}}`;
       let skippedCount = 0;
 
       async function walk(h, pfx, d) {
-        if (d > 8) { entries.push('  ' + pfx + '/ [depth limit]'); return; }
+        if (d > LIMITS.DIR_LIST_DEPTH) { entries.push('  ' + pfx + '/ [depth limit]'); return; }
         try {
           for await (const [name, kh] of h.entries()) {
             if (SKIP.has(name)) { skippedCount++; continue; }
@@ -10133,7 +10117,7 @@ Python command: {{PYTHON_CMD}}`;
       requireWorkspace();
       if (!pattern) return { output: 'Error: Pattern is empty or undefined' };
       let regex;
-      try { regex = new RegExp(pattern, 'g'); }
+      try { regex = new RegExp(pattern); }
       catch { return { output: `Invalid regex: ${pattern}` }; }
       const ctx = Math.min(contextLines || 0, 10);
       const results = [];
@@ -10142,7 +10126,7 @@ Python command: {{PYTHON_CMD}}`;
       async function searchFile(fileHandle, filePath) {
         const f = await fileHandle.getFile();
         if (f.type && f.type.startsWith('image/') && !f.type.includes('svg')) return;
-        if (f.size > 5 * 1024 * 1024) return;
+        if (f.size > LIMITS.MAX_TEXT_SIZE) return;
         const buf = await f.slice(0, 8000).arrayBuffer();
         const bytes = new Uint8Array(buf);
         if (bytes.some(b => b === 0)) return;
@@ -10167,7 +10151,7 @@ Python command: {{PYTHON_CMD}}`;
       }
 
       async function walk(h, pfx, d) {
-        if (d > 8 || fileCount >= MAX_FILES) return;
+        if (d > LIMITS.DIR_LIST_DEPTH || fileCount >= MAX_FILES) return;
         for await (const [name, kh] of h.entries()) {
           if (isSkippedPath(pfx ? pfx + '/' + name : name)) continue;
           const full = pfx ? pfx + '/' + name : name;
@@ -10340,8 +10324,15 @@ Python command: {{PYTHON_CMD}}`;
     async function gitStatus() { return await execViaCompanion('git status --short 2>/dev/null || echo "NOT A GIT REPOSITORY"'); }
     async function gitDiff(staged, file) { const s = staged ? '--cached' : ''; const f = file ? `-- "${file}"` : ''; return await execViaCompanion(`git diff ${s} ${f} 2>&1`); }
     async function gitLog(count) { return await execViaCompanion(`git log --oneline -${count || 10} 2>&1`); }
-    async function gitAdd(paths) { return await execViaCompanion(`git add ${paths} 2>&1`); }
-    async function gitCommit(message) { return await execViaCompanion(`git commit -m ${JSON.stringify(message)} 2>&1`); }
+    async function gitAdd(paths) {
+      const escaped = paths.split(/\s+/).map(p => `'${p.replace(/'/g, "'\\''")}'`).join(' ');
+      return await execViaCompanion(`git add ${escaped} 2>&1`);
+    }
+    async function gitCommit(message) {
+      // Single-quote and escape any embedded single quotes
+      const safe = "'" + String(message).replace(/'/g, "'\\''") + "'";
+      return await execViaCompanion(`git commit -m ${safe} 2>&1`);
+    }
 
     /* ═══════════════ VIRTUAL SHELL ═══════════════ */
     async function execVirtual(rawCmd) {
@@ -10467,7 +10458,7 @@ Python command: {{PYTHON_CMD}}`;
       /\bgit\s+(reset\s+--hard|clean\s+-fdx|push\s+--force)\b/,
       /\b(shutdown|reboot|halt|poweroff)\b/, /\bsystemctl\s+(stop|disable|mask)\b/,
       /\bkill\s+(-9\s+)?1\b/, /\biptables\s+-F\b/,
-      /\|\s*(ba)?sh\b/, /\b(curl|wget)\s+.*\|\s*(ba)?sh\b/,
+      /\|\s*\b(ba)?sh\b/, /\b(curl|wget)\s+[^|]*\|\s*\b(ba)?sh\b/,
       /\bdrop\s+(table|database|schema)\b/i,
     ];
     function isDangerous(cmd) { return DANGEROUS.some(p => p.test(cmd)); }
@@ -10685,8 +10676,473 @@ Python command: {{PYTHON_CMD}}`;
     }
 
     /* ═══════════════ TOOL DISPATCH ═══════════════ */
+    const toolHandlers = {
+      'read_file': async (args) => {
+        if (args._parseError) return { output: 'Error: read_file received invalid arguments — ' + args._parseError + '\n\nFix: Provide "path" as valid JSON. Example:\nread_file({"path": "src/main.py"})' };
+        if (!args.path) return { output: 'Error: "path" is required for read_file. Example: read_file({"path": "src/main.py"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        return await readFileSafe(args.path);
+      },
+      'read_file_summary': async (args) => {
+        if (!args.path) return { output: 'Error: "path" is required' };
+        return await readFileSummarySafe(args.path);
+      },
+      '/reindex': async () => {
+        showToast('Re-indexing...', 'info');
+        startIndexing().then(() => showToast('Indexed ' + semanticIndex.size + ' files', 'ok'));
+        return { output: 'Re-indexing started. Will notify when complete.' };
+      },
+      'view_image': async (args) => {
+        if (args._parseError) return { output: 'Error: view_image received invalid arguments — ' + args._parseError };
+        if (!args.path) return { output: 'Error: "path" is required for view_image. Example: view_image({"path": "assets/logo.svg"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        return await viewImageSafe(args.path);
+      },
+      'read_file_lines': async (args) => {
+        if (args._parseError) return { output: 'Error: read_file_lines received invalid arguments — ' + args._parseError };
+        if (!args.path) return { output: 'Error: "path" is required for read_file_lines. Example: read_file_lines({"path": "src/main.py", "start_line": 1, "end_line": 50})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        return await readFileLinesSafe(args.path, args.start_line, args.end_line);
+      },
+      'edit_file': async (args, signal) => {
+        if (args._parseError) {
+          const isTruncated = args._parseError.includes('truncated') || args._parseError.includes('empty');
+          const pathHint = args.path ? ` (path: "${args.path}")` : '';
+          const msg = isTruncated
+            ? `TRUNCATED — edit_file JSON was cut off mid-stream${pathHint}. The edits array content was too large.\n\nThis usually happens when:\n- old_text or new_text contains a very large block of code\n- The path was placed AFTER the edits array and got cut off\n\nFix:\n1. Put "path" FIRST in the JSON object — before "edits"\n2. Keep each old_text under 20 lines / 500 chars\n3. Split large edits into multiple sequential edit_file calls\n\nExample:\nedit_file({"path":"index.html", "edits": [{"old_text":"short snippet", "new_text":"replacement"}]})`
+            : `Error: edit_file received invalid arguments${pathHint} — ${args._parseError}\n\nExample:\nedit_file({"path": "src/example.py", "edits": [{"old_text": "old line", "new_text": "new line"}]})`;
+          return { output: msg, _truncatedWrite: isTruncated };
+        }
+        if (!args.path) {
+          return { output: 'Error: "path" is required for edit_file. Put "path" as the FIRST key in the JSON object (before "edits") so it is never truncated.\n\nExample:\nedit_file({"path": "src/example.py", "edits": [{"old_text":"old text", "new_text":"new text"}]})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        }
+        if (!Array.isArray(args.edits) || !args.edits.length) {
+          return { output: 'Error: "edits" must be a non-empty array of {old_text, new_text} objects.\n\nExample:\nedit_file({"path": "src/example.py", "edits": [\n  {"old_text":"line to find", "new_text":"replacement line"},\n  {"old_text":"another line", "new_text":"another replacement"}\n]})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        }
+        let editsValid = true;
+        for (let i = 0; i < args.edits.length; i++) {
+          if (!args.edits[i].old_text) {
+            return { output: 'Error: edits[' + i + '].old_text is missing or empty. Every edit must have an "old_text" field with the exact text to find.\n\nDebug: edits[' + i + '] = ' + esc(JSON.stringify(args.edits[i]).slice(0, 200)) };
+          }
+        }
+
+        const result = await editFileSafe(args.path, args.edits, state.requireEditApproval);
+
+        const editSucceeded = result
+          && !result._pendingApproval
+          && !String(result.output || '').includes('ERROR')
+          && !String(result.output || '').includes('not found');
+
+        if (editSucceeded) {
+          debouncedFileTreeRefresh();
+          debouncedEmbedUpdate(args.path);
+          if (state.compConnected && (args.path || '').endsWith('.py')) {
+            try {
+              const check = await execViaCompanion(
+                'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
+                15, signal
+              );
+              if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
+            } catch (_) { }
+          }
+        }
+        return result;
+      },
+      'write_file_chunked': async (args, signal, panel, argsStr) => {
+        let wcArgs = args;
+        let wasSalvaged = false;
+        if (args._parseError && argsStr) {
+          const rescued = { _parseError: args._parseError };
+          const pathM = argsStr.match(/"path"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+          if (pathM) rescued.path = pathM[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+          const chunksStart = argsStr.indexOf('"chunks"');
+          if (chunksStart !== -1) {
+            const arrStart = argsStr.indexOf('[', chunksStart);
+            if (arrStart !== -1) {
+              const partial = argsStr.slice(arrStart);
+              const salvaged = [];
+              let i = 1;
+              while (i < partial.length) {
+                while (i < partial.length && /[\s,]/.test(partial[i])) i++;
+                if (partial[i] !== '"') break;
+                let j = i + 1, str = '', complete = false;
+                while (j < partial.length) {
+                  if (partial[j] === '\\' && j + 1 < partial.length) {
+                    const escChar = partial[j + 1];
+                    str += escChar === 'n' ? '\n' : escChar === 't' ? '\t' : escChar === 'r' ? '\r' : escChar === '"' ? '"' : escChar === '\\' ? '\\' : escChar;
+                    j += 2;
+                  } else if (partial[j] === '"') { complete = true; j++; break; }
+                  else { str += partial[j]; j++; }
+                }
+                if (complete) { salvaged.push(str); i = j; }
+                else break;
+              }
+              if (salvaged.length) { rescued.chunks = salvaged; wasSalvaged = true; }
+            }
+          }
+          wcArgs = rescued;
+        }
+
+        if (!wcArgs.path) {
+          return { output: 'Error: "path" is required for write_file_chunked. Put it first in the JSON.' };
+        }
+        if (!Array.isArray(wcArgs.chunks) || !wcArgs.chunks.length) {
+          const errDetail = args._parseError
+            ? `The JSON was truncated before any complete chunks could be parsed.\n\nIMPORTANT: Keep each chunk small — 50-80 lines max — so that all chunks fit within the token budget.\n\nFix:\nwrite_file_chunked({"path": "${wcArgs.path || 'YOUR_FILE'}", "chunks": ["lines 1-60 here", "lines 61-120 here", "lines 121-180 here", ...]})`
+            : `"chunks" must be a non-empty array of strings.\n\nDebug: args.chunks = ${JSON.stringify(wcArgs.chunks)}, keys: ${Object.keys(wcArgs).join(', ')}`;
+          return { output: 'Error: ' + errDetail };
+        }
+
+        const joined = wcArgs.chunks.join('');
+        let result;
+        if (wcArgs.append) {
+          let existing = '';
+          try {
+            const segs2 = sanitizePath(wcArgs.path);
+            let d2 = state.dirHandle;
+            for (let i = 0; i < segs2.length - 1; i++) d2 = await d2.getDirectoryHandle(segs2[i], { create: false }).catch(() => null);
+            if (d2) {
+              const fh2 = await d2.getFileHandle(segs2[segs2.length - 1], { create: false }).catch(() => null);
+              if (fh2) existing = await (await fh2.getFile()).text();
+            }
+          } catch { }
+          result = await writeFileSafe(wcArgs.path, existing + joined, state.requireEditApproval);
+        } else {
+          result = await writeFileSafe(wcArgs.path, joined, state.requireEditApproval);
+        }
+
+        if (result && !result._pendingApproval && !String(result.output || '').includes('Error')) {
+          const totalLines = joined.split('\n').length;
+          if (wasSalvaged) {
+            result.output = `⚠ PARTIAL WRITE (JSON was truncated mid-chunks):\n` +
+              `Wrote ${wcArgs.chunks.length} chunk(s) / ${totalLines} lines / ${joined.length} bytes to "${wcArgs.path}".\n\n` +
+              `The file is INCOMPLETE. Continue writing the rest using append mode:\n` +
+              `write_file_chunked({"path": "${wcArgs.path}", "append": true, "chunks": ["...lines that come after what was written...", "...more lines..."]})\n\n` +
+              `Keep each chunk ≤ 60 lines so all chunks fit in one tool call.`;
+          } else {
+            result.output = (result.output || 'OK') +
+              ` [write_file_chunked: ${wcArgs.chunks.length} chunks, ${totalLines} lines, ${joined.length} bytes]`;
+          }
+          debouncedFileTreeRefresh();
+          debouncedEmbedUpdate(wcArgs.path);
+        }
+        return result;
+      },
+      'write_file': async (args, signal, panel, argsStr) => {
+        if (args._parseError) {
+          const contentHint = argsStr.includes('"content"') ? 'The "content" field was present but the JSON was cut off — the file content was too long for a single tool call.' : 'Could not find a "content" field in the truncated JSON.';
+          return {
+            output: 'Error: write_file received invalid arguments — ' + args._parseError + '\n\n' + contentHint + '\n\nFix: Instead of one large write_file, either:\n1. Use edit_file with small search/replace blocks on an existing file\n2. Split into multiple smaller write_file calls\n3. Reduce the content size\n\nExample:\nwrite_file({"path": "src/example.py", "content": "print(\\"hello\\")"})\n\nIf the file is very large (>30KB), use edit_file instead.',
+            _truncatedWrite: true
+          };
+        }
+        if (!args.path) {
+          return { output: 'Error: "path" is required for write_file.\n\nExample:\nwrite_file({"path": "src/example.py", "content": "your code here"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
+        }
+        if (args.content === undefined || args.content === null) {
+          return { output: 'Error: "content" is required for write_file. The JSON may have been truncated mid-content.\n\nExample:\nwrite_file({"path": "src/example.py", "content": "your code here"})\n\nDebug: received args keys: [' + Object.keys(args).join(', ') + ']' };
+        }
+        const result = await writeFileSafe(args.path, args.content, state.requireEditApproval);
+
+        const writeSucceeded = result
+          && !result._pendingApproval
+          && !String(result.output || '').includes('Error');
+
+        if (writeSucceeded) {
+          debouncedFileTreeRefresh();
+          debouncedEmbedUpdate(args.path);
+          if (state.compConnected && (args.path || '').endsWith('.py')) {
+            try {
+              const check = await execViaCompanion(
+                'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
+                15, signal
+              );
+              if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
+            } catch (_) { }
+          }
+        }
+        return result;
+      },
+      'list_directory': async (args) => {
+        return { output: await listDirSafe(args.path || '', args.recursive || false) };
+      },
+      'search_files': async (args) => {
+        if (!args.pattern) return { output: 'Error: "pattern" is required for search_files' };
+        return { output: await searchFilesSafe(args.pattern) };
+      },
+      'grep': async (args) => {
+        if (!args.pattern) return { output: 'Error: "pattern" is required for grep' };
+        return await grepSafe(args.pattern, args.path || '', args.include || '', args.context_lines || 0);
+      },
+      'delete_file': async (args, signal, panel, argsStr) => {
+        if (!args.path) return { output: 'Error: "path" is required for delete_file' };
+        if (!args._confirmDelete) {
+          return new Promise(resolve => {
+            const isRec = !!args.recursive;
+            const warn = isRec ? ' This will delete all contents.' : '';
+            const overlay = document.createElement('div');
+            overlay.className = 'modal-overlay open';
+            overlay.style.zIndex = '150';
+            const dialog = document.createElement('div');
+            dialog.className = 'modal';
+            dialog.style.width = '400px';
+            dialog.innerHTML = `<div class="modal-hdr"><h2 style="display:flex;align-items:center;gap:6px"><i class="fas fa-triangle-exclamation" style="color:var(--red)"></i> Delete File</h2><button class="modal-close" id="df-close"><i class="fas fa-xmark"></i></button></div><div class="modal-body" style="gap:10px"><p style="font-size:13px;color:var(--tx-1);line-height:1.5;margin:0">Delete <code style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-3);padding:1px 5px;border-radius:3px;word-break:break-all">${esc(args.path)}</code>?${warn}</p><p style="font-size:11px;color:var(--tx-3);margin:0;font-style:italic">This cannot be undone.</p><div style="display:flex;gap:8px;justify-content:flex-end"><button class="sb-btn" id="df-cancel" style="padding:7px 14px;font-size:12px">Cancel</button><button class="sb-btn" id="df-ok" style="padding:7px 14px;font-size:12px;background:var(--red);color:white;border-color:var(--red)">Delete</button></div></div>`;
+            overlay.appendChild(dialog);
+            document.body.appendChild(overlay);
+            const cleanup = () => overlay.remove();
+            dialog.querySelector('#df-close').onclick = cleanup;
+            dialog.querySelector('#df-cancel').onclick = cleanup;
+            overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
+            dialog.querySelector('#df-ok').onclick = () => {
+              cleanup();
+              resolve(executeTool('delete_file', JSON.stringify({ ...safeParseArgs(argsStr), _confirmDelete: true, recursive: args.recursive }), signal, panel));
+            };
+          });
+        }
+        const result = { output: await deleteFileSafe(args.path, args.recursive) };
+        debouncedFileTreeRefresh();
+        return result;
+      },
+      'move_file': async (args) => {
+        if (!args.source) return { output: 'Error: "source" is required for move_file' };
+        if (!args.destination) return { output: 'Error: "destination" is required for move_file' };
+        const result = { output: await moveFileSafe(args.source, args.destination) };
+        debouncedFileTreeRefresh();
+        return result;
+      },
+      'semantic_search': async (args) => {
+        if (!args.query) return { output: 'Error: "query" is required for semantic_search. Example: semantic_search({"query": "find the auth middleware"})' };
+        try { return await doSemanticSearch(args.query, args.top_k || 8); }
+        catch (e) { return { output: 'Error: ' + e.message }; }
+      },
+      'start_dev_server': async (args) => {
+        if (!state.compConnected) return { output: 'start_dev_server requires the companion server.' };
+        if (!args.command) return { output: 'Error: "command" is required. Example: start_dev_server({"command": "npm run dev", "port": 3000})' };
+        const port = parseInt(args.port) || 3000;
+        try {
+          const res = await fetch(`${state.compUrl}/dev_start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ command: args.command, port, cwd: null }),
+            signal: AbortSignal.timeout(15000)
+          });
+          const data = await res.json();
+          if (data.error) return { output: `[Dev Server Error] ${data.error}` };
+          state.devServer = { port, command: args.command, pollInterval: null, ready: false };
+          switchRpTab('preview');
+          updateDevPreviewUI('starting');
+          pollDevServer(port);
+          return { output: `Dev server starting: "${args.command}" → http://localhost:${port}\n\nPreview is loading in the Preview panel. The server runs in the background — you can continue coding while it starts.\n\nUse browser_screenshot to capture the preview, browser_console to check for errors, or fetch_url to read pages.` };
+        } catch (e) {
+          return { output: `[Dev Server Error] ${e.message}` };
+        }
+      },
+      'execute_command': async (args, signal, panel) => {
+        const cmd = String(args.command || '').trim();
+        if (!cmd) return { output: 'Error: "command" is required for execute_command' };
+        if (state.compConnected && isDangerous(cmd)) {
+          return new Promise(resolve => {
+            showShellConfirm(cmd, async modifiedCmd => {
+              if (modifiedCmd) {
+                rpTermStart(modifiedCmd);
+                let streamedOutput = '';
+                const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
+                const out = await execViaCompanion(modifiedCmd, args.timeout, signal, onLine);
+                const finalOutput = (typeof out === 'string' && out) ? out : streamedOutput;
+                rpTermEnd(finalOutput);
+                resolve({ output: finalOutput });
+              } else {
+                resolve({ output: 'Command cancelled by user.' });
+              }
+            });
+          });
+        }
+        if (state.compConnected) {
+          rpTermStart(cmd);
+          let streamedOutput = '';
+          const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
+          const out = await execViaCompanion(cmd, args.timeout, signal, onLine);
+          const finalOutput = (typeof out === 'string' && out) ? out : streamedOutput;
+          rpTermEnd(finalOutput);
+          return { output: finalOutput };
+        } else { return await execVirtual(cmd); }
+      },
+      'screenshot': async (args) => {
+        if (!state.visionCapable) return { output: 'Screenshot requires a vision-capable model.' };
+        try {
+          const reason = args.reason || 'agent requested';
+          const dataUrl = navigator.mediaDevices?.getDisplayMedia ? await captureScreenRegion('SlopLobster wants to see your screen', reason) : await captureScreenshotFallback();
+          if (!dataUrl) return { output: 'Screenshot cancelled by user.' };
+          const sizeKB = Math.round((dataUrl.length * 3 / 4) / 1024);
+          return { output: 'Screenshot captured (' + sizeKB + ' KB).', _screenshotDataUrl: dataUrl, _screenshotReason: reason, _screenshotPath: 'screen-capture' };
+        } catch (e) { return { output: 'Screenshot failed: ' + e.message }; }
+      },
+      'web_search': async (args) => {
+        if (!state.compConnected) return { output: 'web_search requires the companion server.', _searchData: null };
+        if (!args.query) return { output: 'Error: "query" is required for web_search' };
+        try {
+          const data = await searchViaCompanion(args.query, args.num_results, args.fetch_top);
+          let text = 'Search: "' + args.query + '"\nFound ' + data.count + ' results\n\n';
+          data.results.forEach((r, i) => {
+            if (r.error) {
+              text += `${i + 1}. Error: ${r.error}\n\n`;
+              return;
+            }
+            text += (i + 1) + '. ' + (r.title || '(no title)') + '\n   ' + r.url + '\n';
+            if (r.snippet) text += '   ' + r.snippet + '\n'; if (r.content) text += '\n   --- Fetched content (' + (r.content_chars || r.content.length).toLocaleString() + ' chars) ---\n' + r.content.slice(0, 8000) + (r.content.length > 8000 ? '\n   ... (truncated)' : '') + '\n'; if (r.content_error) text += '   [Fetch failed: ' + r.content_error + ']\n'; text += '\n';
+          });
+          return { output: text, _searchData: data };
+        } catch (e) { return { output: 'Search error: ' + e.message, _searchData: null }; }
+      },
+      'fetch_url': async (args) => {
+        if (!state.compConnected) return { output: 'fetch_url requires the companion server.' };
+        if (!args.url || typeof args.url !== 'string' || !args.url.trim()) return { output: 'Error: "url" is required for fetch_url' };
+        if (!args.url.trim().startsWith('http://') && !args.url.trim().startsWith('https://')) return { output: 'Error: URL must start with http:// or https://' };
+        return { output: await fetchViaCompanion(args.url.trim(), args.max_bytes) };
+      },
+      'git_status': async () => {
+        return { output: await gitStatus() };
+      },
+      'git_diff': async (args) => {
+        return { output: await gitDiff(args.staged, args.file) };
+      },
+      'git_log': async (args) => {
+        return { output: await gitLog(args.count) };
+      },
+      'git_add': async (args) => {
+        if (!args.paths) return { output: 'Error: "paths" is required for git_add' };
+        return { output: await gitAdd(args.paths) };
+      },
+      'git_commit': async (args) => {
+        if (!args.message) return { output: 'Error: "message" is required for git_commit' };
+        return { output: await gitCommit(args.message) };
+      },
+      'think': async (args) => {
+        if (!args.thought) return { output: 'Error: "thought" is required for think' };
+        return { output: args.thought };
+      },
+      'browser_launch': async (args) => {
+        if (!state.compConnected) return { output: 'browser_launch requires the companion server.' };
+        if (!state.browserAvailable) return { output: 'Playwright is not installed on the companion. Run: pip install playwright Then restart the companion server.' };
+        return { output: await browserApi('/browser_launch', args) };
+      },
+      'browser_navigate': async (args) => {
+        if (!args.url) return { output: 'Error: "url" is required for browser_navigate' };
+        return { output: await browserApi('/browser_navigate', args) };
+      },
+      'browser_screenshot': async (args, signal, panel) => {
+        return await handleBrowserScreenshot(args, panel);
+      },
+      'browser_console': async (args, signal, panel) => {
+        return await handleBrowserConsole(args, panel);
+      },
+      'browser_click': async (args) => {
+        if (!args.selector) return { output: 'Error: "selector" is required for browser_click' };
+        return { output: await browserApi('/browser_click', args) };
+      },
+      'browser_type': async (args) => {
+        if (!args.selector || args.text === undefined) return { output: 'Error: "selector" and "text" are required for browser_type' };
+        return { output: await browserApi('/browser_type', args) };
+      },
+      'browser_evaluate': async (args) => {
+        if (!args.script) return { output: 'Error: "script" is required for browser_evaluate' };
+        return { output: await browserApi('/browser_evaluate', args) };
+      },
+      'browser_get_content': async (args) => {
+        return { output: await browserApi('/browser_get_content', args) };
+      },
+      'browser_wait_for': async (args) => {
+        if (!args.selector) return { output: 'Error: "selector" is required for browser_wait_for' };
+        return { output: await browserApi('/browser_wait_for', args) };
+      },
+      'browser_hover': async (args) => {
+        if (!args.selector) return { output: 'Error: "selector" is required for browser_hover' };
+        return { output: await browserApi('/browser_hover', args) };
+      },
+      'browser_select_option': async (args) => {
+        if (!args.selector || !args.value) return { output: 'Error: "selector" and "value" are required for browser_select_option' };
+        return { output: await browserApi('/browser_select_option', args) };
+      },
+      'browser_press_key': async (args) => {
+        if (!args.key) return { output: 'Error: "key" is required for browser_press_key' };
+        return { output: await browserApi('/browser_press_key', args) };
+      },
+      'browser_scroll': async (args) => {
+        return { output: await browserApi('/browser_scroll', args) };
+      },
+      'browser_go_back': async () => {
+        return { output: await browserApi('/browser_go_back', {}) };
+      },
+      'browser_go_forward': async () => {
+        return { output: await browserApi('/browser_go_forward', {}) };
+      },
+      'browser_close': async () => {
+        return { output: await browserApi('/browser_close', {}) };
+      },
+      'get_tool_schema': async (args) => {
+        const name = args.tool_name;
+        if (!name) return { output: 'Error: "tool_name" is required' };
+        const all = getToolDefs();
+        const def = all.find(t => t.function.name === name);
+        if (!def) {
+          const names = all.map(t => t.function.name).join(', ');
+          return { output: `Tool "${name}" not found.\n\nAvailable tools: ${names}` };
+        }
+        return { output: `Tool: ${name}\nDescription: \dots\n\nParameters:\n${JSON.stringify(def.function.parameters, null, 2)}`.replace('\dots', def.function.description) };
+      },
+      'spawn_swarm': async (args, signal, panel) => {
+        if (!args.goal) return { output: 'Error: "goal" is required for spawn_swarm' };
+        if (!Array.isArray(args.workers) || !args.workers.length) return { output: 'Error: "workers" must be a non-empty array' };
+        const swarmResult = await runSwarm(args.goal, args.workers, args.max_worker_iterations, signal, panel);
+        return {
+          output: `[Swarm: ${args.workers.length} workers, ${swarmResult.totalIterations} total rounds, ${(swarmResult.duration / 1000).toFixed(1)}s${swarmResult.error ? ' — ERROR' : ''}]\n\n${swarmResult.managerSummary}`,
+          _swarmData: swarmResult
+        };
+      },
+      'deep_research': async (args, signal, panel) => {
+        if (!state.compConnected) return { output: 'deep_research requires the companion server to access web_search and fetch_url.' };
+        if (!args.query) return { output: 'Error: "query" is required for deep_research.' };
+        const depth = Math.min(Math.max(
+          (typeof _drDepth !== 'undefined' ? _drDepth : null) || args.depth || 2,
+          1), 3);
+        const livePanel = createLiveResearchPanel(args.query);
+        if (panel && panel.el) {
+          panel.el.classList.add('screenshot-tool');
+          panel.el.appendChild(livePanel);
+          const resEl = panel.el.querySelector('.tool-result');
+          if (resEl) resEl.style.display = 'none';
+        }
+        let result;
+        try {
+          result = await runDeepResearch(args.query, depth, signal, livePanel);
+        } catch (drErr) {
+          console.error('[deep_research] uncaught error:', drErr);
+          const statusEl = livePanel.querySelector('.dr-status');
+          if (statusEl) statusEl.textContent = '❌ ' + drErr.message;
+          let dbgLog = livePanel.querySelector('.dr-debug-log');
+          if (!dbgLog) {
+            dbgLog = document.createElement('div');
+            dbgLog.className = 'dr-debug-log';
+            dbgLog.style.cssText = 'font-size:9px;font-family:JetBrains Mono,monospace;color:var(--red);padding:6px 8px;white-space:pre-wrap;';
+            livePanel.querySelector('.dr-body')?.appendChild(dbgLog);
+          }
+          dbgLog.textContent += '\nUNCAUGHT: ' + (drErr.stack || drErr.message);
+          result = { output: 'Deep research failed: ' + drErr.message, _sources: [], _researchData: null };
+        }
+        if (panel && panel.el) {
+           panel.el._researchData = result._researchData;
+        }
+        return result;
+      },
+      'spawn_sub_agent': async (args, signal, panel) => {
+        if (!args.task) return { output: 'Error: "task" is required for spawn_sub_agent' };
+        if (isSkippedPath(args.task)) return { output: 'Task references a filtered file.' };
+        const subResult = await runSubAgent(args.task, args.tools, args.max_iterations, signal, panel);
+        return {
+          output: `[Sub-agent: \dots]\n\dots`.replace('[Sub-agent: \dots]\n\dots', `[Sub-agent: ${subResult.iterations} rounds, ${subResult.log.length} tool calls, ${(subResult.duration / 1000).toFixed(1)}s${subResult.hitLimit ? ' — hit iteration limit' : ''}${subResult.error ? ' — ERROR' : ''}]\n${subResult.summary}`),
+          _subAgentData: subResult
+        };
+      }
+    };
+
     async function executeTool(name, argsStr, signal, panel) {
-      /* ── Parse arguments with debug-friendly error reporting ── */
       let args;
       if (!argsStr || typeof argsStr !== 'string' || !argsStr.trim()) {
         args = { _parseError: 'empty arguments string' };
@@ -10694,7 +11150,6 @@ Python command: {{PYTHON_CMD}}`;
         try {
           args = JSON.parse(argsStr);
         } catch (parseErr) {
-          /* Diagnose the truncation: show first 80 + last 80 chars of raw args */
           const raw = argsStr;
           const preview = raw.length > 200
             ? raw.slice(0, 80) + ' ... [' + raw.length + ' chars total] ... ' + raw.slice(-80)
@@ -10714,9 +11169,8 @@ Python command: {{PYTHON_CMD}}`;
         }
       }
 
-      /* ── Path sanitization (before tool switch) ── */
       if (args._parseError) {
-        /* Skip sanitization — we'll report the parse error in the tool-specific handler */
+        /* Skip */
       } else {
         const _isRootPath = args.path === '.' || args.path === './' || args.path === '/';
         if (args.path != null && args.path !== '' && !_isRootPath) { 
@@ -10727,496 +11181,13 @@ Python command: {{PYTHON_CMD}}`;
       }
 
       try {
-        let result;
-        switch (name) {
-          case 'read_file':
-            if (args._parseError) return { output: 'Error: read_file received invalid arguments — ' + args._parseError + '\n\nFix: Provide "path" as valid JSON. Example:\nread_file({"path": "src/main.py"})' };
-            if (!args.path) return { output: 'Error: "path" is required for read_file. Example: read_file({"path": "src/main.py"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-            result = await readFileSafe(args.path); break;
-
-          case 'read_file_summary': {
-            if (!args.path) return { output: 'Error: "path" is required' };
-            result = await readFileSummarySafe(args.path);
-            break;
-          }  
-
-          case '/reindex': 
-            showToast('Re-indexing...', 'info');
-            startIndexing().then(() => showToast('Indexed ' + semanticIndex.size + ' files', 'ok'));
-            break;
-
-          case 'view_image':
-            if (args._parseError) return { output: 'Error: view_image received invalid arguments — ' + args._parseError };
-            if (!args.path) return { output: 'Error: "path" is required for view_image. Example: view_image({"path": "assets/logo.svg"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-            result = await viewImageSafe(args.path); break;
-
-          case 'read_file_lines':
-            if (args._parseError) return { output: 'Error: read_file_lines received invalid arguments — ' + args._parseError };
-            if (!args.path) return { output: 'Error: "path" is required for read_file_lines. Example: read_file_lines({"path": "src/main.py", "start_line": 1, "end_line": 50})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-            result = await readFileLinesSafe(args.path, args.start_line, args.end_line); break;
-
-          case 'edit_file': {
-            if (args._parseError) {
-              const isTruncated = args._parseError.includes('truncated') || args._parseError.includes('empty');
-              const pathHint = args.path ? ` (path: "${args.path}")` : '';
-              const msg = isTruncated
-                ? `TRUNCATED — edit_file JSON was cut off mid-stream${pathHint}. The edits array content was too large.\n\nThis usually happens when:\n- old_text or new_text contains a very large block of code\n- The path was placed AFTER the edits array and got cut off\n\nFix:\n1. Put "path" FIRST in the JSON object — before "edits"\n2. Keep each old_text under 20 lines / 500 chars\n3. Split large edits into multiple sequential edit_file calls\n\nExample:\nedit_file({"path":"index.html", "edits": [{"old_text":"short snippet", "new_text":"replacement"}]})`
-                : `Error: edit_file received invalid arguments${pathHint} — ${args._parseError}\n\nExample:\nedit_file({"path": "src/example.py", "edits": [{"old_text": "old line", "new_text": "new line"}]})`;
-              result = { output: msg, _truncatedWrite: isTruncated };
-              break;
-            }
-            if (!args.path) {
-              result = { output: 'Error: "path" is required for edit_file. Put "path" as the FIRST key in the JSON object (before "edits") so it is never truncated.\n\nExample:\nedit_file({"path": "src/example.py", "edits": [{"old_text":"old text", "new_text":"new text"}]})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-              break;
-            }
-            if (!Array.isArray(args.edits) || !args.edits.length) {
-              result = { output: 'Error: "edits" must be a non-empty array of {old_text, new_text} objects.\n\nExample:\nedit_file({"path": "src/example.py", "edits": [\n  {"old_text":"line to find", "new_text":"replacement line"},\n  {"old_text":"another line", "new_text":"another replacement"}\n]})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-              break;
-            }
-            let editsValid = true;
-            for (let i = 0; i < args.edits.length; i++) {
-              if (!args.edits[i].old_text) {
-                result = { output: 'Error: edits[' + i + '].old_text is missing or empty. Every edit must have an "old_text" field with the exact text to find.\n\nDebug: edits[' + i + '] = ' + esc(JSON.stringify(args.edits[i]).slice(0, 200)) };
-                editsValid = false;
-                break;
-              }
-            }
-            if (!editsValid) break;
-
-            result = await editFileSafe(args.path, args.edits, state.requireEditApproval);
-
-            /* ── Determine if the edit actually succeeded ──
-              Check for explicit ERROR markers in the output.
-              Only refresh tree and run syntax check on SUCCESS. */
-            const editSucceeded = result
-              && !result._pendingApproval
-              && !String(result.output || '').includes('ERROR')
-              && !String(result.output || '').includes('not found');
-
-            if (editSucceeded) {
-              debouncedFileTreeRefresh();
-              debouncedEmbedUpdate(args.path);
-              /* ── Syntax check: only for files that changed, only on success ── */
-              if (state.compConnected && (args.path || '').endsWith('.py')) {
-                try {
-                  const check = await execViaCompanion(
-                    'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
-                    15, signal
-                  );
-                  if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
-                } catch (_) { /* don't let syntax check crash the tool result */ }
-              }
-            }
-            break;
-          }
-
-          case 'write_file_chunked': {
-            // Salvage partial chunks even from truncated/malformed JSON
-            let wcArgs = args;
-            let wasSalvaged = false;
-            if (args._parseError && argsStr) {
-              const rescued = { _parseError: args._parseError };
-              const pathM = argsStr.match(/"path"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-              if (pathM) rescued.path = pathM[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-              // Extract all complete quoted strings from the partial "chunks" array
-              const chunksStart = argsStr.indexOf('"chunks"');
-              if (chunksStart !== -1) {
-                const arrStart = argsStr.indexOf('[', chunksStart);
-                if (arrStart !== -1) {
-                  const partial = argsStr.slice(arrStart);
-                  const salvaged = [];
-                  let i = 1;
-                  while (i < partial.length) {
-                    while (i < partial.length && /[\s,]/.test(partial[i])) i++;
-                    if (partial[i] !== '"') break;
-                    let j = i + 1, str = '', complete = false;
-                    while (j < partial.length) {
-                      if (partial[j] === '\\' && j + 1 < partial.length) {
-                        const esc = partial[j + 1];
-                        str += esc === 'n' ? '\n' : esc === 't' ? '\t' : esc === 'r' ? '\r' : esc === '"' ? '"' : esc === '\\' ? '\\' : esc;
-                        j += 2;
-                      } else if (partial[j] === '"') { complete = true; j++; break; }
-                      else { str += partial[j]; j++; }
-                    }
-                    if (complete) { salvaged.push(str); i = j; }
-                    else break; // truncation point
-                  }
-                  if (salvaged.length) { rescued.chunks = salvaged; wasSalvaged = true; }
-                }
-              }
-              wcArgs = rescued;
-            }
-
-            if (!wcArgs.path) {
-              result = { output: 'Error: "path" is required for write_file_chunked. Put it first in the JSON.' };
-              break;
-            }
-            if (!Array.isArray(wcArgs.chunks) || !wcArgs.chunks.length) {
-              const errDetail = args._parseError
-                ? `The JSON was truncated before any complete chunks could be parsed.\n\nIMPORTANT: Keep each chunk small — 50-80 lines max — so that all chunks fit within the token budget.\n\nFix:\nwrite_file_chunked({"path": "${wcArgs.path || 'YOUR_FILE'}", "chunks": ["lines 1-60 here", "lines 61-120 here", "lines 121-180 here", ...]})`
-                : `"chunks" must be a non-empty array of strings.\n\nDebug: args.chunks = ${JSON.stringify(wcArgs.chunks)}, keys: ${Object.keys(wcArgs).join(', ')}`;
-              result = { output: 'Error: ' + errDetail };
-              break;
-            }
-
-            const joined = wcArgs.chunks.join('');
-            if (wcArgs.append) {
-              let existing = '';
-              try {
-                const segs2 = sanitizePath(wcArgs.path);
-                let d2 = state.dirHandle;
-                for (let i = 0; i < segs2.length - 1; i++) d2 = await d2.getDirectoryHandle(segs2[i], { create: false }).catch(() => null);
-                if (d2) {
-                  const fh2 = await d2.getFileHandle(segs2[segs2.length - 1], { create: false }).catch(() => null);
-                  if (fh2) existing = await (await fh2.getFile()).text();
-                }
-              } catch { /* file doesn't exist yet */ }
-              result = await writeFileSafe(wcArgs.path, existing + joined, state.requireEditApproval);
-            } else {
-              result = await writeFileSafe(wcArgs.path, joined, state.requireEditApproval);
-            }
-
-            if (result && !result._pendingApproval && !String(result.output || '').includes('Error')) {
-              const totalLines = joined.split('\n').length;
-              if (wasSalvaged) {
-                // Partial write — tell the model exactly what was written and how to continue
-                result.output = `⚠ PARTIAL WRITE (JSON was truncated mid-chunks):\n` +
-                  `Wrote ${wcArgs.chunks.length} chunk(s) / ${totalLines} lines / ${joined.length} bytes to "${wcArgs.path}".\n\n` +
-                  `The file is INCOMPLETE. Continue writing the rest using append mode:\n` +
-                  `write_file_chunked({"path": "${wcArgs.path}", "append": true, "chunks": ["...lines that come after what was written...", "...more lines..."]})\n\n` +
-                  `Keep each chunk ≤ 60 lines so all chunks fit in one tool call.`;
-              } else {
-                result.output = (result.output || 'OK') +
-                  ` [write_file_chunked: ${wcArgs.chunks.length} chunks, ${totalLines} lines, ${joined.length} bytes]`;
-              }
-              debouncedFileTreeRefresh();
-              debouncedEmbedUpdate(wcArgs.path);
-            }
-            break;
-          }
-
-          case 'write_file': {
-            if (args._parseError) {
-              const contentHint = argsStr.includes('"content"') ? 'The "content" field was present but the JSON was cut off — the file content was too long for a single tool call.' : 'Could not find a "content" field in the truncated JSON.';
-              result = {
-                output: 'Error: write_file received invalid arguments — ' + args._parseError + '\n\n' + contentHint + '\n\nFix: Instead of one large write_file, either:\n1. Use edit_file with small search/replace blocks on an existing file\n2. Split into multiple smaller write_file calls\n3. Reduce the content size\n\nExample:\nwrite_file({"path": "src/example.py", "content": "print(\\"hello\\")"})\n\nIf the file is very large (>30KB), use edit_file instead.',
-                _truncatedWrite: true
-              };
-              break;
-            }
-            if (!args.path) {
-              result = { output: 'Error: "path" is required for write_file.\n\nExample:\nwrite_file({"path": "src/example.py", "content": "your code here"})\n\nDebug: received args: ' + esc(JSON.stringify(args).slice(0, 300)) };
-              break;
-            }
-            if (args.content === undefined || args.content === null) {
-              result = { output: 'Error: "content" is required for write_file. The JSON may have been truncated mid-content.\n\nExample:\nwrite_file({"path": "src/example.py", "content": "your code here"})\n\nDebug: received args keys: [' + Object.keys(args).join(', ') + ']' };
-              break;
-            }
-            result = await writeFileSafe(args.path, args.content, state.requireEditApproval);
-
-            const writeSucceeded = result
-              && !result._pendingApproval
-              && !String(result.output || '').includes('Error');
-
-            if (writeSucceeded) {
-              debouncedFileTreeRefresh();
-              debouncedEmbedUpdate(args.path);
-              /* Skip JS syntax check for .js files — node -c doesn't handle ESM (import/export).
-                Only check .py files where py_compile works reliably. */
-              if (state.compConnected && (args.path || '').endsWith('.py')) {
-                try {
-                  const check = await execViaCompanion(
-                    'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
-                    15, signal
-                  );
-                  if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
-                } catch (_) { }
-              }
-            }
-            break;
-          }
-
-          case 'list_directory':
-            result = { output: await listDirSafe(args.path || '', args.recursive || false) }; break;
-          case 'search_files':
-            if (!args.pattern) return { output: 'Error: "pattern" is required for search_files' };
-            result = { output: await searchFilesSafe(args.pattern) }; break;
-          case 'grep':
-            if (!args.pattern) return { output: 'Error: "pattern" is required for grep' };
-            result = await grepSafe(args.pattern, args.path || '', args.include || '', args.context_lines || 0); break;
-          case 'delete_file':
-            if (!args.path) return { output: 'Error: "path" is required for delete_file' };
-            if (!args._confirmDelete) {
-              return new Promise(resolve => {
-                const isRec = !!args.recursive;
-                const warn = isRec ? ' This will delete all contents.' : '';
-                const overlay = document.createElement('div');
-                overlay.className = 'modal-overlay open';
-                overlay.style.zIndex = '150';
-                const dialog = document.createElement('div');
-                dialog.className = 'modal';
-                dialog.style.width = '400px';
-                dialog.innerHTML = `<div class="modal-hdr"><h2 style="display:flex;align-items:center;gap:6px"><i class="fas fa-triangle-exclamation" style="color:var(--red)"></i> Delete File</h2><button class="modal-close" id="df-close"><i class="fas fa-xmark"></i></button></div><div class="modal-body" style="gap:10px"><p style="font-size:13px;color:var(--tx-1);line-height:1.5;margin:0">Delete <code style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-3);padding:1px 5px;border-radius:3px;word-break:break-all">${esc(args.path)}</code>?${warn}</p><p style="font-size:11px;color:var(--tx-3);margin:0;font-style:italic">This cannot be undone.</p><div style="display:flex;gap:8px;justify-content:flex-end"><button class="sb-btn" id="df-cancel" style="padding:7px 14px;font-size:12px">Cancel</button><button class="sb-btn" id="df-ok" style="padding:7px 14px;font-size:12px;background:var(--red);color:white;border-color:var(--red)">Delete</button></div></div>`;
-                overlay.appendChild(dialog);
-                document.body.appendChild(overlay);
-                const cleanup = () => overlay.remove();
-                dialog.querySelector('#df-close').onclick = cleanup;
-                dialog.querySelector('#df-cancel').onclick = cleanup;
-                overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
-                dialog.querySelector('#df-ok').onclick = () => {
-                  cleanup();
-                  resolve(executeTool('delete_file', JSON.stringify({ ...safeParseArgs(argsStr), _confirmDelete: true, recursive: args.recursive }), signal, panel));
-                };
-              });
-            }
-            result = { output: await deleteFileSafe(args.path, args.recursive) };
-            debouncedFileTreeRefresh(); break;
-          case 'move_file':
-            if (!args.source) return { output: 'Error: "source" is required for move_file' };
-            if (!args.destination) return { output: 'Error: "destination" is required for move_file' };
-            result = { output: await moveFileSafe(args.source, args.destination) };
-            debouncedFileTreeRefresh(); break;
-          case 'semantic_search':
-            if (!args.query) return { output: 'Error: "query" is required for semantic_search. Example: semantic_search({"query": "find the auth middleware"})' };
-            try { result = await doSemanticSearch(args.query, args.top_k || 8); }
-            catch (e) { result = { output: 'Error: ' + e.message }; }
-            break;
-          case 'start_dev_server': {
-            if (!state.compConnected) return { output: 'start_dev_server requires the companion server.' };
-            if (!args.command) return { output: 'Error: "command" is required. Example: start_dev_server({"command": "npm run dev", "port": 3000})' };
-            const port = parseInt(args.port) || 3000;
-
-            try {
-              const res = await fetch(`${state.compUrl}/dev_start`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command: args.command, port, cwd: null }),
-                signal: AbortSignal.timeout(15000)
-              });
-              const data = await res.json();
-              if (data.error) return { output: `[Dev Server Error] ${data.error}` };
-
-              state.devServer = { port, command: args.command, pollInterval: null, ready: false };
-
-              // Switch to preview tab and start polling
-              switchRpTab('preview');
-              updateDevPreviewUI('starting');
-              pollDevServer(port);
-
-              return { output: `Dev server starting: "${args.command}" → http://localhost:${port}\n\nPreview is loading in the Preview panel. The server runs in the background — you can continue coding while it starts.\n\nUse browser_screenshot to capture the preview, browser_console to check for errors, or fetch_url to read pages.` };
-            } catch (e) {
-              return { output: `[Dev Server Error] ${e.message}` };
-            }
-            break;
-          }  
-          case 'execute_command': {
-            const cmd = String(args.command || '').trim();
-            if (!cmd) return { output: 'Error: "command" is required for execute_command' };
-            if (state.compConnected && isDangerous(cmd)) {
-              return new Promise(resolve => {
-                showShellConfirm(cmd, async modifiedCmd => {
-                  if (modifiedCmd) {
-                    rpTermStart(modifiedCmd);
-                    let streamedOutput = '';
-                    const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
-                    const out = await execViaCompanion(modifiedCmd, args.timeout, signal, onLine);
-                    const finalOutput = (typeof out === 'string' && out) ? out : streamedOutput;
-                    rpTermEnd(finalOutput);
-                    resolve({ output: finalOutput });
-                  } else {
-                    resolve({ output: 'Command cancelled by user.' });
-                  }
-                });
-              });
-            }
-            if (state.compConnected) {
-              rpTermStart(cmd);
-              let streamedOutput = '';
-              const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
-              const out = await execViaCompanion(cmd, args.timeout, signal, onLine);
-              const finalOutput = (typeof out === 'string' && out) ? out : streamedOutput;
-              rpTermEnd(finalOutput);
-              result = { output: finalOutput };
-            } else { result = await execVirtual(cmd); }
-            break;
-          }
-          case 'screenshot':
-            if (!state.visionCapable) return { output: 'Screenshot requires a vision-capable model.' };
-            try {
-              const reason = args.reason || 'agent requested';
-              const dataUrl = navigator.mediaDevices?.getDisplayMedia ? await captureScreenRegion('SlopLobster wants to see your screen', reason) : await captureScreenshotFallback();
-              if (!dataUrl) return { output: 'Screenshot cancelled by user.' };
-              const sizeKB = Math.round((dataUrl.length * 3 / 4) / 1024);
-              result = { output: 'Screenshot captured (' + sizeKB + ' KB).', _screenshotDataUrl: dataUrl, _screenshotReason: reason, _screenshotPath: 'screen-capture' };
-            } catch (e) { result = { output: 'Screenshot failed: ' + e.message }; }
-            break;
-          case 'web_search':
-            if (!state.compConnected) return { output: 'web_search requires the companion server.', _searchData: null };
-            if (!args.query) return { output: 'Error: "query" is required for web_search' };
-            try {
-              const data = await searchViaCompanion(args.query, args.num_results, args.fetch_top);
-              let text = 'Search: "' + args.query + '"\nFound ' + data.count + ' results\n\n';
-              data.results.forEach((r, i) => {
-                if (r.error) {
-                  text += `${i + 1}. Error: ${r.error}\n\n`;
-                  return;
-                }
-                text += (i + 1) + '. ' + (r.title || '(no title)') + '\n   ' + r.url + '\n';
-                if (r.snippet) text += '   ' + r.snippet + '\n'; if (r.content) text += '\n   --- Fetched content (' + (r.content_chars || r.content.length).toLocaleString() + ' chars) ---\n' + r.content.slice(0, 8000) + (r.content.length > 8000 ? '\n   ... (truncated)' : '') + '\n'; if (r.content_error) text += '   [Fetch failed: ' + r.content_error + ']\n'; text += '\n';
-              });
-              result = { output: text, _searchData: data };
-            } catch (e) { result = { output: 'Search error: ' + e.message, _searchData: null }; }
-            break;
-          case 'fetch_url':
-            if (!state.compConnected) return { output: 'fetch_url requires the companion server.' };
-            if (!args.url || typeof args.url !== 'string' || !args.url.trim()) return { output: 'Error: "url" is required for fetch_url' };
-            if (!args.url.trim().startsWith('http://') && !args.url.trim().startsWith('https://')) return { output: 'Error: URL must start with http:// or https://' };
-            result = { output: await fetchViaCompanion(args.url.trim(), args.max_bytes) }; break;
-          case 'git_status': result = { output: await gitStatus() }; break;
-          case 'git_diff': result = { output: await gitDiff(args.staged, args.file) }; break;
-          case 'git_log': result = { output: await gitLog(args.count) }; break;
-          case 'git_add':
-            if (!args.paths) return { output: 'Error: "paths" is required for git_add' };
-            result = { output: await gitAdd(args.paths) }; break;
-          case 'git_commit':
-            if (!args.message) return { output: 'Error: "message" is required for git_commit' };
-            result = { output: await gitCommit(args.message) }; break;
-          case 'think':
-            if (!args.thought) return { output: 'Error: "thought" is required for think' };
-            result = { output: args.thought }; break;
-          case 'browser_launch':
-            if (!state.compConnected) return { output: 'browser_launch requires the companion server.' };
-            if (!state.browserAvailable) return { output: 'Playwright is not installed on the companion. Run: pip install playwright Then restart the companion server.' };
-            result = { output: await browserApi('/browser_launch', args) }; break;
-          case 'browser_navigate':
-            if (!args.url) return { output: 'Error: "url" is required for browser_navigate' };
-            result = { output: await browserApi('/browser_navigate', args) }; break;
-          case 'browser_screenshot':
-            result = await handleBrowserScreenshot(args, panel); break;
-          case 'browser_console':
-            result = await handleBrowserConsole(args, panel); break;
-          case 'browser_click':
-            if (!args.selector) return { output: 'Error: "selector" is required for browser_click' };
-            result = { output: await browserApi('/browser_click', args) }; break;
-          case 'browser_type':
-            if (!args.selector || args.text === undefined) return { output: 'Error: "selector" and "text" are required for browser_type' };
-            result = { output: await browserApi('/browser_type', args) }; break;
-          case 'browser_evaluate':
-            if (!args.script) return { output: 'Error: "script" is required for browser_evaluate' };
-            result = { output: await browserApi('/browser_evaluate', args) }; break;
-          case 'browser_get_content':
-            result = { output: await browserApi('/browser_get_content', args) }; break;
-          case 'browser_wait_for':
-            if (!args.selector) return { output: 'Error: "selector" is required for browser_wait_for' };
-            result = { output: await browserApi('/browser_wait_for', args) }; break;
-          case 'browser_hover':
-            if (!args.selector) return { output: 'Error: "selector" is required for browser_hover' };
-            result = { output: await browserApi('/browser_hover', args) }; break;
-          case 'browser_select_option':
-            if (!args.selector || !args.value) return { output: 'Error: "selector" and "value" are required for browser_select_option' };
-            result = { output: await browserApi('/browser_select_option', args) }; break;
-          case 'browser_press_key':
-            if (!args.key) return { output: 'Error: "key" is required for browser_press_key' };
-            result = { output: await browserApi('/browser_press_key', args) }; break;
-          case 'browser_scroll':
-            result = { output: await browserApi('/browser_scroll', args) }; break;
-          case 'browser_go_back':
-            result = { output: await browserApi('/browser_go_back', {}) }; break;
-          case 'browser_go_forward':
-            result = { output: await browserApi('/browser_go_forward', {}) }; break;
-          case 'browser_close':
-            result = { output: await browserApi('/browser_close', {}) }; break;     
-            
-            
-            
-          case 'get_tool_schema': {
-            const name = args.tool_name;
-            if (!name) { result = { output: 'Error: "tool_name" is required' }; break; }
-            const all = getToolDefs();
-            const def = all.find(t => t.function.name === name);
-            if (!def) {
-              const names = all.map(t => t.function.name).join(', ');
-              result = { output: `Tool "${name}" not found.\n\nAvailable tools: ${names}` };
-            } else {
-              result = { output: `Tool: ${name}\nDescription: ${def.function.description}\n\nParameters:\n${JSON.stringify(def.function.parameters, null, 2)}` };
-            }
-            break;
-          }
-
-          case 'spawn_swarm':
-            if (!args.goal) return { output: 'Error: "goal" is required for spawn_swarm' };
-            if (!Array.isArray(args.workers) || !args.workers.length) return { output: 'Error: "workers" must be a non-empty array' };
-            {
-              const swarmResult = await runSwarm(args.goal, args.workers, args.max_worker_iterations, signal, panel);
-              result = {
-                output: `[Swarm: ${args.workers.length} workers, ${swarmResult.totalIterations} total rounds, ${(swarmResult.duration / 1000).toFixed(1)}s${swarmResult.error ? ' — ERROR' : ''}]\n\n${swarmResult.managerSummary}`,
-                _swarmData: swarmResult
-              };
-            }
-            break;
-
-          case 'deep_research':
-            if (!state.compConnected) return { output: 'deep_research requires the companion server to access web_search and fetch_url.' };
-            if (!args.query) return { output: 'Error: "query" is required for deep_research.' };
-            {
-              // Prefer the UI depth selector (_drDepth) over whatever the LLM guessed
-              const depth = Math.min(Math.max(
-                (typeof _drDepth !== 'undefined' ? _drDepth : null) || args.depth || 2,
-                1), 3);
-              const livePanel = createLiveResearchPanel(args.query);
-              
-              if (panel && panel.el) {
-                panel.el.classList.add('screenshot-tool');
-                panel.el.appendChild(livePanel);
-                const resEl = panel.el.querySelector('.tool-result');
-                if (resEl) resEl.style.display = 'none';
-              }
-              
-              let result;
-              try {
-                result = await runDeepResearch(args.query, depth, signal, livePanel);
-              } catch (drErr) {
-                console.error('[deep_research] uncaught error:', drErr);
-                const statusEl = livePanel.querySelector('.dr-status');
-                if (statusEl) statusEl.textContent = '❌ ' + drErr.message;
-                let dbgLog = livePanel.querySelector('.dr-debug-log');
-                if (!dbgLog) {
-                  dbgLog = document.createElement('div');
-                  dbgLog.className = 'dr-debug-log';
-                  dbgLog.style.cssText = 'font-size:9px;font-family:JetBrains Mono,monospace;color:var(--red);padding:6px 8px;white-space:pre-wrap;';
-                  livePanel.querySelector('.dr-body')?.appendChild(dbgLog);
-                }
-                dbgLog.textContent += '\nUNCAUGHT: ' + (drErr.stack || drErr.message);
-                result = { output: 'Deep research failed: ' + drErr.message, _sources: [], _researchData: null };
-              }
-              
-              if (panel && panel.el) {
-                 panel.el._researchData = result._researchData;
-              }
-              return result;
-            }
-
-          case 'spawn_sub_agent':
-            if (!args.task) return { output: 'Error: "task" is required for spawn_sub_agent' };
-            {
-              if (isSkippedPath(args.task)) return { output: 'Task references a filtered file.' };
-              const subResult = await runSubAgent(args.task, args.tools, args.max_iterations, signal, panel);
-              result = {
-                output: `[Sub-agent: ${subResult.iterations} rounds, ${subResult.log.length} tool calls, ${(subResult.duration / 1000).toFixed(1)}s${subResult.hitLimit ? ' — hit iteration limit' : ''}${subResult.error ? ' — ERROR' : ''}]\n${subResult.summary}`,
-                _subAgentData: subResult
-              };
-            }
-            break;
-          default: result = { output: 'Unknown tool: ' + name };
-        }
-
-        return result;
+        return await handler(args, signal, panel, argsStr);
       } catch (e) {
+        if (e.name === 'AbortError' || signal?.aborted) throw e; // propagate
         return { output: 'Error: ' + e.message };
       }
-    
     }
-    /* ═══════════════ PROJECT DETECTION ═══════════════ */
+/* ═══════════════ PROJECT DETECTION ═══════════════ */
     async function detectProject() {
       if (!state.dirHandle) { state.projectType = null; state.projectMeta = null; document.getElementById('proj-badge-area').innerHTML = ''; return; }
       const detectors = [
@@ -11279,9 +11250,26 @@ Python command: {{PYTHON_CMD}}`;
       const cp = state.checkpoints.find(c => c.id === checkpointId);
       if (!cp) return;
       if (state.running) { state.abortCtrl?.abort(); state.running = false; updateSendBtn(); }
+      
+      // 1. Restore all files in the checkpoint to their snapshot state
       for (const [path, content] of Object.entries(cp.files)) {
         try { await writeFileSafe(path, content); } catch (e) { showToast(`Rewind failed for ${path}: ${e.message}`, 'err'); }
       }
+      
+      // 2. Revert or delete files modified AFTER this checkpoint
+      for (const path of allModified) {
+        if (!cp.files[path]) {
+          const originalContent = state.fileBackups.get(path);
+          if (originalContent !== null && originalContent !== undefined) {
+            // File existed before the session; restore its original content
+            try { await writeFileSafe(path, originalContent); } catch (e) { /* ignore */ }
+          } else {
+            // File was created during the session; delete it
+            try { await deleteFileSafe(path); } catch (e) { /* ignore */ }
+          }
+        }
+      }
+
       state.messages = state.messages.slice(0, cp.messageCount);
       state.checkpoints = state.checkpoints.filter(c => c.id <= checkpointId);
       modifiedFiles.clear(); newFiles.clear();
@@ -11459,14 +11447,21 @@ Python command: {{PYTHON_CMD}}`;
           checkCompanion();
         }
 
+    function decodeJsonString(s) {
+      try { return JSON.parse('"' + s + '"'); }
+      catch { return s.replace(/\\(.)/g, (_, c) =>
+        c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c); }
+    }
 
-    function extractThinkText(argsStr) {
-      // Don't try to show partial JSON — it'll be garbage
+    function extractThinkText(argsStr, streaming = false) {
       try { const a = JSON.parse(argsStr); return a.thought || ''; } catch { }
-      // Only try regex if we can see a closing quote for the value
+      // Complete match
       const m = argsStr.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)"/);
-      if (m) return m[1].replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-      return ''; // ← was: return argsStr.replace(...) which showed garbage
+      if (m) return decodeJsonString(m[1]);
+      // Streaming: match everything after the opening quote
+      const sm = argsStr.match(/"thought"\s*:\s*"((?:[^"\\]|\\.)*)/);
+      if (sm) return decodeJsonString(sm[1]);
+      return '';
     }
 
     async function streamChat(messages, onChunk, onToolCall, onThinkStream) {
@@ -12117,11 +12112,13 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         }
       }
 
+
       // ── Agent loop ──
       while (iterations < maxIterations) {
         if (subAbort.signal.aborted) break;
         iterations++;
         updatePanelStatus(`Round ${iterations}/${maxIterations}`, 'run');
+        const subStats = createCompressionStats(); 
 
         let content = '';
         let toolCalls = [];
@@ -12188,7 +12185,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           subMessages.push({
             role: 'tool',
             tool_call_id: r.tc.id,
-            content: r.output
+            content: compressToolOutput(r.tc.function.name, r.output, subStats)
           });
         }
 
@@ -12310,8 +12307,22 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       /** Serialise to a JSON string for injection into worker prompts */
       toContextString() {
         if (!this._store.size) return '(empty — no data written yet)';
+        
         return [...this._store.entries()]
-          .map(([k, v]) => `  ${k}: ${JSON.stringify(v.value).slice(0, 200)} [written by ${v.writer}]`)
+          .map(([k, v]) => {
+            const valStr = JSON.stringify(v.value);
+            
+            // Increased limit to 500 chars to better fit schemas/endpoints
+            const MAX_LEN = 500;
+            
+            if (valStr.length > MAX_LEN) {
+              // Explicitly mark truncated data so the worker knows it's incomplete
+              const truncatedVal = valStr.slice(0, MAX_LEN) + '... [TRUNCATED]';
+              return `  ${k}: ${truncatedVal} [written by ${v.writer}]`;
+            }
+            
+            return `  ${k}: ${valStr} [written by ${v.writer}]`;
+          })
           .join('\n');
       }
     }
@@ -12546,6 +12557,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           if (workerAbort.signal.aborted) break;
           iterations++;
           if (wIter) wIter.textContent = `${iterations}/${maxIter}r`;
+          const workerStats = createCompressionStats(); 
 
           // Patch system prompt into sub-agent chat manually
           const apiMsgs = [{ role: 'system', content: sysPrompt }, ...subMessages];
@@ -12642,7 +12654,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               try {
                 const res = await executeTool(name, tc.function.arguments, workerAbort.signal, null);
                 outText = (typeof res === 'string') ? res : (res?.output || '');
-                outText = compressToolOutput(name, outText);
+                outText = compressToolOutput(name, outText, workerStats);
                 log.push({ tool: name, args: (tc.function.arguments || '').slice(0, 100), output: outText.slice(0, 200), success: !outText.includes('Error:') && !outText.includes('ERROR') });
               } catch (e) {
                 outText = 'Error: ' + e.message;
@@ -12889,28 +12901,6 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       return null;
     }
 
-    async function unloadModel(instanceId) {
-      /* Unload a model from LM Studio GPU. Returns true on success. */
-      if (!instanceId) return false;
-      try {
-        const res = await fetch(`${state.apiUrl}/api/v1/models/unload`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ instance_id: instanceId }),
-          signal: AbortSignal.timeout(15000)
-        });
-        if (res.ok) {
-          activeInstance = null;
-          return true;
-        }
-        const err = await res.text().catch(() => res.statusText);
-        console.warn('[model] unload failed:', res.status, err);
-        return false;
-      } catch (e) {
-        console.warn('[model] unload error:', e.message);
-        return false;
-      }
-    }
 
     let _refreshing = false;
     let _queuedRefresh = false;
@@ -13354,7 +13344,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       for (const line of lines) {
         if (line.startsWith('FILE ') || line.startsWith('DIR ')) {
           const isDir = line.startsWith('DIR ');
-          const rest = line.slice(5); // strip "FILE " or "DIR  "
+          const rest = isDir ? line.slice(4) : line.slice(5); // strip "FILE " or "DIR  "
           const tagM = rest.match(/^(.+?)(\s+\[(IMAGE|PDF)\])?$/);
           const path = tagM ? tagM[1] : rest;
           const tag = tagM && tagM[2] ? '|' + tagM[3] : '';
@@ -13382,11 +13372,9 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       return text.slice(0, head) + truncMsg + text.slice(-tail);
     }
 
-    let _totalCompressedChars = 0;
-    let _totalOriginalChars = 0;
-
+    /** Creates an isolated stats object for tracking compression */
     /** Master pipeline — call before pushing any tool result to state.messages */
-    function compressToolOutput(toolName, outText) {
+    function compressToolOutput(toolName, outText, stats) {
       if (!outText || typeof outText !== 'string') return outText;
       let t = outText;
 
@@ -13394,7 +13382,6 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       if (toolName === 'web_search') t = _compressSearchOutput(t);
       else if (toolName === 'list_directory') t = _compressDirectoryOutput(t);
       else if (toolName === 'fetch_url') {
-        // Strip HTML from the content section (after the --- separator)
         const sepIdx = t.indexOf('\n---\n');
         if (sepIdx !== -1) {
           const header = t.slice(0, sepIdx + 5);
@@ -13407,22 +13394,23 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       // Universal size cap
       t = _capOutputSize(t, toolName);
 
-      // Track savings
-      _totalOriginalChars += outText.length;
-      _totalCompressedChars += t.length;
+      // Track savings in the provided stats object
+      if (stats) {
+        stats.original += outText.length;
+        stats.compressed += t.length;
+      }
 
       return t;
     }
 
-    function getCompressionStats() {
-      if (_totalOriginalChars === 0) return null;
-      const saved = _totalOriginalChars - _totalCompressedChars;
-      const pct = Math.round(saved / _totalOriginalChars * 100);
-      return { saved, pct, original: _totalOriginalChars, compressed: _totalCompressedChars };
+    function getCompressionStats(stats) {
+      if (!stats || stats.original === 0) return null;
+      const saved = stats.original - stats.compressed;
+      const pct = Math.round(saved / stats.original * 100);
+      return { saved, pct, original: stats.original, compressed: stats.compressed };
     }
 
     /* ══════════════════════════════════════════════════════════= */
-    const PROGRESS_FILE = getProgressFile(state.activeConvId);
 
     function getProgressFile(convId) {
       return `.sloplobster-progress-${convId || 'default'}.md`;
@@ -13567,21 +13555,22 @@ Use git_diff to review changes before committing. git_diff without arguments sho
 
       const sysPrompt = 'Summarize this conversation preserving: the core task, key decisions, files modified with brief descriptions, errors and their resolutions, current state. Be concise — under 600 tokens.';
       const convText = state.messages.map(m => {
+        let text = '';
         if (m._images?.length) {
-          text += `\n[${m._images.length} image(s) were attached and analyzed]`;
+          text += `\n[${m._images.length} image(s) were attached and analyzed]\n`;
         }
-        if (m.role === 'user') return '[User]: ' + (m.content || '');
+        if (m.role === 'user') return text + '[User]: ' + (m.content || '');
         if (m.role === 'assistant') {
-          let text = '[Agent]: ' + (m.content || '');
+          let t = text + '[Agent]: ' + (m.content || '');
           if (m.tool_calls) {
-            text += '\n[Tools Called]: ' + m.tool_calls.map(tc => {
+            t += '\n[Tools Called]: ' + m.tool_calls.map(tc => {
               const args = safeParseArgs(tc.function.arguments);
               return tc.function.name + '(' + Object.entries(args).map(([k, v]) => k + '=' + String(v).slice(0, 60)).join(', ') + ')';
             }).join(', ');
           }
-          return text;
+          return t;
         }
-        if (m.role === 'tool') return '[Tool Result]: ' + m.content.slice(0, 150) + '...';
+        if (m.role === 'tool') return text + '[Tool Result]: ' + m.content.slice(0, 150) + '...';
         return '';
       }).filter(Boolean).join('\n');
 
@@ -13660,9 +13649,15 @@ Use git_diff to review changes before committing. git_diff without arguments sho
     /* ═══════════════ AGENT LOOP ═══════════════ */
     let agentStopwatch = null;
 
+    /** Creates an isolated stats object for tracking compression */
+    function createCompressionStats() {
+      return { original: 0, compressed: 0 };
+    }
+
     async function agentLoop() {
       state.running = true; updateSendBtn();
       let iters = 0;
+      const compStats = createCompressionStats(); 
       const SOFT_WARN = Math.floor(state.maxIters * 0.4);
       const COMPACT_AT = Math.floor(state.maxIters * 0.6);
       const HARD_STOP = state.maxIters;
@@ -14359,7 +14354,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
                 });
                 continue;
               }
-              const toolMsg = { role: 'tool', tool_call_id: tc.id, content: compressToolOutput(tc.function.name, r.outText), _diff: r.diff || null, _searchData: r.searchData || null };
+              const toolMsg = { role: 'tool', tool_call_id: tc.id, content: compressToolOutput(tc.function.name, r.outText, compStats), _diff: r.diff || null, _searchData: r.searchData || null };
               if (panel) {
                 if (panel.el._svgPreviewUrl) { toolMsg._svgPreviewUrl = panel.el._svgPreviewUrl; toolMsg._svgText = panel.el._svgText; toolMsg._svgPath = panel.el._svgPath; }
                 if (panel.el._previewDataUrl) { toolMsg._previewDataUrl = panel.el._previewDataUrl; toolMsg._previewPath = panel.el._previewPath; }
@@ -14462,7 +14457,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         }
 
         // Save a checkpoint after each iteration where files were modified
-        saveCheckpoint(iters);
+        modifiedFiles.forEach(p => allModified.add(p));
+        saveCheckpoint(iters, allModified); // pass cumulative set
         modifiedFiles.clear(); newFiles.clear();
 
         updateContextMeter();
