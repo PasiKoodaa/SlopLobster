@@ -11171,7 +11171,7 @@ Python command: {{PYTHON_CMD}}`;
       }
 
       if (args._parseError) {
-        /* Skip */
+        /* Skip sanitization if parsing failed */
       } else {
         const _isRootPath = args.path === '.' || args.path === './' || args.path === '/';
         if (args.path != null && args.path !== '' && !_isRootPath) { 
@@ -11182,9 +11182,16 @@ Python command: {{PYTHON_CMD}}`;
       }
 
       try {
+        const handler = toolHandlers[name];
+        if (!handler) {
+          return { output: 'Unknown tool: ' + name };
+        }
         return await handler(args, signal, panel, argsStr);
       } catch (e) {
-        if (e.name === 'AbortError' || signal?.aborted) throw e; // propagate
+        // FIX: If the user hit Esc or cancelled, don't turn it into a text error for the LLM to read.
+        // Re-throw it so the agentLoop catches it and stops properly.
+        if (e.name === 'AbortError' || signal?.aborted) throw e;
+        
         return { output: 'Error: ' + e.message };
       }
     }
