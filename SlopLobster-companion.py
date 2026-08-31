@@ -36,10 +36,19 @@ def kill_tree(pid):
 
 def _find_bash():
     if platform.system() != "Windows": return None
-    for p in [shutil.which("bash"), r"C:\Program Files\Git\bin\bash.exe",
-              r"C:\Program Files (x86)\Git\bin\bash.exe",
-              r"C:\Program Files\Git\usr\bin\bash.exe"]:
-        if p: return p
+    candidates = [
+        "C:/Program Files/Git/bin/bash.exe",
+        "C:/Program Files (x86)/Git/bin/bash.exe",
+        "C:/Program Files/Git/usr/bin/bash.exe",
+        os.path.expandvars("%LOCALAPPDATA%/Programs/Git/bin/bash.exe"),
+        os.path.expandvars("%USERPROFILE%/AppData/Local/Programs/Git/bin/bash.exe"),
+    ]
+    for p in candidates:
+        if os.path.isfile(p): return p
+    wb = shutil.which("bash")
+    # CRITICAL: Exclude C:\Windows\System32\bash.exe (WSL launcher that causes 0x80072747 socket buffer exhaustion)
+    if wb and not wb.replace("\\", "/").lower().startswith("c:/windows/system32"):
+        return wb
     return None
 
 WINDOWS_BASH = _find_bash()
@@ -578,6 +587,10 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
         
     with lock: 
         full = ''.join(out_buf) + ''.join(err_buf)
+        if "0x80072747" in full or "0x800705aa" in full or "lacked sufficient buffer space" in full:
+            time.sleep(1.0)
+            if WINDOWS_BASH:
+                _pshell_invalidate()
         if len(full) > MAX_OUTPUT: 
             # Fixed: use \n for actual newlines instead of literal \n text
             full = full[:MAX_OUTPUT] + f"\n[Truncated at {MAX_OUTPUT}]"
@@ -843,7 +856,136 @@ def _check_dev_ready(port, timeout=3):
         with socket.create_connection(("127.0.0.1", port), timeout=timeout):
             return True
     except (OSError, socket.timeout):
-        return False    
+        return False
+
+_mcp_servers = {}
+_mcp_lock = threading.Lock()
+
+def _mcp_send_and_recv(proc, req_obj, timeout=30):
+    line = json.dumps(req_obj) + "\n"
+    proc.stdin.write(line)
+    proc.stdin.flush()
+    res_line = [None]
+    done_evt = threading.Event()
+    
+    def read_stdout():
+        try:
+            for l in proc.stdout:
+                l = l.strip()
+                if l and (l.startswith('{') or l.startswith('[')):
+                    res_line[0] = l
+                    done_evt.set()
+                    break
+        except Exception:
+            done_evt.set()
+            
+    t = threading.Thread(target=read_stdout, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if not done_evt.is_set() or not res_line[0]:
+        raise TimeoutError("MCP server response timed out after " + str(timeout) + "s")
+    return json.loads(res_line[0])
+
+def _mcp_init_server(name, config):
+    with _mcp_lock:
+        if name in _mcp_servers:
+            old = _mcp_servers[name]
+            if old.get("proc") and old["proc"].poll() is None:
+                try: kill_tree(old["proc"].pid)
+                except Exception: pass
+            del _mcp_servers[name]
+            
+        cmd_base = config.get("command", "python3")
+        if cmd_base in ("python", "python3"):
+            cmd_base = sys.executable
+        elif not shutil.which(cmd_base):
+            if shutil.which("python"): cmd_base = shutil.which("python")
+            
+        args = [cmd_base] + config.get("args", [])
+        cwd = config.get("cwd") or None
+        env = os.environ.copy()
+        if "env" in config and isinstance(config["env"], dict):
+            env.update(config["env"])
+            
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
+        proc = subprocess.Popen(
+            args,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=flags
+        )
+        
+        # 1. initialize
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "SlopLobster", "version": "1.4"}
+            }
+        }
+        init_res = _mcp_send_and_recv(proc, init_req, timeout=15)
+        
+        # 2. initialized notification
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        proc.stdin.flush()
+        
+        # 3. tools/list
+        list_req = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }
+        list_res = _mcp_send_and_recv(proc, list_req, timeout=15)
+        tools = list_res.get("result", {}).get("tools", [])
+        
+        _mcp_servers[name] = {
+            "proc": proc,
+            "tools": tools,
+            "config": config,
+            "id_counter": 3,
+            "lock": threading.Lock()
+        }
+        return {"status": "connected", "tools": tools, "tool_count": len(tools)}
+
+def _mcp_call_tool(server_name, tool_name, arguments, timeout=120):
+    srv = _mcp_servers.get(server_name)
+    if not srv or not srv.get("proc") or srv["proc"].poll() is not None:
+        raise RuntimeError("MCP server '" + str(server_name) + "' is not running")
+    with srv["lock"]:
+        req_id = srv["id_counter"]
+        srv["id_counter"] += 1
+        call_req = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": arguments or {}
+            }
+        }
+        res = _mcp_send_and_recv(srv["proc"], call_req, timeout=timeout)
+        if "error" in res:
+            err_msg = res["error"].get("message", str(res["error"])) if isinstance(res["error"], dict) else str(res["error"])
+            return {"error": err_msg}
+        content = res.get("result", {}).get("content", [])
+        text_out = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text":
+                text_out.append(c.get("text", ""))
+            elif isinstance(c, str):
+                text_out.append(c)
+        out_str = "\n".join(text_out) if text_out else json.dumps(res.get("result", {}), indent=2)
+        return {"output": out_str, "isError": res.get("result", {}).get("isError", False)}
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -1254,6 +1396,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, "killed": killed, "port": port})
             except Exception as e:
                 self.send_json(500, {"error": str(e)})    
+
+        elif path in ('/mcp/sync', '/api/mcp/sync'):
+            try:
+                body = self.read_body()
+                servers = body.get("mcpServers") or body.get("servers") or {}
+                results = {}
+                for srv_name, srv_cfg in servers.items():
+                    try:
+                        results[srv_name] = _mcp_init_server(srv_name, srv_cfg)
+                    except Exception as e:
+                        results[srv_name] = {"status": "error", "error": str(e), "tools": []}
+                self.send_json(200, {"ok": True, "servers": results})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path in ('/mcp/call', '/api/mcp/call'):
+            try:
+                body = self.read_body()
+                srv_name = body.get("server", "")
+                tool_name = body.get("tool", "")
+                args = body.get("arguments", {})
+                timeout = min(int(body.get("timeout", 120)), 600)
+                res = _mcp_call_tool(srv_name, tool_name, args, timeout=timeout)
+                self.send_json(200, res)
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
+
+        elif path in ('/mcp/status', '/api/mcp/status'):
+            try:
+                status = {}
+                for name, srv in _mcp_servers.items():
+                    alive = srv.get("proc") and srv["proc"].poll() is None
+                    status[name] = {"alive": alive, "tool_count": len(srv.get("tools", []))}
+                self.send_json(200, {"servers": status})
+            except Exception as e:
+                self.send_json(500, {"error": str(e)})
         else:
             self.send_json(404, {"error": "not found"})
 
