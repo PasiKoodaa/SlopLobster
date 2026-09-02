@@ -1042,6 +1042,36 @@
       align-content: flex-start
     }
 
+    /* ── Plan scroll marker: a small bookmark tracking the inline Plan Mode
+       panel's position along the scroll track, so it's findable once later
+       messages have pushed it out of view. Positioned against the scroll
+       track (not the panel itself), so it stays visible regardless of
+       scroll position. ── */
+    #plan-scroll-marker {
+      position: fixed;
+      right: 6px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--accent);
+      color: #fff;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      font-size: 10px;
+      cursor: pointer;
+      z-index: 40;
+      box-shadow: 0 1px 4px rgba(0,0,0,.35);
+      transition: top .15s ease-out;
+    }
+
+    #plan-scroll-marker:hover {
+      transform: scale(1.12);
+    }
+
+    #plan-scroll-marker.hidden { display: none !important; }
+
+
     .msg {
       display: flex;
       gap: 10px;
@@ -2484,6 +2514,36 @@
     }
 
     #scroll-bottom-btn.visible {
+      display: grid
+    }
+
+    #scroll-top-btn {
+      position: absolute;
+      bottom: 122px;
+      right: 24px;
+      width: 32px;
+      height: 32px;
+      border-radius: 50%;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      color: var(--tx-2);
+      cursor: pointer;
+      display: none;
+      place-items: center;
+      z-index: 10;
+      transition: .2s;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, .4);
+      font-size: 12px
+    }
+
+    #scroll-top-btn:hover {
+      background: var(--bg-3);
+      color: var(--tx-0);
+      border-color: var(--border-l);
+      transform: translateY(1px)
+    }
+
+    #scroll-top-btn.visible {
       display: grid
     }
 
@@ -5641,12 +5701,15 @@
           <button class="conv-search-close" onclick="closeConvSearch()" title="Close (Esc)"><i class="fas fa-xmark"></i></button>
         </div>
         <div id="messages" style="display:none"></div>
+        <div id="plan-scroll-marker" class="hidden" onclick="jumpToPlan()"><i class="fas fa-list-check"></i></div>
         <div class="ws-warning" id="ws-warning" style="display:none">
             <i class="fas fa-folder-open"></i>
             <span class="ws-warn-text">No workspace directory selected — the agent cannot read, create, or edit files. Open a project folder to enable file operations.</span>
             <button class="ws-warn-btn" onclick="openDirectory()">Open Directory</button>
             <button class="ws-warn-dismiss" onclick="dismissWorkspaceWarning()" title="Dismiss"><i class="fas fa-xmark"></i></button>
         </div>
+        <button id="scroll-top-btn" onclick="scrollToTopForce()" title="Scroll to top"><i
+            class="fas fa-arrow-up"></i></button>
         <button id="scroll-bottom-btn" onclick="scrollToBottomForce()" title="Scroll to bottom"><i
             class="fas fa-arrow-down"></i></button>
       </main>
@@ -8236,11 +8299,12 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
 
     const tokenTracker = {
       lastPromptTokens: -1,
+      lastPromptTokensAsOfLen: 0,
       totalOutputTokens: 0,
       _callOut: 0,
 
 
-      reset() { this._callOut = 0; this.lastPromptTokens = -1; this._loggedMissing = false; this._loggedEmpty = false; },
+      reset() { this._callOut = 0; this.lastPromptTokens = -1; this.lastPromptTokensAsOfLen = 0; this._loggedMissing = false; this._loggedEmpty = false; },
 
       feed(chunk) {
         if (!chunk?.usage) {
@@ -8257,7 +8321,13 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
           }
         }
         const u = chunk.usage;
-        if (u.prompt_tokens != null) this.lastPromptTokens = u.prompt_tokens;
+        // Record how many messages existed when this request was SENT (i.e. before
+        // this turn's assistant/tool messages get appended), so the meter can later
+        // tell how much has been added since this "exact" reading was taken — see
+        // getFreshTokenEstimate(). Without this, the header freezes at the prompt
+        // size of the last completed API call until the NEXT one returns, even
+        // though new tool results have already landed in state.messages.
+        if (u.prompt_tokens != null) { this.lastPromptTokens = u.prompt_tokens; this.lastPromptTokensAsOfLen = state.messages.length; }
         if (u.completion_tokens != null) this._callOut += u.completion_tokens;
       },
 
@@ -8329,8 +8399,12 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
     function estimateTokens(t) { if (!t) return 0; return Math.ceil(t.length / 3.8); }
 
     function estimateConvTokens() {
+      return estimateTokensForMessages(state.messages);
+    }
+
+    function estimateTokensForMessages(msgs) {
       let total = 0;
-      for (const m of state.messages) {
+      for (const m of msgs) {
         if (m.content) total += estimateTokens(m.content);
         if (m.tool_calls) {
           for (const tc of m.tool_calls) {
@@ -8341,6 +8415,22 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
         total += 4;
       }
       return total;
+    }
+
+    // The "exact" prompt-token count only reflects the size of the LAST completed
+    // API request — anything pushed to state.messages since then (tool results,
+    // the assistant's own message) isn't in it yet, and won't be until the NEXT
+    // API call returns. Bridge that gap by adding a live estimate of just the
+    // messages added since that reading, so the header doesn't visibly freeze
+    // between iterations while a click-triggered breakdown (which always
+    // estimates fresh) shows a different, more current number.
+    function getFreshTokenEstimate() {
+      const exact = tokenTracker.lastPromptTokens;
+      if (exact > 0) {
+        const newMsgs = state.messages.slice(tokenTracker.lastPromptTokensAsOfLen);
+        return exact + (newMsgs.length ? estimateTokensForMessages(newMsgs) : 0);
+      }
+      return null;
     }
 
     let _syncRealTokensDebounce = null;
@@ -8365,8 +8455,8 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
     }
 
     function getContextPct() {
-      const exact = tokenTracker.lastPromptTokens;
-      if (exact > 0) return Math.min(100, (exact / state.ctxWindow) * 100);
+      const fresh = getFreshTokenEstimate();
+      if (fresh !== null) return Math.min(100, (fresh / state.ctxWindow) * 100);
       if (!state._sysPromptLength) state._sysPromptLength = estimateTokens(DEFAULT_SYS);
       const convTok = state._realConvTokens > 0 ? state._realConvTokens : estimateConvTokens();
       return Math.min(100, ((convTok + state._sysPromptLength) / state.ctxWindow) * 100);
@@ -8376,10 +8466,11 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
       const fill = document.getElementById('ctx-fill'), label = document.getElementById('ctx-label');
       if (!fill || !label) return;
       if (!state._sysPromptLength) state._sysPromptLength = estimateTokens(DEFAULT_SYS);
-      const isExact = tokenTracker.lastPromptTokens > 0;
+      const fresh = getFreshTokenEstimate();
+      const isExact = fresh !== null;
       const isRealSync = !isExact && state._realConvTokens > 0;
       const tok = isExact
-        ? tokenTracker.lastPromptTokens
+        ? fresh
         : (state._realConvTokens > 0 ? state._realConvTokens : estimateConvTokens()) + state._sysPromptLength;
       const pct = Math.min(100, (tok / state.ctxWindow) * 100);
       const fillCls = pct > 80 ? 'high' : pct > 50 ? 'mid' : 'low';
@@ -8388,16 +8479,18 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
       const remaining = state.ctxWindow - tok;
       const remainingPct = remaining / state.ctxWindow;
       // Show remaining tokens (red warning) when < 20% context left
+      const hasEstimatedDelta = isExact && state.messages.length > tokenTracker.lastPromptTokensAsOfLen;
       if (remainingPct < 0.2) {
         label.textContent = formatTok(remaining) + ' left';
         label.style.color = 'var(--red)';
       } else {
-        label.textContent = (isExact || isRealSync ? '' : '~') + formatTok(tok) + ' tok';
+        label.textContent = (isExact && !hasEstimatedDelta || isRealSync ? '' : '~') + formatTok(tok) + ' tok';
         label.style.color = '';
       }
       const stats = getCompressionStats();
       const meter = fill.closest('.ctx-meter');
-      const precisionLabel = isExact ? '(exact from response)' : isRealSync ? '(exact from /tokenize API)' : '(estimated)';
+      const precisionLabel = !isExact ? (isRealSync ? '(exact from /tokenize API)' : '(estimated)')
+        : hasEstimatedDelta ? '(last exact reading + estimate of what\'s been added since)' : '(exact from response)';
       if (meter && stats && stats.saved > 100) {
         meter.title = `Context: ${formatTok(tok)} tokens ${precisionLabel} (${pct.toFixed(0)}% of ${formatTok(state.ctxWindow)})\nCompression saved: ~${formatTok(Math.round(stats.saved / 3.8))} tokens (${stats.pct}% reduction in tool outputs)`;
       } else if (meter) {
@@ -14979,6 +15072,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
 
     /* ═══════════════ SMART SCROLL ═══════════════ */
     function isNearBottom(el, threshold) { threshold = threshold || 100; return el.scrollHeight - el.scrollTop - el.clientHeight < threshold; }
+    function isNearTop(el, threshold) { threshold = threshold || 100; return el.scrollTop < threshold; }
 
     let programmaticScroll = false;
     let scrollDebounce = null;
@@ -14999,6 +15093,18 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       document.getElementById('scroll-bottom-btn').classList.remove('visible');
     }
 
+    function scrollToTopForce() {
+      // Scrolling away from the bottom on purpose implies the user wants to read
+      // up, not have new output yank them back down — same as manual scrolling
+      // already does via the scroll handler below, made explicit here since this
+      // is a one-shot jump rather than a drag.
+      state.autoScroll = false; updateScrollLockBtn();
+      programmaticScroll = true;
+      $msg().scrollTop = 0;
+      programmaticScroll = false;
+      document.getElementById('scroll-top-btn').classList.remove('visible');
+    }
+
     function toggleAutoScroll() {
       state.autoScroll = !state.autoScroll; updateScrollLockBtn();
       if (state.autoScroll) scrollToBottomForce();
@@ -15017,9 +15123,60 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       $msg().addEventListener('scroll', function () {
         const near = isNearBottom($msg(), 100);
         document.getElementById('scroll-bottom-btn').classList.toggle('visible', !near);
+        // Only worth showing "scroll to top" once there's actually enough content
+        // to scroll through — no point on a short conversation that already fits.
+        const el = $msg();
+        const hasEnoughContent = el.scrollHeight > el.clientHeight + 200;
+        document.getElementById('scroll-top-btn').classList.toggle('visible', hasEnoughContent && !isNearTop(el, 100));
         if (near && !state.autoScroll) { state.autoScroll = true; updateScrollLockBtn(); }
         else if (!near && state.autoScroll) { state.autoScroll = false; updateScrollLockBtn(); }
+        updatePlanScrollMarker();
       }, { passive: true });
+      // Content can grow (streaming text, new messages) without a scroll event
+      // firing — that's exactly when the plan panel's position changes, so
+      // watch for it directly rather than relying on scroll events alone.
+      const mo = new MutationObserver(() => updatePlanScrollMarker());
+      mo.observe($msg(), { childList: true, subtree: false });
+      window.addEventListener('resize', updatePlanScrollMarker, { passive: true });
+    }
+
+    /* ── Plan scroll marker: keeps a small bookmark on the right edge tracking
+       where the inline Plan Mode panel sits along the scroll track, so it's
+       easy to find again once later messages have pushed it out of view.
+       Hidden entirely when the panel is already visible or doesn't exist. ── */
+    function updatePlanScrollMarker() {
+      const marker = document.getElementById('plan-scroll-marker');
+      const panel = document.getElementById('plan-panel');
+      const container = $msg();
+      if (!marker) return;
+      if (!panel || !container) { marker.classList.add('hidden'); return; }
+
+      const viewTop = container.scrollTop;
+      const viewBottom = viewTop + container.clientHeight;
+      const panelTop = panel.offsetTop;
+      const panelBottom = panelTop + panel.offsetHeight;
+      const isVisible = panelBottom > viewTop && panelTop < viewBottom;
+
+      if (isVisible) { marker.classList.add('hidden'); return; }
+
+      const rect = container.getBoundingClientRect();
+      const scrollable = Math.max(1, container.scrollHeight - container.clientHeight);
+      const frac = Math.min(1, Math.max(0, panelTop / scrollable));
+      const markerSize = 22;
+      const top = rect.top + frac * Math.max(0, rect.height - markerSize);
+
+      marker.classList.remove('hidden');
+      marker.style.top = top + 'px';
+      const above = panelBottom <= viewTop;
+      marker.innerHTML = `<i class="fas fa-chevron-${above ? 'up' : 'down'}"></i>`;
+      marker.title = `Jump to plan (${above ? 'scrolled above' : 'scrolled below'})`;
+    }
+
+    function jumpToPlan() {
+      const panel = document.getElementById('plan-panel');
+      if (!panel) return;
+      panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      setTimeout(updatePlanScrollMarker, 350);
     }
 
     /* ═══════════════════════════════════════════════════════════
@@ -19452,6 +19609,7 @@ Format:
 
       $msg().appendChild(el);
       scrollBottom();
+      updatePlanScrollMarker();
     }
 
     /**
@@ -19651,6 +19809,7 @@ Format:
       }
       const panel = document.getElementById('plan-panel');
       if (panel) panel.remove();
+      updatePlanScrollMarker();
       state.currentPlan = null;
       state.planStepIndex = -1;
       /* Remove the user message that triggered planning (last one) */
@@ -21210,7 +21369,7 @@ Format:
     function showContextBreakdown() {
       const sysTok = state._sysPromptLength || estimateTokens(DEFAULT_SYS);
       const convTok = estimateConvTokens();
-      const exactTok = tokenTracker.lastPromptTokens > 0 ? tokenTracker.lastPromptTokens : null;
+      const exactTok = getFreshTokenEstimate();
       const totalTok = exactTok || (sysTok + convTok);
       const ctxWindow = state.ctxWindow;
       const pct = Math.min(100, (totalTok / ctxWindow) * 100);
@@ -21224,7 +21383,7 @@ Format:
       const rows = [
         ['System prompt', formatTok(sysTok), 'var(--cyan)'],
         ['Conversation', formatTok(convTok), 'var(--teal)'],
-        exactTok ? ['Total (exact from API)', formatTok(exactTok), 'var(--green)'] : ['Total (estimated)', formatTok(totalTok), 'var(--tx-2)'],
+        exactTok ? ['Total (last exact + delta)', formatTok(exactTok), 'var(--green)'] : ['Total (estimated)', formatTok(totalTok), 'var(--tx-2)'],
         ['Context window', formatTok(ctxWindow), 'var(--tx-4)'],
         ['Remaining', formatTok(remaining), remaining < ctxWindow * 0.2 ? 'var(--red)' : 'var(--green)'],
       ];
