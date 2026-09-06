@@ -4999,6 +4999,37 @@
     .cp-empty {
       padding: 20px; text-align: center; font-size: 11px; color: var(--tx-4);
     }
+    .cp-divider {
+      height: 1px; background: var(--border); margin: 8px 4px;
+    }
+    .belief-item {
+      padding: 7px 10px 9px; border-radius: 6px; margin-bottom: 4px;
+    }
+    .belief-item.ruled_out { opacity: .65; }
+    .belief-row {
+      display: flex; align-items: center; gap: 7px; margin-bottom: 4px;
+    }
+    .belief-row i { font-size: 11px; flex-shrink: 0; }
+    .belief-text {
+      flex: 1; font-size: 11px; color: var(--tx-1); min-width: 0;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .belief-conf {
+      font-size: 10px; font-family: 'JetBrains Mono', monospace; font-weight: 700;
+      flex-shrink: 0; min-width: 30px; text-align: right;
+    }
+    .belief-bar-track {
+      height: 4px; border-radius: 2px; background: var(--bg-3); overflow: hidden;
+      margin-left: 19px;
+    }
+    .belief-bar-fill {
+      height: 100%; border-radius: 2px; transition: width .3s ease;
+    }
+    .belief-next-action {
+      margin: 6px 4px 2px; padding: 7px 9px; border-radius: 6px;
+      background: var(--bg-3); font-size: 10.5px; color: var(--tx-2);
+      font-style: italic; line-height: 1.4;
+    }
     .hdr-btn.cp-btn { position: relative; }
     .cp-badge {
       position: absolute; top: -2px; right: -2px;
@@ -5852,6 +5883,11 @@
     <div class="modal" style="width:580px">
       <div class="modal-hdr">
         <h2><i class="fas fa-sliders" style="color:var(--accent);margin-right:6px"></i> Settings</h2>
+        <div style="display:flex;align-items:center;gap:6px;margin-left:auto;margin-right:8px">
+          <button class="sb-btn" onclick="exportSettingsFile()" title="Export all settings as a JSON file"><i class="fas fa-download"></i> Export</button>
+          <button class="sb-btn" onclick="document.getElementById('settings-import-input').click()" title="Import settings from a JSON file"><i class="fas fa-upload"></i> Import</button>
+          <input type="file" id="settings-import-input" accept="application/json,.json" style="display:none" onchange="importSettingsFile(this)">
+        </div>
         <button class="modal-close" onclick="closeSettings()"><i class="fas fa-xmark"></i></button>
       </div>
       <div class="settings-tabs">
@@ -6004,6 +6040,10 @@
             </div>
             <div class="slider-row" style="margin-top:8px"><input type="checkbox" id="s-allow-ask-user" checked style="accent-color:var(--accent)"><span class="val" style="min-width:auto">Allow the agent to pause mid-task and ask a question</span></div>
             <div class="hint" style="margin-top:2px">Uncheck for fully hands-off runs (e.g. unattended sub-agents/swarms) — the agent will use its best judgment instead of stopping to ask.</div>
+          </div>
+          <div class="field">
+            <div class="slider-row"><input type="checkbox" id="s-notifications" style="accent-color:var(--accent)" onchange="onNotificationsToggle(this)"><span class="val" style="min-width:auto">Desktop notifications</span></div>
+            <div class="hint" style="margin-top:2px">Notifies you when the agent finishes, needs a confirmation or answer, hits a hard-stop/budget limit, or the companion server disconnects mid-task — only while this tab isn't focused. Requires browser permission.</div>
           </div>
           <div class="field"><label>Auto-verify command</label>
             <input type="text" id="s-auto-verify" placeholder="e.g. pytest, npm test, cargo test">
@@ -7787,6 +7827,13 @@ if __name__ == "__main__":
       disabledTools: new Set(),
       /* ── Visible plan checklist, set via the update_plan tool ── */
       planItems: [],
+      /* ── Competing hypotheses with confidence, set via update_beliefs — for
+         exploratory/diagnostic work where the right approach isn't known yet.
+         Rendered in the same panel as planItems; a task can have either, both
+         (hypotheses first, then the concrete plan once one is confirmed), or
+         neither. ── */
+      beliefs: [],
+      beliefNextAction: '',
       /* ── Cross-session project memory text, loaded from .sloplobster-memory.md
          when a workspace is opened; injected into every conversation's system
          prompt via {{PROJECT_MEMORY_SECTION}}. ── */
@@ -7805,6 +7852,11 @@ if __name__ == "__main__":
          so the agent picks them up in its very next turn without the loop
          being stopped or restarted. ── */
       pendingSteerMessages: [],
+      /* ── Desktop notifications for events while the tab isn't focused: agent
+         finished, a confirm dialog or ask_user is waiting, a hard-stop/budget
+         limit was hit, companion disconnected mid-task. Off by default since
+         requesting Notification permission is intrusive — opt-in only. ── */
+      notificationsEnabled: false,
       autoVerifyCommand: '',
       /* ── Session token budget guard: 0 = unlimited. Checked against
          _sessionTotalOut (cumulative output tokens across this browser session,
@@ -8139,7 +8191,16 @@ Python command: {{PYTHON_CMD}}{{ENV_DETAILS}} — this is DETECTED from the actu
 
 ═══ DON'T LOSE WHAT YOU LEARN ═══
 
-Long tasks get compacted, and compaction summaries are lossy — a one-line environment fix ("use X not Y here") competes for space against the whole task history and can be the thing that gets dropped. The moment you discover something like that — not at the end of the task, right when it happens — call save_memory. It writes to a file that's shown to you at the start of every future conversation in this workspace, completely bypassing compaction. Good candidates: a command/tool that only works one specific way here, a project convention, a user preference stated once. Bad candidates: routine task progress (that's handled automatically) or anything secret.`;
+Long tasks get compacted, and compaction summaries are lossy — a one-line environment fix ("use X not Y here") competes for space against the whole task history and can be the thing that gets dropped. The moment you discover something like that — not at the end of the task, right when it happens — call save_memory. It writes to a file that's shown to you at the start of every future conversation in this workspace, completely bypassing compaction. Good candidates: a command/tool that only works one specific way here, a project convention, a user preference stated once. Bad candidates: routine task progress (that's handled automatically) or anything secret.
+
+═══ REASONING UNDER UNCERTAINTY ═══
+
+Two tools track your progress visibly, for two different situations — pick based on whether you actually know the right approach yet, not by default habit:
+
+- **update_plan**: the shape of the work is already known — "add these 3 files, refactor these functions". A fixed, ordered checklist.
+- **update_beliefs**: you DON'T yet know what's true or what the right approach is — debugging ("why is this failing"), root-cause analysis, an architecture choice with real trade-offs. Track 2-4 competing hypotheses with a rough confidence each. Before acting, choose the action that best discriminates between your leading hypotheses — the one whose result would most change your confidence — rather than just the next thing that seems useful. After every observation, update confidences explicitly. Move a hypothesis to "ruled_out" when evidence contradicts it, but keep it in the list rather than deleting it — reviving a demoted hypothesis when a "confirmed" one turns out wrong should be cheap, not a restart.
+
+Don't force a checklist onto something you're not actually sure about yet — a fake fixed plan you have to awkwardly revise is exactly the friction update_beliefs exists to avoid. Once a hypothesis is confirmed and you know the concrete steps to act on it, switch to update_plan for execution — update_beliefs is for figuring out what's true, update_plan is for doing something about it. Both can be active at once: the natural lifecycle for diagnostic work is hypotheses first, then a plan once one is confirmed.`;
 
     /* ═══════════════ PATH SANITIZATION ═══════════════ */
     function sanitizePath(raw) {
@@ -9002,7 +9063,7 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
         { type: 'function', function: { name: 'think', description: 'Think through a problem step by step before acting. Visible to user.', parameters: { type: 'object', properties: { thought: { type: 'string', description: 'Your reasoning and plan' } }, required: ['thought'] } } },
         { type: 'function', function: {
           name: 'update_plan',
-          description: 'Set or update your visible task checklist for this conversation. Call this whenever you form a multi-step plan, complete a step, or the plan changes. ALWAYS pass the FULL list of items (not just the changed one) — each call fully replaces the previous checklist. Skip this for single-step or trivial requests.',
+          description: 'Set or update your visible task checklist for this conversation. Use this when the shape of the work is already known — a mechanical multi-step task like "add these files, refactor these functions". Call whenever you form a plan, complete a step, or the plan changes. ALWAYS pass the FULL list of items — each call fully replaces the previous checklist. Skip for single-step or trivial requests. If you\'re not sure what the right approach even is yet (debugging, "why is X happening", architecture choices), use update_beliefs instead — don\'t force uncertain work into a fake fixed checklist.',
           parameters: {
             type: 'object',
             properties: {
@@ -9020,6 +9081,30 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
               }
             },
             required: ['items']
+          }
+        }},
+        { type: 'function', function: {
+          name: 'update_beliefs',
+          description: 'Track competing hypotheses with confidence when you don\'t yet know the right approach — debugging ("why is this failing"), root-cause analysis, architecture decisions with real trade-offs. Maintain 2-4 hypotheses with rough confidence (they don\'t need to sum to 100). Before acting, pick the action that best discriminates between your leading hypotheses, not just the next thing that seems useful. After every observation, call this again with updated confidences — move a hypothesis to "ruled_out" when evidence contradicts it (but keep it in the list, don\'t delete it, in case you need to revive it), and to "confirmed" once you\'re sure. ALWAYS pass the FULL list, not just the changed one. Once a hypothesis is confirmed and you know the concrete steps to act on it, switch to update_plan for the implementation steps — update_beliefs is for figuring out WHAT\'s true, update_plan is for executing once you know.',
+          parameters: {
+            type: 'object',
+            properties: {
+              hypotheses: {
+                type: 'array',
+                description: 'The complete list of hypotheses, including ruled-out ones (kept for reference, not deleted).',
+                items: {
+                  type: 'object',
+                  properties: {
+                    text: { type: 'string', description: 'The hypothesis, stated concretely' },
+                    confidence: { type: 'number', description: 'Rough confidence 0-100' },
+                    status: { type: 'string', enum: ['active', 'ruled_out', 'confirmed'], description: 'active = still in play, ruled_out = contradicted by evidence but kept for reference, confirmed = this is the answer' }
+                  },
+                  required: ['text', 'confidence', 'status']
+                }
+              },
+              next_action: { type: 'string', description: 'One sentence: what you\'re about to do next and which hypothesis/hypotheses it will help distinguish between' }
+            },
+            required: ['hypotheses']
           }
         }},
         { type: 'function', function: {
@@ -9218,7 +9303,7 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
       return filtered;
     }
 
-    const TOOL_ICONS = { think: 'brain', update_plan: 'list-check', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
+    const TOOL_ICONS = { think: 'brain', update_plan: 'list-check', update_beliefs: 'brain', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
 
     // Tools that can't be turned off from the toggle list, because the app
     // depends on them for basic reasoning/filesystem awareness.
@@ -11791,7 +11876,28 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
     }
 
     async function checkCompanion() {
-      if (state.running) return; // ← skip health check during agent loop
+      const wasConnected = state.compConnected;
+      if (state.running) {
+        // Lighter-weight probe during an active run: skip the status-dot UI
+        // update (would flicker mid-task) and MCP re-sync, just detect a
+        // disconnect so it surfaces immediately instead of every tool call
+        // silently failing against a dead server until the loop happens to
+        // stop on its own for an unrelated reason.
+        try {
+          const res = await fetch(`${state.compUrl}/status`, { signal: AbortSignal.timeout(3000) });
+          if (!res.ok) throw new Error(res.statusText);
+          state.compConnected = true;
+        } catch {
+          state.compConnected = false; state.compInfo = null;
+        }
+        if (wasConnected && !state.compConnected) {
+          appendMsg('system', '⚠ Companion server disconnected mid-task — shell, git, and browser tools will fail until it reconnects. If you restarted it, this reconnects automatically within 20s.');
+          notifyUser('Companion server disconnected', 'Shell, git, and browser tools will fail until it reconnects.');
+        } else if (!wasConnected && state.compConnected) {
+          appendMsg('system', '✓ Companion server reconnected.');
+        }
+        return;
+      }
       const dot = document.getElementById('comp-dot'), txt = document.getElementById('comp-text'), info = document.getElementById('comp-info');
       dot.className = 'status-dot loading'; txt.textContent = 'Shell...';
       try {
@@ -11866,6 +11972,19 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
         renderTodoChecklist();
         const done = state.planItems.filter(i => i.status === 'done').length;
         return { output: `Plan updated (${done}/${state.planItems.length} done).` };
+      },
+      'update_beliefs': async (args) => {
+        const hyps = Array.isArray(args.hypotheses) ? args.hypotheses : [];
+        state.beliefs = hyps.map(h => ({
+          text: String(h.text || '').slice(0, 240),
+          confidence: Math.max(0, Math.min(100, Math.round(Number(h.confidence) || 0))),
+          status: ['active', 'ruled_out', 'confirmed'].includes(h.status) ? h.status : 'active'
+        }));
+        state.beliefNextAction = String(args.next_action || '').slice(0, 300);
+        renderTodoChecklist();
+        const confirmed = state.beliefs.find(h => h.status === 'confirmed');
+        const leading = confirmed || state.beliefs.filter(h => h.status === 'active').sort((a, b) => b.confidence - a.confidence)[0];
+        return { output: leading ? `Beliefs updated. Leading: "${leading.text}" (${leading.confidence}%${leading.status === 'confirmed' ? ', confirmed' : ''}).` : 'Beliefs updated (no active hypotheses).' };
       },
       'ask_user': async (args) => {
         if (!args.question) return { output: 'Error: "question" is required for ask_user' };
@@ -12867,7 +12986,11 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
       ).join('');
     }
 
-    /* ═══════════════ PLAN CHECKLIST PANEL (update_plan tool) ═══════════════ */
+    /* ═══════════════ PLAN + BELIEFS PANEL (update_plan / update_beliefs tools) ═══════════════
+       Shared panel for two complementary states: hypotheses (uncertain/exploratory
+       work — update_beliefs) and a concrete checklist (known-shape work —
+       update_plan). Both can be shown at once, in that order, modeling the natural
+       lifecycle of diagnostic work: figure out what's true, THEN plan the fix. */
     function togglePlanPopup() {
       let popup = document.getElementById('plan-popup');
       if (!popup) { popup = renderPlanPopup(); document.body.appendChild(popup); requestAnimationFrame(() => popup.classList.add('open')); }
@@ -12881,43 +13004,88 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
       popup.id = 'plan-popup';
       popup.className = 'cp-popup';
       popup.onclick = e => { if (e.target === popup) togglePlanPopup(); };
-      popup.innerHTML = `<div class="cp-popup-hdr"><span><i class="fas fa-list-check" style="color:var(--accent);margin-right:6px"></i>Task Plan</span><button onclick="event.stopPropagation();clearPlan()"><i class="fas fa-trash"></i></button></div><div class="cp-list" id="plan-list"></div>`;
+      popup.innerHTML = `<div class="cp-popup-hdr"><span id="plan-popup-title"><i class="fas fa-list-check" style="color:var(--accent);margin-right:6px"></i>Task Plan</span><button onclick="event.stopPropagation();clearPlan()" title="Clear"><i class="fas fa-trash"></i></button></div><div class="cp-list" id="plan-list"></div>`;
       return popup;
     }
 
-    // Called from the update_plan tool handler, and also safe to call any time
-    // the checklist changes — keeps the header badge and any open popup in sync.
-    // NOTE: named renderTodoChecklist (not renderPlanPanel) to avoid colliding
-    // with the pre-existing renderPlanPanel(steps) used by the separate
-    // structured "Plan Mode" feature (state.currentPlan) — that name collision
-    // previously caused this function to be silently overwritten and never run.
+    // Called from the update_plan and update_beliefs tool handlers, and also
+    // safe to call any time either changes — keeps the header badge and any
+    // open popup in sync. NOTE: named renderTodoChecklist (not renderPlanPanel)
+    // to avoid colliding with the pre-existing renderPlanPanel(steps) used by
+    // the separate structured "Plan Mode" feature (state.currentPlan) — that
+    // name collision previously caused this function to be silently
+    // overwritten and never run.
     function renderTodoChecklist() {
       const btn = document.getElementById('plan-btn');
       const badge = document.getElementById('plan-badge');
-      const n = state.planItems.length;
-      if (btn) btn.style.display = n ? '' : 'none';
-      if (badge) {
-        const done = state.planItems.filter(i => i.status === 'done').length;
-        badge.textContent = `${done}/${n}`;
-        badge.classList.toggle('hidden', n === 0);
+      const nPlan = state.planItems.length;
+      const nBeliefs = state.beliefs.length;
+      const hasAny = nPlan > 0 || nBeliefs > 0;
+      if (btn) {
+        btn.style.display = hasAny ? '' : 'none';
+        const icon = btn.querySelector('i');
+        if (icon) icon.className = nBeliefs ? 'fas fa-brain' : 'fas fa-list-check';
+        btn.title = nBeliefs && nPlan ? 'Hypotheses & task plan' : nBeliefs ? 'Hypotheses' : 'Task plan';
       }
+      if (badge) {
+        if (nBeliefs) {
+          const confirmed = state.beliefs.find(h => h.status === 'confirmed');
+          const leading = confirmed || state.beliefs.filter(h => h.status === 'active').sort((a, b) => b.confidence - a.confidence)[0];
+          badge.textContent = leading ? `${leading.confidence}%` : '?';
+        } else {
+          const done = state.planItems.filter(i => i.status === 'done').length;
+          badge.textContent = `${done}/${nPlan}`;
+        }
+        badge.classList.toggle('hidden', !hasAny);
+      }
+      const title = document.getElementById('plan-popup-title');
+      if (title) title.innerHTML = nBeliefs && nPlan ? '<i class="fas fa-brain" style="color:var(--accent);margin-right:6px"></i>Hypotheses & Plan'
+        : nBeliefs ? '<i class="fas fa-brain" style="color:var(--accent);margin-right:6px"></i>Hypotheses'
+        : '<i class="fas fa-list-check" style="color:var(--accent);margin-right:6px"></i>Task Plan';
       updatePlanList();
     }
 
     function updatePlanList() {
       const list = document.getElementById('plan-list');
       if (!list) return;
-      if (!state.planItems.length) {
-        list.innerHTML = `<div class="cp-empty"><i class="fas fa-info-circle" style="margin-bottom:4px;opacity:.5"></i>No active plan — the agent sets one via update_plan on multi-step tasks</div>`;
+      if (!state.planItems.length && !state.beliefs.length) {
+        list.innerHTML = `<div class="cp-empty"><i class="fas fa-info-circle" style="margin-bottom:4px;opacity:.5"></i>No active plan or hypotheses yet — the agent sets these via update_plan (known steps) or update_beliefs (still figuring out the approach)</div>`;
         return;
       }
-      const icon = { pending: 'fas fa-circle', in_progress: 'fas fa-spinner fa-spin', done: 'fas fa-circle-check' };
-      const color = { pending: 'var(--tx-4)', in_progress: 'var(--accent)', done: 'var(--teal)' };
-      list.innerHTML = state.planItems.map(it => `<div class="cp-item" style="cursor:default"><i class="${icon[it.status]}" style="color:${color[it.status]};width:14px;text-align:center;flex-shrink:0"></i><span class="cp-desc" style="${it.status === 'done' ? 'text-decoration:line-through;opacity:.6' : ''}">${esc(it.text)}</span></div>`).join('');
+      let html = '';
+      if (state.beliefs.length) {
+        const statusColor = { active: 'var(--accent)', confirmed: 'var(--teal)', ruled_out: 'var(--tx-4)' };
+        const statusIcon = { active: 'fa-circle-question', confirmed: 'fa-circle-check', ruled_out: 'fa-circle-xmark' };
+        html += state.beliefs.slice().sort((a, b) => {
+          const rank = { confirmed: 0, active: 1, ruled_out: 2 };
+          if (rank[a.status] !== rank[b.status]) return rank[a.status] - rank[b.status];
+          return b.confidence - a.confidence;
+        }).map(h => `
+          <div class="belief-item ${h.status}">
+            <div class="belief-row">
+              <i class="fas ${statusIcon[h.status]}" style="color:${statusColor[h.status]}"></i>
+              <span class="belief-text" style="${h.status === 'ruled_out' ? 'text-decoration:line-through;opacity:.55' : ''}">${esc(h.text)}</span>
+              <span class="belief-conf" style="color:${statusColor[h.status]}">${h.confidence}%</span>
+            </div>
+            <div class="belief-bar-track"><div class="belief-bar-fill" style="width:${h.confidence}%;background:${statusColor[h.status]}"></div></div>
+          </div>`).join('');
+        if (state.beliefNextAction) {
+          html += `<div class="belief-next-action"><i class="fas fa-arrow-right" style="margin-right:5px;opacity:.7"></i>${esc(state.beliefNextAction)}</div>`;
+        }
+        if (state.planItems.length) html += `<div class="cp-divider"></div>`;
+      }
+      if (state.planItems.length) {
+        const icon = { pending: 'fas fa-circle', in_progress: 'fas fa-spinner fa-spin', done: 'fas fa-circle-check' };
+        const color = { pending: 'var(--tx-4)', in_progress: 'var(--accent)', done: 'var(--teal)' };
+        html += state.planItems.map(it => `<div class="cp-item" style="cursor:default"><i class="${icon[it.status]}" style="color:${color[it.status]};width:14px;text-align:center;flex-shrink:0"></i><span class="cp-desc" style="${it.status === 'done' ? 'text-decoration:line-through;opacity:.6' : ''}">${esc(it.text)}</span></div>`).join('');
+      }
+      list.innerHTML = html;
     }
 
     function clearPlan() {
       state.planItems = [];
+      state.beliefs = [];
+      state.beliefNextAction = '';
       renderTodoChecklist();
       state.pendingSteerMessages = [];
       renderSteerQueue();
@@ -12943,6 +13111,7 @@ Long tasks get compacted, and compaction summaries are lossy — a one-line envi
         el.querySelectorAll('.ask-opt-btn').forEach(btn => btn.onclick = () => finish(btn.textContent));
         $msg().appendChild(el); scrollBottom();
         input.focus();
+        notifyUser('Agent has a question', question, 'ask-user');
       });
     }
 
@@ -15693,11 +15862,13 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (iters > HARD_STOP) {
           await saveProgressToWorkspace('hard stop (' + iters + ' iterations)');
           appendMsg('system', 'Stopped after ' + iters + ' iterations. Progress saved to `' + getProgressFile() + '`.');
+          notifyUser('Agent stopped', 'Hit the ' + iters + '-iteration limit. Progress was saved.', 'agent-stopped');
           break;
         }
         if (state.tokenBudget > 0 && _sessionTotalOut >= state.tokenBudget) {
           await saveProgressToWorkspace('session token budget reached (' + _sessionTotalOut + ' tokens)');
           appendMsg('system', 'Stopped: session output-token budget of ' + state.tokenBudget.toLocaleString() + ' reached (' + _sessionTotalOut.toLocaleString() + ' generated so far). Raise or disable the budget in Settings → Tools to continue. Progress saved to `' + getProgressFile() + '`.');
+          notifyUser('Agent stopped', 'Hit the session token budget. Progress was saved.', 'agent-stopped');
           break;
         }
         if (state.pauseRequested) {
@@ -15871,6 +16042,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           }
 
           finalizeStreamingMsg(cur);
+          notifyUser('Agent finished', cur || 'Task complete', 'agent-done');
           break;
         }
 
@@ -17099,6 +17271,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       el.querySelector('.confirm-no').onclick = () => { el.remove(); callback(false); };
       $msg().appendChild(el); scrollBottom();
       if (input) input.focus();
+      notifyUser('Confirmation needed', label + ': ' + detail, 'action-confirm');
     }
 
     // Wraps a browser write-action (click/type/evaluate) in a confirm-bar, gated
@@ -17120,6 +17293,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       el.querySelector('.confirm-no').onclick = () => { el.remove(); callback(false); };
       $msg().appendChild(el); scrollBottom();
       input.focus();
+      notifyUser('Confirmation needed', (label || 'Dangerous') + ': ' + cmd, 'shell-confirm');
     }
 
     function showToolPanel(name, argsStr, status, onStopClick, toolCallId) {
@@ -17784,6 +17958,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.planExecuting = false;
       state.planStepIndex = -1;
       state.planItems = [];
+      state.beliefs = [];
+      state.beliefNextAction = '';
       renderTodoChecklist();
       toolCallHistory.length = 0;
       state._autoVerifyRetries = 0;
@@ -17845,6 +18021,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       addImageAttachmentsToInputArea(); 
       state.originalTask = c._originalTask || null;
       state.planItems = [];
+      state.beliefs = [];
+      state.beliefNextAction = '';
       renderTodoChecklist();
       state.pendingSteerMessages = [];
       renderSteerQueue();
@@ -18309,6 +18487,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (s.requireEditApproval !== undefined) state.requireEditApproval = s.requireEditApproval;
         if (s.clarifyMode !== undefined) state.clarifyMode = s.clarifyMode;
         if (s.allowAskUser !== undefined) state.allowAskUser = s.allowAskUser;
+        if (s.notificationsEnabled !== undefined) state.notificationsEnabled = s.notificationsEnabled;
         if (s.clarifyCount !== undefined) state.clarifyCount = s.clarifyCount;
         if (s.autoVerifyCommand !== undefined) state.autoVerifyCommand = s.autoVerifyCommand;
         if (s.autoVerifyMaxRetries !== undefined) state.autoVerifyMaxRetries = s.autoVerifyMaxRetries;
@@ -18337,6 +18516,39 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const _gitCb = document.getElementById('s-git-autoapprove'); if (_gitCb) _gitCb.checked = state.gitWriteAutoApprove;
       const _browserCb = document.getElementById('s-browser-autoapprove'); if (_browserCb) _browserCb.checked = state.browserWriteAutoApprove;
       renderToolToggleList();
+    }
+
+    function exportSettingsFile() {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (!raw) { showToast('No settings to export yet', 'warn'); return; }
+      const blob = new Blob([raw], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = 'sloplobster-settings.json';
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      showToast('Settings exported', 'ok');
+    }
+
+    function importSettingsFile(input) {
+      const file = input.files?.[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        try {
+          const parsed = JSON.parse(reader.result);
+          if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('not a settings object');
+          localStorage.setItem(SETTINGS_KEY, JSON.stringify(parsed));
+          loadSettings();
+          showToast('Settings imported', 'ok');
+        } catch (e) {
+          showToast('Invalid settings file: ' + e.message, 'err');
+        } finally {
+          input.value = ''; // allow re-importing the same file later
+        }
+      };
+      reader.onerror = () => { showToast('Could not read file', 'err'); input.value = ''; };
+      reader.readAsText(file);
     }
 
     function persistSettings() {
@@ -18373,6 +18585,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           requireEditApproval: state.requireEditApproval,
           clarifyMode: state.clarifyMode,
           allowAskUser: state.allowAskUser,
+          notificationsEnabled: state.notificationsEnabled,
           clarifyCount: state.clarifyCount,
           autoVerifyCommand: state.autoVerifyCommand,
           autoVerifyMaxRetries: state.autoVerifyMaxRetries,
@@ -18471,6 +18684,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       document.getElementById('s-require-approval').checked = state.requireEditApproval;
       document.getElementById('s-clarify-mode').checked = state.clarifyMode;
       const _allowAskCb = document.getElementById('s-allow-ask-user'); if (_allowAskCb) _allowAskCb.checked = state.allowAskUser;
+      const _notifCb = document.getElementById('s-notifications'); if (_notifCb) _notifCb.checked = state.notificationsEnabled;
       document.getElementById('s-clarify-count').value = state.clarifyCount;
       document.getElementById('s-auto-verify').value = state.autoVerifyCommand || '';
       document.getElementById('s-auto-verify-retries').value = state.autoVerifyMaxRetries;
@@ -18517,6 +18731,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.requireEditApproval = document.getElementById('s-require-approval').checked;
       state.clarifyMode = document.getElementById('s-clarify-mode').checked;
       const _allowAskCb2 = document.getElementById('s-allow-ask-user'); if (_allowAskCb2) state.allowAskUser = _allowAskCb2.checked;
+      const _notifCb2 = document.getElementById('s-notifications'); if (_notifCb2) state.notificationsEnabled = _notifCb2.checked;
       state.clarifyCount = Math.min(5, Math.max(1, parseInt(document.getElementById('s-clarify-count').value) || 3));
       state.autoVerifyCommand = document.getElementById('s-auto-verify').value.trim();
       state.autoVerifyMaxRetries = Math.max(1, parseInt(document.getElementById('s-auto-verify-retries').value) || 3);
@@ -20021,6 +20236,37 @@ Format:
       _wsWarningDismissed = true;
       persistSettings(); 
       document.getElementById('ws-warning').style.display = 'none';
+    }
+
+    /* ═══════════════ DESKTOP NOTIFICATIONS ═══════════════ */
+    async function enableNotifications() {
+      if (typeof Notification === 'undefined') { showToast('Notifications not supported in this browser', 'warn'); return false; }
+      if (Notification.permission === 'denied') { showToast('Notifications blocked — enable them in your browser\'s site settings', 'warn'); return false; }
+      if (Notification.permission !== 'granted') {
+        const perm = await Notification.requestPermission();
+        if (perm !== 'granted') { showToast('Notification permission not granted', 'warn'); return false; }
+      }
+      return true;
+    }
+
+    // Only actually shows a notification if the tab is hidden/unfocused — no
+    // point interrupting someone who's already looking at the screen.
+    function notifyUser(title, body, tag) {
+      if (!state.notificationsEnabled) return;
+      if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      if (document.visibilityState === 'visible' && document.hasFocus()) return;
+      try {
+        const n = new Notification(title, { body: body ? body.slice(0, 200) : '', tag: tag || undefined });
+        n.onclick = () => { window.focus(); n.close(); };
+      } catch { /* some platforms throw if notifications are unsupported despite permission */ }
+    }
+
+    async function onNotificationsToggle(cb) {
+      if (cb.checked) {
+        const ok = await enableNotifications();
+        if (!ok) { cb.checked = false; state.notificationsEnabled = false; return; }
+      }
+      state.notificationsEnabled = cb.checked;
     }
 
     function showToast(msg, type = 'info') {
