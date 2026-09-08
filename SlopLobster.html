@@ -5030,6 +5030,19 @@
       background: var(--bg-3); font-size: 10.5px; color: var(--tx-2);
       font-style: italic; line-height: 1.4;
     }
+    .invariants-block {
+      padding: 2px 4px 6px;
+    }
+    .invariants-hdr {
+      font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+      color: var(--tx-3); display: flex; align-items: center; gap: 5px; margin-bottom: 5px;
+    }
+    .invariants-hdr i { color: var(--teal); font-size: 10px; }
+    .invariant-item {
+      display: flex; align-items: flex-start; gap: 6px; font-size: 11px;
+      color: var(--tx-1); padding: 2px 2px; line-height: 1.4;
+    }
+    .invariant-item i { margin-top: 6px; flex-shrink: 0; }
     .hdr-btn.cp-btn { position: relative; }
     .cp-badge {
       position: absolute; top: -2px; right: -2px;
@@ -6042,6 +6055,10 @@
             <div class="hint" style="margin-top:2px">Uncheck for fully hands-off runs (e.g. unattended sub-agents/swarms) — the agent will use its best judgment instead of stopping to ask.</div>
           </div>
           <div class="field">
+            <div class="slider-row"><input type="checkbox" id="s-experimental-mode" style="accent-color:var(--accent)"><span class="val" style="min-width:auto">Experimental thinking mode</span></div>
+            <div class="hint" style="margin-top:2px">Bundles extra reasoning strategies on top of update_beliefs: <b>invariant tracking</b> (declare constraints that must keep holding across a multi-step task, kept visible in the system prompt the whole time), <b>premortems</b> (optional "if this breaks, most likely reason" note attached to commits/risky commands, shown in the confirmation), and <b>reflexion</b> (a forced one-line self-critique before retrying a failed test, instead of silently retrying). Adds real per-turn overhead — worth it for gnarly/high-stakes work, not routine tasks.</div>
+          </div>
+          <div class="field">
             <div class="slider-row"><input type="checkbox" id="s-notifications" style="accent-color:var(--accent)" onchange="onNotificationsToggle(this)"><span class="val" style="min-width:auto">Desktop notifications</span></div>
             <div class="hint" style="margin-top:2px">Notifies you when the agent finishes, needs a confirmation or answer, hits a hard-stop/budget limit, or the companion server disconnects mid-task — only while this tab isn't focused. Requires browser permission.</div>
           </div>
@@ -6202,7 +6219,7 @@
     try { pdfjsLib.GlobalWorkerOptions.workerSrc = 'vendor/pdf.worker.min.js'; } catch(e) { console.warn('[pdf] worker init failed:', e); }
     const COMPANION_SCRIPT = `#!/usr/bin/env python
 """SlopLobster Companion Server v1.4 — Shell + Git + Web Search for SlopLobster Agent."""
-import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time
+import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time, queue
 from html.parser import HTMLParser
 
 try:
@@ -7063,30 +7080,50 @@ def _check_dev_ready(port, timeout=3):
 _mcp_servers = {}
 _mcp_lock = threading.Lock()
 
-def _mcp_send_and_recv(proc, req_obj, timeout=30):
+def _mcp_reader_loop(proc, q):
+    # One persistent reader per server process, for its whole lifetime.
+    # Previously a fresh thread was spawned per call and abandoned on
+    # timeout; a late response would then be silently eaten by that zombie
+    # thread, and the next call's own fresh reader thread would race it for
+    # the following line on the same pipe -- losing or cross-matching
+    # responses. A single long-lived reader avoids that race entirely.
+    try:
+        for l in proc.stdout:
+            l = l.strip()
+            if l and (l.startswith('{') or l.startswith('[')):
+                try:
+                    q.put(json.loads(l))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        q.put(None)  # sentinel: stdout closed / process ended
+
+def _mcp_send_and_recv(proc, resp_queue, req_obj, timeout=30):
     line = json.dumps(req_obj) + "\\n"
     proc.stdin.write(line)
     proc.stdin.flush()
-    res_line = [None]
-    done_evt = threading.Event()
-    
-    def read_stdout():
+    req_id = req_obj.get("id")
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError("MCP server response timed out after " + str(timeout) + "s")
         try:
-            for l in proc.stdout:
-                l = l.strip()
-                if l and (l.startswith('{') or l.startswith('[')):
-                    res_line[0] = l
-                    done_evt.set()
-                    break
-        except Exception:
-            done_evt.set()
-            
-    t = threading.Thread(target=read_stdout, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if not done_evt.is_set() or not res_line[0]:
-        raise TimeoutError("MCP server response timed out after " + str(timeout) + "s")
-    return json.loads(res_line[0])
+            msg = resp_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            if proc.poll() is not None:
+                raise RuntimeError("MCP server process exited unexpectedly")
+            continue
+        if msg is None:
+            raise RuntimeError("MCP server closed its output stream")
+        # Discard notifications and any stale response left over from a
+        # previous call that timed out client-side but answered late --
+        # match on id so it can never be mistaken for the current call's
+        # response.
+        if isinstance(msg, dict) and msg.get("id") == req_id:
+            return msg
 
 def _mcp_init_server(name, config):
     with _mcp_lock:
@@ -7122,7 +7159,11 @@ def _mcp_init_server(name, config):
             errors="replace",
             creationflags=flags
         )
-        
+
+        resp_queue = queue.Queue()
+        reader_thread = threading.Thread(target=_mcp_reader_loop, args=(proc, resp_queue), daemon=True)
+        reader_thread.start()
+
         # 1. initialize
         init_req = {
             "jsonrpc": "2.0",
@@ -7134,7 +7175,7 @@ def _mcp_init_server(name, config):
                 "clientInfo": {"name": "SlopLobster", "version": "1.4"}
             }
         }
-        init_res = _mcp_send_and_recv(proc, init_req, timeout=15)
+        init_res = _mcp_send_and_recv(proc, resp_queue, init_req, timeout=15)
         
         # 2. initialized notification
         proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\\n")
@@ -7147,7 +7188,7 @@ def _mcp_init_server(name, config):
             "method": "tools/list",
             "params": {}
         }
-        list_res = _mcp_send_and_recv(proc, list_req, timeout=15)
+        list_res = _mcp_send_and_recv(proc, resp_queue, list_req, timeout=15)
         tools = list_res.get("result", {}).get("tools", [])
         
         _mcp_servers[name] = {
@@ -7155,7 +7196,9 @@ def _mcp_init_server(name, config):
             "tools": tools,
             "config": config,
             "id_counter": 3,
-            "lock": threading.Lock()
+            "lock": threading.Lock(),
+            "resp_queue": resp_queue,
+            "reader_thread": reader_thread,
         }
         return {"status": "connected", "tools": tools, "tool_count": len(tools)}
 
@@ -7175,7 +7218,7 @@ def _mcp_call_tool(server_name, tool_name, arguments, timeout=120):
                 "arguments": arguments or {}
             }
         }
-        res = _mcp_send_and_recv(srv["proc"], call_req, timeout=timeout)
+        res = _mcp_send_and_recv(srv["proc"], srv["resp_queue"], call_req, timeout=timeout)
         if "error" in res:
             err_msg = res["error"].get("message", str(res["error"])) if isinstance(res["error"], dict) else str(res["error"])
             return {"error": err_msg}
@@ -7796,7 +7839,7 @@ if __name__ == "__main__":
       backendType: 'lmstudio', // 'lmstudio' | 'llamacpp'
       isGitRepo: false,
       modelInfoMap: new Map(), // modelId -> {vision, contextLength, displayName, trainedForToolUse, architecture, paramsString}
-      model: null, connected: false, compConnected: false, compInfo: null,
+      model: null, connected: false, compConnected: false, compInfo: null, compFailStreak: 0,
       sysPromptProfiles: {},
       safetyProfiles: {},
       messages: [], running: false, abortCtrl: null,
@@ -7857,6 +7900,13 @@ if __name__ == "__main__":
          limit was hit, companion disconnected mid-task. Off by default since
          requesting Notification permission is intrusive — opt-in only. ── */
       notificationsEnabled: false,
+      /* ── Experimental Thinking Mode: bundles several reasoning strategies
+         beyond update_beliefs — invariant tracking, premortem notes on risky
+         actions, and reflexion (explicit self-critique) after test failures.
+         Off by default: adds real overhead per turn, worth it mainly for
+         gnarly/high-stakes tasks, not routine ones. ── */
+      experimentalMode: false,
+      invariants: [],
       autoVerifyCommand: '',
       /* ── Session token budget guard: 0 = unlimited. Checked against
          _sessionTotalOut (cumulative output tokens across this browser session,
@@ -8200,7 +8250,9 @@ Two tools track your progress visibly, for two different situations — pick bas
 - **update_plan**: the shape of the work is already known — "add these 3 files, refactor these functions". A fixed, ordered checklist.
 - **update_beliefs**: you DON'T yet know what's true or what the right approach is — debugging ("why is this failing"), root-cause analysis, an architecture choice with real trade-offs. Track 2-4 competing hypotheses with a rough confidence each. Before acting, choose the action that best discriminates between your leading hypotheses — the one whose result would most change your confidence — rather than just the next thing that seems useful. After every observation, update confidences explicitly. Move a hypothesis to "ruled_out" when evidence contradicts it, but keep it in the list rather than deleting it — reviving a demoted hypothesis when a "confirmed" one turns out wrong should be cheap, not a restart.
 
-Don't force a checklist onto something you're not actually sure about yet — a fake fixed plan you have to awkwardly revise is exactly the friction update_beliefs exists to avoid. Once a hypothesis is confirmed and you know the concrete steps to act on it, switch to update_plan for execution — update_beliefs is for figuring out what's true, update_plan is for doing something about it. Both can be active at once: the natural lifecycle for diagnostic work is hypotheses first, then a plan once one is confirmed.`;
+Don't force a checklist onto something you're not actually sure about yet — a fake fixed plan you have to awkwardly revise is exactly the friction update_beliefs exists to avoid. Once a hypothesis is confirmed and you know the concrete steps to act on it, switch to update_plan for execution — update_beliefs is for figuring out what's true, update_plan is for doing something about it. Both can be active at once: the natural lifecycle for diagnostic work is hypotheses first, then a plan once one is confirmed.
+
+{{INVARIANTS_SECTION}}{{EXPERIMENTAL_SECTION}}`;
 
     /* ═══════════════ PATH SANITIZATION ═══════════════ */
     function sanitizePath(raw) {
@@ -9108,6 +9160,17 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           }
         }},
         { type: 'function', function: {
+          name: 'set_invariants',
+          description: '(Experimental mode) Declare constraints that must keep holding true for the rest of this task — things easy to silently break several edits later without noticing: "the public API of this function must not change", "all existing tests must stay green", "this config format stays backward-compatible". These are injected into your own system prompt for the rest of the conversation, not checked automatically — restate the full list (not just additions) whenever it changes, and actively double-check your own recent changes against it before moving on, especially after edits that weren\'t directly about the invariant itself.',
+          parameters: {
+            type: 'object',
+            properties: {
+              invariants: { type: 'array', items: { type: 'string' }, description: 'The complete list of constraints that must keep holding' }
+            },
+            required: ['invariants']
+          }
+        }},
+        { type: 'function', function: {
           name: 'save_memory',
           description: 'Save a short, durable note to project memory — persists across conversations in this workspace and is shown to you at the start of every future session here, immune to context compaction. Call this IMMEDIATELY at the moment you discover something, don\'t wait until you think you\'re "done": environment/tooling quirks (e.g. "use python not python3 here", a command that only works one specific way), user preferences, architectural decisions, non-obvious conventions. A fix that cost you a failed attempt to find is exactly the kind of thing worth one save_memory call so it\'s never rediscovered the hard way again. Do NOT use for task-specific progress (handled automatically by compaction) or secrets/credentials.',
           parameters: {
@@ -9177,7 +9240,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           tools.push({ type: 'function', function: { name: 'git_diff', description: 'Show git diff. Use staged=true for staged changes.', parameters: { type: 'object', properties: { staged: { type: 'boolean', description: 'Show staged changes only' }, file: { type: 'string', description: 'Specific file to diff' } }, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_log', description: 'Show recent git commit history.', parameters: { type: 'object', properties: { count: { type: 'number', description: 'Number of commits (default: 10)' } }, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_add', description: 'Stage files for commit. Use "." to stage all changes.', parameters: { type: 'object', properties: { paths: { type: 'string', description: 'File paths to stage (space-separated, or "." for all)' } }, required: ['paths'] } } });
-          tools.push({ type: 'function', function: { name: 'git_commit', description: 'Commit staged changes with a descriptive message.', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Commit message' } }, required: ['message'] } } });
+          tools.push({ type: 'function', function: { name: 'git_commit', description: 'Commit staged changes with a descriptive message.', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Commit message' }, premortem: { type: 'string', description: '(Experimental mode) One sentence: the most likely way this commit could be wrong, if it is. Shown to the user in the confirmation.' } }, required: ['message'] } } });
           tools.push({ type: 'function', function: { name: 'git_push', description: 'Push commits to a remote. Always confirms first (this affects a remote/shared repo).', parameters: { type: 'object', properties: { remote: { type: 'string', description: 'Remote name (default: origin)' }, branch: { type: 'string', description: 'Branch name (default: current branch)' }, force: { type: 'boolean', description: 'Use --force-with-lease (default: false). Use only if you are sure you want to overwrite remote history.' } }, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_checkout_branch', description: 'Switch to a branch, optionally creating it.', parameters: { type: 'object', properties: { branch: { type: 'string', description: 'Branch name' }, create: { type: 'boolean', description: 'Create the branch if it does not exist (git checkout -b)' } }, required: ['branch'] } } });
           tools.push({ type: 'function', function: { name: 'git_stash', description: 'Stash, pop, or list stashed working-tree changes.', parameters: { type: 'object', properties: { action: { type: 'string', enum: ['push', 'pop', 'list'], description: 'push = stash current changes (default), pop = restore most recent stash, list = show stashes' }, message: { type: 'string', description: 'Optional label for a push action' } }, required: [] } } });
@@ -9297,13 +9360,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       // rather than just trimming context.
       let filtered = tools;
       if (!state.allowAskUser) filtered = filtered.filter(t => t.function.name !== 'ask_user');
+      if (!state.experimentalMode) filtered = filtered.filter(t => t.function.name !== 'set_invariants');
       if (state.disabledTools && state.disabledTools.size) {
         filtered = filtered.filter(t => t.function.name === 'think' || !state.disabledTools.has(t.function.name));
       }
       return filtered;
     }
 
-    const TOOL_ICONS = { think: 'brain', update_plan: 'list-check', update_beliefs: 'brain', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
+    const TOOL_ICONS = { think: 'brain', update_plan: 'list-check', update_beliefs: 'brain', set_invariants: 'shield-halved', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
 
     // Tools that can't be turned off from the toggle list, because the app
     // depends on them for basic reasoning/filesystem awareness.
@@ -9327,11 +9391,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     function getAllToolDefsUnfiltered() {
       const savedDisabled = state.disabledTools;
       const savedAllowAsk = state.allowAskUser;
+      const savedExperimental = state.experimentalMode;
       state.disabledTools = new Set();
       state.allowAskUser = true;
+      state.experimentalMode = true;
       const defs = getToolDefs();
       state.disabledTools = savedDisabled;
       state.allowAskUser = savedAllowAsk;
+      state.experimentalMode = savedExperimental;
       return defs;
     }
 
@@ -11875,26 +11942,50 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       }
     }
 
+    // Consecutive failed 20s-interval probes required before we treat the
+    // companion as actually down mid-task. A single dropped/slow request
+    // (transient network blip, brief GC pause, etc.) shouldn't interrupt
+    // the transcript with a disconnect/reconnect pair moments apart — that
+    // adds noise without giving the user anything to act on. Requiring two
+    // consecutive misses (~20-40s of real downtime) filters those out while
+    // still catching genuine outages promptly.
+    const COMPANION_FAIL_THRESHOLD = 2;
+
     async function checkCompanion() {
-      const wasConnected = state.compConnected;
       if (state.running) {
         // Lighter-weight probe during an active run: skip the status-dot UI
         // update (would flicker mid-task) and MCP re-sync, just detect a
-        // disconnect so it surfaces immediately instead of every tool call
-        // silently failing against a dead server until the loop happens to
-        // stop on its own for an unrelated reason.
+        // disconnect so it surfaces before every tool call silently fails
+        // against a dead server. Debounced against transient blips (see
+        // COMPANION_FAIL_THRESHOLD) so we only alert on a confirmed outage,
+        // and only announce recovery if we actually announced the outage.
+        let ok = false;
         try {
           const res = await fetch(`${state.compUrl}/status`, { signal: AbortSignal.timeout(3000) });
           if (!res.ok) throw new Error(res.statusText);
+          ok = true;
+        } catch { ok = false; }
+
+        if (ok) {
+          const wasConfirmedDown = state.compFailStreak >= COMPANION_FAIL_THRESHOLD;
+          state.compFailStreak = 0;
           state.compConnected = true;
-        } catch {
-          state.compConnected = false; state.compInfo = null;
-        }
-        if (wasConnected && !state.compConnected) {
-          appendMsg('system', '⚠ Companion server disconnected mid-task — shell, git, and browser tools will fail until it reconnects. If you restarted it, this reconnects automatically within 20s.');
-          notifyUser('Companion server disconnected', 'Shell, git, and browser tools will fail until it reconnects.');
-        } else if (!wasConnected && state.compConnected) {
-          appendMsg('system', '✓ Companion server reconnected.');
+          if (wasConfirmedDown) {
+            appendMsg('system', '✓ Companion server reconnected.');
+          }
+        } else {
+          state.compFailStreak++;
+          if (state.compFailStreak === COMPANION_FAIL_THRESHOLD) {
+            // Confirmed outage (not a one-off blip) — surface it now, tied
+            // to the actual failure, rather than a floating status ping.
+            state.compConnected = false; state.compInfo = null;
+            appendMsg('system', '⚠ Companion server disconnected mid-task — shell, git, and browser tools will fail until it reconnects. If you restarted it, this reconnects automatically.');
+            notifyUser('Companion server disconnected', 'Shell, git, and browser tools will fail until it reconnects.');
+          }
+          // First miss: stay optimistic. Don't flip compConnected or notify
+          // yet — let an in-flight tool call try its own request rather
+          // than being pre-emptively blocked by a probe that may have just
+          // been unlucky.
         }
         return;
       }
@@ -11903,7 +11994,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       try {
         const res = await fetch(`${state.compUrl}/status`, { signal: AbortSignal.timeout(3000) });
         if (!res.ok) throw new Error(res.statusText); const data = await res.json();
-        state.compConnected = true; state.compInfo = data;
+        state.compConnected = true; state.compInfo = data; state.compFailStreak = 0;
         dot.className = 'status-dot comp-on'; txt.textContent = 'Shell';
         let pythonLine = `<div><span>Python:</span> ${data.python} (${data.python_cmd || 'unknown'})</div>`;
         if (data.python_env) {
@@ -11985,6 +12076,13 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         const confirmed = state.beliefs.find(h => h.status === 'confirmed');
         const leading = confirmed || state.beliefs.filter(h => h.status === 'active').sort((a, b) => b.confidence - a.confidence)[0];
         return { output: leading ? `Beliefs updated. Leading: "${leading.text}" (${leading.confidence}%${leading.status === 'confirmed' ? ', confirmed' : ''}).` : 'Beliefs updated (no active hypotheses).' };
+      },
+      'set_invariants': async (args) => {
+        const list = Array.isArray(args.invariants) ? args.invariants : [];
+        state.invariants = list.map(s => String(s).slice(0, 200)).filter(Boolean);
+        state._sysPromptCacheText = null; // invariants are injected into the system prompt, so force a rebuild
+        renderTodoChecklist();
+        return { output: state.invariants.length ? `Invariants set (${state.invariants.length}). These are now in your system prompt for the rest of this conversation.` : 'Invariants cleared.' };
       },
       'ask_user': async (args) => {
         if (!args.question) return { output: 'Error: "question" is required for ask_user' };
@@ -12384,7 +12482,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             showActionConfirm('Confirm commit', args.message, msgOrFalse => {
               if (msgOrFalse === false) { resolve({ output: 'Commit cancelled by user.' }); return; }
               gitCommit(msgOrFalse).then(output => resolve({ output }));
-            }, { editable: true, icon: 'fa-code-commit', yesLabel: 'Commit' });
+            }, { editable: true, icon: 'fa-code-commit', yesLabel: 'Commit', subtitle: args.premortem ? 'If wrong: ' + args.premortem : null });
           });
         }
         return { output: await gitCommit(args.message) };
@@ -13020,39 +13118,54 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       const badge = document.getElementById('plan-badge');
       const nPlan = state.planItems.length;
       const nBeliefs = state.beliefs.length;
-      const hasAny = nPlan > 0 || nBeliefs > 0;
+      const nInvariants = state.invariants.length;
+      const hasAny = nPlan > 0 || nBeliefs > 0 || nInvariants > 0;
       if (btn) {
         btn.style.display = hasAny ? '' : 'none';
         const icon = btn.querySelector('i');
-        if (icon) icon.className = nBeliefs ? 'fas fa-brain' : 'fas fa-list-check';
-        btn.title = nBeliefs && nPlan ? 'Hypotheses & task plan' : nBeliefs ? 'Hypotheses' : 'Task plan';
+        if (icon) icon.className = nBeliefs ? 'fas fa-brain' : nPlan ? 'fas fa-list-check' : 'fas fa-shield-halved';
+        const parts = [];
+        if (nInvariants) parts.push('invariants');
+        if (nBeliefs) parts.push('hypotheses');
+        if (nPlan) parts.push('task plan');
+        btn.title = parts.length ? parts.join(' & ') : 'Task plan';
       }
       if (badge) {
         if (nBeliefs) {
           const confirmed = state.beliefs.find(h => h.status === 'confirmed');
           const leading = confirmed || state.beliefs.filter(h => h.status === 'active').sort((a, b) => b.confidence - a.confidence)[0];
           badge.textContent = leading ? `${leading.confidence}%` : '?';
-        } else {
+        } else if (nPlan) {
           const done = state.planItems.filter(i => i.status === 'done').length;
           badge.textContent = `${done}/${nPlan}`;
+        } else {
+          badge.textContent = `${nInvariants}`;
         }
         badge.classList.toggle('hidden', !hasAny);
       }
       const title = document.getElementById('plan-popup-title');
-      if (title) title.innerHTML = nBeliefs && nPlan ? '<i class="fas fa-brain" style="color:var(--accent);margin-right:6px"></i>Hypotheses & Plan'
-        : nBeliefs ? '<i class="fas fa-brain" style="color:var(--accent);margin-right:6px"></i>Hypotheses'
-        : '<i class="fas fa-list-check" style="color:var(--accent);margin-right:6px"></i>Task Plan';
+      if (title) {
+        const label = nBeliefs && nPlan ? 'Hypotheses & Plan' : nBeliefs ? 'Hypotheses' : nPlan ? 'Task Plan' : nInvariants ? 'Invariants' : 'Task Plan';
+        const iconClass = nBeliefs ? 'fa-brain' : nPlan ? 'fa-list-check' : 'fa-shield-halved';
+        title.innerHTML = `<i class="fas ${iconClass}" style="color:var(--accent);margin-right:6px"></i>${label}`;
+      }
       updatePlanList();
     }
 
     function updatePlanList() {
       const list = document.getElementById('plan-list');
       if (!list) return;
-      if (!state.planItems.length && !state.beliefs.length) {
+      if (!state.planItems.length && !state.beliefs.length && !state.invariants.length) {
         list.innerHTML = `<div class="cp-empty"><i class="fas fa-info-circle" style="margin-bottom:4px;opacity:.5"></i>No active plan or hypotheses yet — the agent sets these via update_plan (known steps) or update_beliefs (still figuring out the approach)</div>`;
         return;
       }
       let html = '';
+      if (state.invariants.length) {
+        html += `<div class="invariants-block"><div class="invariants-hdr"><i class="fas fa-shield-halved"></i> Invariants</div>` +
+          state.invariants.map(i => `<div class="invariant-item"><i class="fas fa-minus" style="font-size:7px;opacity:.6"></i>${esc(i)}</div>`).join('') +
+          `</div>`;
+        if (state.beliefs.length || state.planItems.length) html += `<div class="cp-divider"></div>`;
+      }
       if (state.beliefs.length) {
         const statusColor = { active: 'var(--accent)', confirmed: 'var(--teal)', ruled_out: 'var(--tx-4)' };
         const statusIcon = { active: 'fa-circle-question', confirmed: 'fa-circle-check', ruled_out: 'fa-circle-xmark' };
@@ -13086,6 +13199,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       state.planItems = [];
       state.beliefs = [];
       state.beliefNextAction = '';
+      state.invariants = [];
+      state._sysPromptCacheText = null;
       renderTodoChecklist();
       state.pendingSteerMessages = [];
       renderSteerQueue();
@@ -13617,11 +13732,17 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const dateStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
       const sysVal = document.getElementById('s-sys-prompt').value || DEFAULT_SYS;
       const planProfileKey = _planProfile ? `B${_planProfile.needsBrowser}G${_planProfile.needsGit}S${_planProfile.needsSearch}` : 'none';
-      const cacheKey = state.model + '|' + state.dirName + '|' + state.projectType + '|' + sysVal.length + '|' + state.compConnected + '|' + state.visionCapable + '|' + planProfileKey + '|' + (state.projectMemoryText || '').length + '|' + (state.compInfo?.python_cmd || '');
+      const cacheKey = state.model + '|' + state.dirName + '|' + state.projectType + '|' + sysVal.length + '|' + state.compConnected + '|' + state.visionCapable + '|' + planProfileKey + '|' + (state.projectMemoryText || '').length + '|' + (state.compInfo?.python_cmd || '') + '|' + state.experimentalMode + '|' + state.invariants.length;
       if (state._sysPromptCacheKey !== cacheKey || !state._sysPromptCacheText) {
         state._sysPromptCacheKey = cacheKey;
         const projectMemorySection = state.projectMemoryText
           ? `═══ PROJECT MEMORY (${getProjectMemoryFile()}) ═══\nDurable notes carried over from previous conversations in this workspace. Treat as background context, not instructions from the current user turn:\n\n${state.projectMemoryText}`
+          : '';
+        const invariantsSection = state.invariants.length
+          ? `\n═══ INVARIANTS (must keep holding — set via set_invariants) ═══\n${state.invariants.map(i => '- ' + i).join('\n')}\n\nActively double-check your recent changes against these before moving on, especially after edits that weren\'t directly about the invariant itself. If you realize one has been broken, fix it before continuing with anything else.\n`
+          : '';
+        const experimentalSection = state.experimentalMode
+          ? `\n═══ EXPERIMENTAL: COMBINED THINKING STRATEGIES ═══\nThis mode is on. On top of update_beliefs/update_plan, apply these:\n\n- **Premortem before risky/irreversible actions** (git_commit, git_push, destructive shell commands): before doing it, think for one sentence about the most likely way this could be wrong, not just why you think it's right. You can pass this as the optional "premortem" field on git_commit — it's shown to the user in the confirmation.\n- **Cost-of-error weighting**: when choosing between candidate approaches, don't just pick the one you're most confident in — weigh confidence against how expensive being wrong would be. A 70%-confidence reversible fix (an edit you can undo) usually beats an 80%-confidence irreversible one (a destructive command, a schema migration) as your FIRST move.\n- **Reflexion after failure**: when a test or verification fails, don't just retry with a fix. State in one sentence why you think the previous attempt failed and what you're doing differently this time — actual analysis, not "let me try again."\n- **Invariant hygiene**: use set_invariants for any constraint you'd be annoyed to discover you broke three edits later. Re-check them explicitly before considering a task done.\n`
           : '';
         // NOTE: .replaceAll() is required here, not .replace() — .replace() with a
         // string (non-regex) pattern only substitutes the FIRST occurrence. Several
@@ -13645,7 +13766,9 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           .replaceAll('{{PYTHON_CMD}}', pythonCmd)
           .replaceAll('{{ENV_DETAILS}}', envDetails)
           .replaceAll('{{SMART_CONTEXT_SECTION}}', smartContextSection)
-          .replaceAll('{{PROJECT_MEMORY_SECTION}}', projectMemorySection);
+          .replaceAll('{{PROJECT_MEMORY_SECTION}}', projectMemorySection)
+          .replaceAll('{{INVARIANTS_SECTION}}', invariantsSection)
+          .replaceAll('{{EXPERIMENTAL_SECTION}}', experimentalSection);
 
         // ── Template placeholder self-check ──
         // Catches the exact class of bug where a `{{PLACEHOLDER}}` is referenced in the
@@ -15893,7 +16016,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               else $msg().appendChild(el);
               liveThinkEls.set(idx, el);
             }
-            updateLiveThinkBlock(liveThinkEls.get(idx), thinkText); scrollBottom();
+            updateLiveThinkBlock(liveThinkEls.get(idx), thinkText); // scroll now happens inside the rAF-batched update
           }, (reasoningText) => {
             // Native model reasoning (Qwen3/DeepSeek-style "reasoning_content"). This streams
             // BEFORE any delta.content arrives, so surface it immediately instead of leaving
@@ -15905,7 +16028,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               if (streamEl && streamEl.parentNode) streamEl.parentNode.insertBefore(reasoningEl, streamEl);
               else $msg().appendChild(reasoningEl);
             }
-            updateLiveThinkBlock(reasoningEl, reasoningText); scrollBottom();
+            updateLiveThinkBlock(reasoningEl, reasoningText); // scroll now happens inside the rAF-batched update
           });
           if (reasoningEl) finalizeLiveThinkBlock(reasoningEl);
           cur = _chatRes.content || '';
@@ -15946,10 +16069,12 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           if (th && th.parentNode) th.remove();
 
           for (const el of [...liveThinkEls.values(), ...(reasoningEl ? [reasoningEl] : [])]) {
+            if (el._rAF) { cancelAnimationFrame(el._rAF); el._rAF = null; }
             const content = el.querySelector('.think-content');
             const badge = el.querySelector('.think-badge');
             if (content) {
               content.classList.remove('streaming-cursor');
+              if (el._text) content.textContent = el._text; // flush any text queued in an un-fired rAF frame
               if (!content.textContent.trim()) content.textContent = '(interrupted)';
             }
             if (badge) {
@@ -16482,9 +16607,12 @@ Use git_diff to review changes before committing. git_diff without arguments sho
 
               /* Send last 4000 chars of output — enough for the error, not enough to blow context */
               const tail = verifyOutput.length > 4000 ? '...\n' + verifyOutput.slice(-4000) : verifyOutput;
+              const reflexionInstruction = state.experimentalMode
+                ? 'Before fixing: state in ONE sentence why you think this attempt failed and what you\'re doing differently this time — actual analysis, not "let me try again." Then fix it.'
+                : 'Do NOT explain what went wrong — just fix it silently.';
               state.messages.push({
                 role: 'user',
-                content: '[AUTO-VERIFY FAILED (attempt ' + state._autoVerifyRetries + '/' + state.autoVerifyMaxRetries + '): Your recent file changes broke the test suite. Read the error below, identify the root cause, and fix it. Do NOT explain what went wrong — just fix it silently.\n\nCommand: ' + state.autoVerifyCommand + '\n---\n' + tail + ']'
+                content: '[AUTO-VERIFY FAILED (attempt ' + state._autoVerifyRetries + '/' + state.autoVerifyMaxRetries + '): Your recent file changes broke the test suite. Read the error below, identify the root cause, and fix it. ' + reflexionInstruction + '\n\nCommand: ' + state.autoVerifyCommand + '\n---\n' + tail + ']'
               });
               updateContextMeter();
             }
@@ -16773,11 +16901,31 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       el._collapsed = true; return el;
     }
     function updateLiveThinkBlock(el, text) {
-      const content = el.querySelector('.think-content'); content.textContent = text;
-      if (!el._collapsed) content.scrollTop = content.scrollHeight;
+      // Coalesce to one DOM write per animation frame instead of writing +
+      // reflowing on every single SSE delta. During a long reasoning phase
+      // a model can emit hundreds of small token deltas per second; without
+      // this, each one did a synchronous textContent write immediately
+      // followed by a synchronous scrollBottom() (which forces a layout
+      // read via scrollHeight) — classic write/read layout-thrashing. That
+      // floods the main thread badly enough that the panel visibly stops
+      // updating for stretches, even though the fetch stream underneath
+      // (and the backend generating it) is still running fine; it just
+      // looks like it "stopped in the middle."
+      el._text = text;
+      if (el._rAF) return;
+      el._rAF = requestAnimationFrame(() => {
+        el._rAF = null;
+        if (!el.isConnected) return;
+        const content = el.querySelector('.think-content');
+        content.textContent = el._text;
+        if (!el._collapsed) content.scrollTop = content.scrollHeight;
+        scrollBottom();
+      });
     }
     function finalizeLiveThinkBlock(el) {
+      if (el._rAF) { cancelAnimationFrame(el._rAF); el._rAF = null; }
       const content = el.querySelector('.think-content'); const badge = el.querySelector('.think-badge');
+      content.textContent = el._text ?? content.textContent; // flush any pending frame's text first
       content.classList.remove('streaming-cursor');
       const charCount = content.textContent.length;
       const shortCount = charCount > 1000 ? (charCount / 1000).toFixed(1) + 'k' : charCount;
@@ -17265,7 +17413,10 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const detailHtml = opts.editable
         ? `<input type="text" class="confirm-cmd-input" value="${esc(detail)}" style="flex:1;background:var(--bg-3);color:var(--tx-1);border:1px solid var(--border);border-radius:3px;padding:4px 6px;font-family:'JetBrains Mono',monospace;font-size:11px;">`
         : `<span style="flex:1;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--tx-1);white-space:pre-wrap;word-break:break-all">${esc(detail)}</span>`;
-      el.innerHTML = `<div style="display:flex;align-items:center;width:100%;gap:8px"><i class="fas ${opts.icon || 'fa-triangle-exclamation'}"></i><b>${esc(label)}:</b> ${detailHtml}<button class="confirm-yes" style="padding:4px 8px;font-size:11px;cursor:pointer;background:var(--accent);color:white;border:none;border-radius:3px">${esc(opts.yesLabel || 'Proceed')}</button><button class="confirm-no" style="padding:4px 8px;font-size:11px;cursor:pointer;background:var(--bg-3);color:var(--tx-2);border:none;border-radius:3px">Cancel</button></div>`;
+      const subtitleHtml = opts.subtitle
+        ? `<div style="width:100%;font-size:10.5px;color:var(--tx-3);font-style:italic;padding-left:22px;margin-top:2px"><i class="fas fa-triangle-exclamation" style="margin-right:4px;opacity:.7"></i>${esc(opts.subtitle)}</div>`
+        : '';
+      el.innerHTML = `<div style="display:flex;align-items:center;width:100%;gap:8px"><i class="fas ${opts.icon || 'fa-triangle-exclamation'}"></i><b>${esc(label)}:</b> ${detailHtml}<button class="confirm-yes" style="padding:4px 8px;font-size:11px;cursor:pointer;background:var(--accent);color:white;border:none;border-radius:3px">${esc(opts.yesLabel || 'Proceed')}</button><button class="confirm-no" style="padding:4px 8px;font-size:11px;cursor:pointer;background:var(--bg-3);color:var(--tx-2);border:none;border-radius:3px">Cancel</button></div>${subtitleHtml}`;
       const input = el.querySelector('.confirm-cmd-input');
       el.querySelector('.confirm-yes').onclick = () => { const val = input ? input.value : detail; el.remove(); callback(val); };
       el.querySelector('.confirm-no').onclick = () => { el.remove(); callback(false); };
@@ -17960,6 +18111,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.planItems = [];
       state.beliefs = [];
       state.beliefNextAction = '';
+      state.invariants = [];
       renderTodoChecklist();
       toolCallHistory.length = 0;
       state._autoVerifyRetries = 0;
@@ -18023,6 +18175,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.planItems = [];
       state.beliefs = [];
       state.beliefNextAction = '';
+      state.invariants = [];
       renderTodoChecklist();
       state.pendingSteerMessages = [];
       renderSteerQueue();
@@ -18488,6 +18641,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (s.clarifyMode !== undefined) state.clarifyMode = s.clarifyMode;
         if (s.allowAskUser !== undefined) state.allowAskUser = s.allowAskUser;
         if (s.notificationsEnabled !== undefined) state.notificationsEnabled = s.notificationsEnabled;
+        if (s.experimentalMode !== undefined) state.experimentalMode = s.experimentalMode;
         if (s.clarifyCount !== undefined) state.clarifyCount = s.clarifyCount;
         if (s.autoVerifyCommand !== undefined) state.autoVerifyCommand = s.autoVerifyCommand;
         if (s.autoVerifyMaxRetries !== undefined) state.autoVerifyMaxRetries = s.autoVerifyMaxRetries;
@@ -18586,6 +18740,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           clarifyMode: state.clarifyMode,
           allowAskUser: state.allowAskUser,
           notificationsEnabled: state.notificationsEnabled,
+          experimentalMode: state.experimentalMode,
           clarifyCount: state.clarifyCount,
           autoVerifyCommand: state.autoVerifyCommand,
           autoVerifyMaxRetries: state.autoVerifyMaxRetries,
@@ -18685,6 +18840,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       document.getElementById('s-clarify-mode').checked = state.clarifyMode;
       const _allowAskCb = document.getElementById('s-allow-ask-user'); if (_allowAskCb) _allowAskCb.checked = state.allowAskUser;
       const _notifCb = document.getElementById('s-notifications'); if (_notifCb) _notifCb.checked = state.notificationsEnabled;
+      const _expCb = document.getElementById('s-experimental-mode'); if (_expCb) _expCb.checked = state.experimentalMode;
       document.getElementById('s-clarify-count').value = state.clarifyCount;
       document.getElementById('s-auto-verify').value = state.autoVerifyCommand || '';
       document.getElementById('s-auto-verify-retries').value = state.autoVerifyMaxRetries;
@@ -18732,6 +18888,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.clarifyMode = document.getElementById('s-clarify-mode').checked;
       const _allowAskCb2 = document.getElementById('s-allow-ask-user'); if (_allowAskCb2) state.allowAskUser = _allowAskCb2.checked;
       const _notifCb2 = document.getElementById('s-notifications'); if (_notifCb2) state.notificationsEnabled = _notifCb2.checked;
+      const _expCb2 = document.getElementById('s-experimental-mode'); if (_expCb2) state.experimentalMode = _expCb2.checked;
       state.clarifyCount = Math.min(5, Math.max(1, parseInt(document.getElementById('s-clarify-count').value) || 3));
       state.autoVerifyCommand = document.getElementById('s-auto-verify').value.trim();
       state.autoVerifyMaxRetries = Math.max(1, parseInt(document.getElementById('s-auto-verify-retries').value) || 3);
