@@ -2850,6 +2850,32 @@
       color: var(--green)
     }
 
+    /* ── MCP JSON config editor: syntax-highlighted overlay behind a
+       transparent textarea, so the raw JSON is easier to read at a glance ── */
+    .mcp-editor-wrap { position: relative; }
+    .mcp-editor-wrap pre.mcp-editor-highlight,
+    .mcp-editor-wrap textarea#s-mcp-config {
+      margin: 0; padding: 8px 10px; box-sizing: border-box;
+      font-family: 'JetBrains Mono', monospace; font-size: 11px; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word; border-radius: 6px;
+    }
+    .mcp-editor-highlight {
+      position: absolute; inset: 0; overflow: auto; pointer-events: none;
+      background: var(--bg-2); border: 1px solid var(--border); color: var(--tx-2);
+    }
+    .mcp-editor-wrap textarea#s-mcp-config {
+      position: relative; width: 100%; resize: vertical; outline: none;
+      background: transparent; color: transparent; caret-color: var(--tx-0);
+      border: 1px solid transparent;
+    }
+    .mcp-editor-wrap textarea#s-mcp-config:focus { border-color: var(--accent-d); }
+    .mcp-editor-wrap textarea#s-mcp-config::selection { background: rgba(232, 160, 35, .35); }
+    .mcp-json-key    { color: #7dd3fc }
+    .mcp-json-string { color: #86efac }
+    .mcp-json-number { color: #fbbf24 }
+    .mcp-json-bool   { color: #c084fc }
+    .mcp-json-punct  { color: var(--tx-4) }
+
     #toasts {
       position: fixed;
       top: 50px;
@@ -5948,25 +5974,77 @@
 
         <!-- TAB: SAMPLING & MODEL -->
         <div class="settings-tab-panel" id="stab-sampling">
-          <div class="field"><label>Temperature</label>
-            <div class="slider-row"><input type="range" id="s-temp" min="0" max="2" step="0.05" value="0.3"><span class="val" id="s-temp-val">0.3</span></div>
+          <div class="field" style="border:1px solid var(--accent-d);border-radius:6px;padding:8px 10px;background:var(--accent-glow)">
+            <label style="color:var(--accent)">Server-Side Sampling & Generation Behavior</label>
+            <div class="slider-row">
+              <input type="checkbox" id="s-use-server-sampling" style="accent-color:var(--accent)">
+              <span class="val" style="min-width:auto">Use LM Studio / llama.cpp's own loaded config — don't send any sampling parameter, or Qwen's enable_thinking/preserve_thinking, on any request</span>
+            </div>
+            <div class="hint">On: whatever sampling params and chat-template behavior the server was started/loaded with apply (e.g. llama.cpp's <code style="background:var(--bg-3);padding:1px 4px;border-radius:3px">--temp</code> flags, or LM Studio's per-model preset) — this also disables the Advanced Samplers section below and the Qwen Thinking Mode checkboxes further down in Model Load Settings, since those would otherwise still override the server on every request (including Plan Mode's planning call). Off (default): the sliders/checkboxes are sent on every request and override the server.</div>
           </div>
-          <div class="field"><label>Top P (Nucleus Sampling)</label>
-            <div class="slider-row"><input type="range" id="s-top-p" min="0" max="1" step="0.05" value="0.95"><span class="val" id="s-top-p-val">0.95</span></div>
-            <div class="hint">Probability threshold for token sampling (0.0 - 1.0).</div>
+
+          <div id="sampling-sliders-group">
+            <div class="field"><label>Temperature</label>
+              <div class="slider-row"><input type="range" id="s-temp" min="0" max="2" step="0.05" value="0.3"><span class="val" id="s-temp-val">0.3</span></div>
+            </div>
+            <div class="field"><label>Top P (Nucleus Sampling)</label>
+              <div class="slider-row"><input type="range" id="s-top-p" min="0" max="1" step="0.05" value="0.95"><span class="val" id="s-top-p-val">0.95</span></div>
+              <div class="hint">Probability threshold for token sampling (0.0 - 1.0).</div>
+            </div>
+            <div class="field"><label>Top K</label>
+              <div class="slider-row"><input type="range" id="s-top-k" min="0" max="100" step="1" value="40"><span class="val" id="s-top-k-val">40</span></div>
+              <div class="hint">Limit vocabulary to top K tokens (0 = disabled).</div>
+            </div>
+            <div class="field"><label>Min P</label>
+              <div class="slider-row"><input type="range" id="s-min-p" min="0" max="1" step="0.01" value="0.05"><span class="val" id="s-min-p-val">0.05</span></div>
+              <div class="hint">Relative probability threshold (P >= min_p * max_P). Recommended for Llama 3 / Mistral.</div>
+            </div>
+            <div class="field"><label>Repeat / Presence Penalty</label>
+              <div class="slider-row"><input type="range" id="s-repeat-penalty" min="1.0" max="2.0" step="0.05" value="1.1"><span class="val" id="s-repeat-penalty-val">1.10</span></div>
+              <div class="hint">Penalizes token repetition. 1.0 = neutral, 1.1-1.2 = gentle penalty.</div>
+            </div>
           </div>
-          <div class="field"><label>Top K</label>
-            <div class="slider-row"><input type="range" id="s-top-k" min="0" max="100" step="1" value="40"><span class="val" id="s-top-k-val">40</span></div>
-            <div class="hint">Limit vocabulary to top K tokens (0 = disabled).</div>
+
+          <div id="advanced-samplers-group" style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
+            <div style="font-size:11px;font-weight:700;color:var(--tx-0);margin-bottom:8px">Advanced Samplers</div>
+
+            <div class="field"><label>Frequency Penalty</label>
+              <div class="slider-row"><input type="range" id="s-freq-penalty" min="0" max="2" step="0.05" value="0"><span class="val" id="s-freq-penalty-val">0.00</span></div>
+              <div class="hint">0 = disabled/omitted. Distinct from repeat penalty — scales with how many times a token already appeared.</div>
+            </div>
+
+            <div class="field"><label>Seed</label>
+              <input type="number" id="s-seed" value="-1">
+              <div class="hint">-1 = random (omitted from request). Set a fixed value for reproducible generations.</div>
+            </div>
+
+            <div class="field"><label>DRY Sampling (repetition suppression)</label>
+              <div class="slider-row"><input type="range" id="s-dry-multiplier" min="0" max="5" step="0.1" value="0"><span class="val" id="s-dry-multiplier-val">0.0</span></div>
+              <div class="hint" style="margin-bottom:6px">0 = disabled. llama.cpp/LM Studio's DRY sampler — better at stopping verbatim repetition loops than repeat_penalty.</div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <div style="flex:1;min-width:110px"><span class="val" style="display:block;margin-bottom:2px">Base</span><input type="number" id="s-dry-base" value="1.75" step="0.05" style="width:100%"></div>
+                <div style="flex:1;min-width:110px"><span class="val" style="display:block;margin-bottom:2px">Allowed length</span><input type="number" id="s-dry-allowed-length" value="2" style="width:100%"></div>
+              </div>
+            </div>
+
+            <div class="field"><label>XTC Sampling</label>
+              <div class="slider-row"><input type="range" id="s-xtc-prob" min="0" max="1" step="0.05" value="0"><span class="val" id="s-xtc-prob-val">0.00</span></div>
+              <div class="hint" style="margin-bottom:6px">Probability of removing top tokens to encourage creativity. 0 = disabled.</div>
+              <div style="display:flex;align-items:center;gap:8px"><span class="val">Threshold</span><input type="number" id="s-xtc-threshold" value="0.1" step="0.01" style="width:100px"></div>
+            </div>
+
+            <div class="field"><label>Mirostat</label>
+              <select id="s-mirostat" style="background:var(--bg-2);border:1px solid var(--border);color:var(--tx-0);padding:4px 8px;border-radius:5px;font-size:12px;width:100%">
+                <option value="0">Off</option><option value="1">v1</option><option value="2">v2</option>
+              </select>
+              <div style="display:flex;gap:8px;margin-top:6px">
+                <div style="flex:1"><span class="val" style="display:block;margin-bottom:2px">Tau (target entropy)</span><input type="number" id="s-mirostat-tau" value="5.0" step="0.1" style="width:100%"></div>
+                <div style="flex:1"><span class="val" style="display:block;margin-bottom:2px">Eta (learning rate)</span><input type="number" id="s-mirostat-eta" value="0.1" step="0.01" style="width:100%"></div>
+              </div>
+              <div class="hint">Mirostat replaces top_p/top_k/min_p entirely when enabled (v1 or v2) — those are ignored by the server while it's on.</div>
+            </div>
           </div>
-          <div class="field"><label>Min P</label>
-            <div class="slider-row"><input type="range" id="s-min-p" min="0" max="1" step="0.01" value="0.05"><span class="val" id="s-min-p-val">0.05</span></div>
-            <div class="hint">Relative probability threshold (P >= min_p * max_P). Recommended for Llama 3 / Mistral.</div>
-          </div>
-          <div class="field"><label>Repeat / Presence Penalty</label>
-            <div class="slider-row"><input type="range" id="s-repeat-penalty" min="1.0" max="2.0" step="0.05" value="1.1"><span class="val" id="s-repeat-penalty-val">1.10</span></div>
-            <div class="hint">Penalizes token repetition. 1.0 = neutral, 1.1-1.2 = gentle penalty.</div>
-          </div>
+
           <div class="field">
             <label>Structured Outputs & Tool Schema Constraints</label>
             <div class="slider-row">
@@ -5981,7 +6059,15 @@
               <i class="fas fa-microchip" style="color:var(--accent);font-size:12px"></i>
               Model Load Settings (LM Studio)
             </div>
-            <div class="field">
+            <div class="field" style="border:1px solid var(--accent-d);border-radius:6px;padding:8px 10px;background:var(--accent-glow)">
+              <label style="color:var(--accent)">Use LM Studio's Own Load Defaults</label>
+              <div class="slider-row">
+                <input type="checkbox" id="s-use-model-load-defaults" style="accent-color:var(--accent)">
+                <span class="val" style="min-width:auto">Don't send context length / flash attention / KV offload / experts / batch size when (re)loading a model — let LM Studio use its own per-model preset or last-used config</span>
+              </div>
+              <div class="hint">On: switching models here (or clicking Load) sends only the model name — nothing below this is sent. Off (default): every field below is sent on every load, overriding whatever LM Studio had configured for that model, including automatically whenever you switch models in the header dropdown to one that isn't already loaded.</div>
+            </div>
+            <div class="field" id="qwen-thinking-group">
               <label>Qwen Thinking Mode</label>
               <div style="display:flex;align-items:center;gap:8px">
                 <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-size:11px;color:var(--tx-2)">
@@ -5993,7 +6079,9 @@
                   <span class="val" style="min-width:auto">preserve_thinking</span>
                 </label>
               </div>
+              <div class="hint">This is a per-request parameter, not a load-time one — skipped on every request whenever "Server-Side Sampling & Generation Behavior" above is on, regardless of the load-defaults toggle just above.</div>
             </div>
+            <div id="model-load-overrides-group">
             <div class="field">
               <label>Context Length Override</label>
               <div style="display:flex;align-items:center;gap:8px">
@@ -6028,6 +6116,7 @@
                 <input type="number" id="s-model-eval" value="0" min="0" max="4096" style="width:120px">
                 <span class="val" style="min-width:auto;color:var(--tx-4);font-size:10px">0 = default (512)</span>
               </div>
+            </div>
             </div>
           </div>
         </div>
@@ -6109,7 +6198,17 @@
               </button>
             </div>
             <div class="hint" style="margin-bottom:6px">External MCP servers (Claude Desktop standard or array format). Windows backslashes are auto-sanitized:</div>
-            <textarea id="s-mcp-config" rows="4" placeholder='{\n  "mcpServers": {\n    "ghidra_headless_mcp": {\n      "command": "python3",\n      "args": ["ghidra_headless_mcp.py", "--ghidra-install-dir", "C:/path/to/ghidra"],\n      "cwd": "C:/path/to/mcp"\n    }\n  }\n}' style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+            <div style="display:flex;gap:5px;align-items:center;margin-bottom:6px">
+              <select id="s-mcp-profile" style="flex:1" onchange="loadMcpProfile()">
+                <option value="">— Load a saved or recent config —</option>
+              </select>
+              <button class="sb-btn" onclick="saveMcpProfile()">Save As...</button>
+              <button class="sb-btn" onclick="deleteMcpProfile()">Delete</button>
+            </div>
+            <div class="mcp-editor-wrap">
+              <pre class="mcp-editor-highlight" id="s-mcp-config-highlight" aria-hidden="true"></pre>
+              <textarea id="s-mcp-config" rows="4" spellcheck="false" placeholder='{\n  "mcpServers": {\n    "ghidra_headless_mcp": {\n      "command": "python3",\n      "args": ["ghidra_headless_mcp.py", "--ghidra-install-dir", "C:/path/to/ghidra"],\n      "cwd": "C:/path/to/mcp"\n    }\n  }\n}'></textarea>
+            </div>
             <div id="mcp-status-area" style="margin-top:6px;font-size:11px;color:var(--tx-3)"></div>
           </div>
         </div>
@@ -7845,6 +7944,23 @@ if __name__ == "__main__":
       messages: [], running: false, abortCtrl: null,
       dirHandle: null, dirName: '', fileTree: [],
       temp: 0.3, topP: 0.95, topK: 40, minP: 0.05, repeatPenalty: 1.1, enforceJsonSchema: true,
+      /* ── Server-side sampling toggle: when true, temp/top_p/top_k/min_p/
+         repeat_penalty/presence_penalty are omitted from the request entirely
+         so whatever LM Studio's loaded config or llama.cpp's startup flags
+         set is what actually gets used, instead of the harness always
+         overriding them. ── */
+      useServerSampling: false,
+      frequencyPenalty: 0,        // 0 = omit
+      seed: -1,                   // -1 = omit (random)
+      dryMultiplier: 0,           // 0 = disabled
+      dryBase: 1.75,
+      dryAllowedLength: 2,
+      drySequenceBreakers: '["\\n", ":", "\\"", "*"]',
+      xtcProbability: 0,          // 0 = disabled
+      xtcThreshold: 0.1,
+      mirostat: 0,                // 0 = off, 1 = v1, 2 = v2
+      mirostatTau: 5.0,
+      mirostatEta: 0.1,
       maxTokens: 60000, maxReadKB: 500, cmdTimeout: 60, ctxWindow: 62768,
       autoCompactPct: 85, maxIters: 50,
       /* ── Memory agent: the dedicated compaction pass. Toggle-able (matches
@@ -7926,6 +8042,12 @@ if __name__ == "__main__":
       modelKvOffload: true,
       modelNumExperts: 0,        // 0 = use model default
       modelEvalBatch: 0,         // 0 = use model default
+      // When true, requestModelLoad() sends only {model, echo_load_config}
+      // and omits context_length/flash_attention/offload_kv_cache_to_gpu/
+      // num_experts/eval_batch_size entirely, so LM Studio applies whatever
+      // per-model preset or last-used load config it already has instead of
+      // the harness's own defaults/overrides above.
+      useModelLoadDefaults: false,
       autoScroll: true,
       conversations: [], activeConvId: null,
       fileCache: new Map(),
@@ -7940,7 +8062,9 @@ if __name__ == "__main__":
       devServer: null,  // { port, command, pollInterval, ready }
       _realConvTokens: 0,
       mcpTools: [],
-      mcpConfig: ''
+      mcpConfig: '',
+      mcpConfigProfiles: {},   // named saved configs: { name: jsonString }
+      mcpConfigHistory: []     // recent configs used: [{ ts, config }], most recent first
     };
 
     /* ═══════════════ INDEXEDDB PERSISTENCE ENGINE ═══════════════ */
@@ -13091,8 +13215,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
        lifecycle of diagnostic work: figure out what's true, THEN plan the fix. */
     function togglePlanPopup() {
       let popup = document.getElementById('plan-popup');
-      if (!popup) { popup = renderPlanPopup(); document.body.appendChild(popup); requestAnimationFrame(() => popup.classList.add('open')); }
-      else { popup.classList.toggle('open'); }
+      if (!popup) { popup = renderPlanPopup(); document.body.appendChild(popup); }
+      popup.classList.toggle('open');
       if (popup.classList.contains('open')) requestAnimationFrame(() => updatePlanList());
       if (!popup.classList.contains('open')) setTimeout(() => { if (popup.parentNode) popup.remove(); }, 250);
     }
@@ -13817,22 +13941,65 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       return m;
       })];
 
-      // Compute model-specific or user-customized sampling parameters
+      // Compute model-specific or user-customized sampling parameters.
+      //
+      // By default the harness always sent temperature/top_p/top_k/min_p/
+      // repeat_penalty/presence_penalty as explicit keys on every request,
+      // which silently overrides whatever LM Studio's loaded model config or
+      // llama.cpp's startup flags (--temp, --top-p, etc.) were set to — the
+      // server-side sampling config was never actually consulted for these.
+      // When state.useServerSampling is on, we omit ALL sampling keys —
+      // classic sliders AND the advanced samplers below — so the server's
+      // own loaded/startup config decides everything. Off (default): the
+      // classic sliders always apply, and each advanced sampler applies on
+      // top of them only when the user has explicitly turned it on
+      // (nonzero/set), since there's no meaningful "leave alone" default for
+      // those the way there is for the classic sliders.
       const _qwenThinking = _isQwen && (document.getElementById('s-qwen-enable-thinking')?.checked ?? true);
-      let _temp, _top_p, _top_k, _min_p, _pres, _repeat_penalty;
-      if (_isGemma) {
-        _temp = 1.0; _top_k = 64; _top_p = 0.95; _min_p = 0.0; _pres = undefined; _repeat_penalty = undefined;
+      let body_sampling = {};
+      if (state.useServerSampling) {
+        // Send nothing — server's own loaded/startup config decides every
+        // sampling parameter, including DRY/XTC/Mirostat/seed/frequency
+        // penalty below. Full deference, not just the classic sliders.
+        body_sampling = {};
+      } else if (_isGemma) {
+        body_sampling = { temperature: 1.0, top_k: 64, top_p: 0.95, min_p: 0.0 };
       } else if (_isQwen && _qwenThinking) {
-        _temp = 1.0; _top_k = 20; _top_p = 0.95; _min_p = 0.0; _pres = 1.5; _repeat_penalty = undefined;
+        body_sampling = { temperature: 1.0, top_k: 20, top_p: 0.95, min_p: 0.0, presence_penalty: 1.5 };
       } else if (_isQwen) {
-        _temp = 0.7; _top_k = 20; _top_p = 0.8; _min_p = 0.0; _pres = 1.5; _repeat_penalty = undefined;
+        body_sampling = { temperature: 0.7, top_k: 20, top_p: 0.8, min_p: 0.0, presence_penalty: 1.5 };
       } else {
-        _temp = state.temp;
-        _top_p = state.topP !== undefined ? state.topP : 0.95;
-        _top_k = (state.topK && state.topK > 0) ? state.topK : undefined;
-        _min_p = (state.minP && state.minP > 0) ? state.minP : undefined;
-        _pres = undefined;
-        _repeat_penalty = (state.repeatPenalty && state.repeatPenalty > 1.0) ? state.repeatPenalty : undefined;
+        body_sampling = {
+          temperature: state.temp,
+          top_p: state.topP !== undefined ? state.topP : 0.95,
+          top_k: (state.topK && state.topK > 0) ? state.topK : undefined,
+          min_p: (state.minP && state.minP > 0) ? state.minP : undefined,
+          repeat_penalty: (state.repeatPenalty && state.repeatPenalty > 1.0) ? state.repeatPenalty : undefined,
+        };
+      }
+
+      // Advanced samplers — llama.cpp / LM Studio extensions to the
+      // OpenAI-compatible endpoint. Skipped entirely when useServerSampling
+      // is on (see above); otherwise sent only when explicitly enabled by
+      // the user (nonzero / non-default).
+      if (!state.useServerSampling) {
+        if (state.frequencyPenalty > 0) body_sampling.frequency_penalty = state.frequencyPenalty;
+        if (state.seed !== undefined && state.seed >= 0) body_sampling.seed = state.seed;
+        if (state.dryMultiplier > 0) {
+          body_sampling.dry_multiplier = state.dryMultiplier;
+          body_sampling.dry_base = state.dryBase;
+          body_sampling.dry_allowed_length = state.dryAllowedLength;
+          try { body_sampling.dry_sequence_breakers = JSON.parse(state.drySequenceBreakers); } catch { /* leave unset if malformed */ }
+        }
+        if (state.xtcProbability > 0) {
+          body_sampling.xtc_probability = state.xtcProbability;
+          body_sampling.xtc_threshold = state.xtcThreshold;
+        }
+        if (state.mirostat > 0) {
+          body_sampling.mirostat = state.mirostat;
+          body_sampling.mirostat_tau = state.mirostatTau;
+          body_sampling.mirostat_eta = state.mirostatEta;
+        }
       }
 
       state.abortCtrl = new AbortController();
@@ -13844,18 +14011,17 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           messages: apiMsgs,
           tools: getToolDefs(),
           stream: true,
-          ...(_isQwen ? {
+          // Qwen's enable_thinking/preserve_thinking are per-request generation
+          // behavior, same category as temp/top_p — omit them too when deferring
+          // to the server, so a server-side chat-template default (if any) applies
+          // instead of the harness always forcing a value.
+          ...(_isQwen && !state.useServerSampling ? {
             chat_template_kwargs: {
               enable_thinking: document.getElementById('s-qwen-enable-thinking')?.checked ?? true,
               preserve_thinking: document.getElementById('s-qwen-preserve-thinking')?.checked ?? true,
             }
           } : {}),
-          temperature: _temp,
-          top_p: _top_p,
-          top_k: _top_k,
-          min_p: _min_p,
-          repeat_penalty: _repeat_penalty,
-          presence_penalty: _pres,
+          ...body_sampling,
           max_tokens: (() => {
             // For local servers (llama.cpp, LM Studio, Ollama) the context slot is
             // fixed. Asking for more output tokens than the remaining space causes
@@ -15236,12 +15402,25 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       meta.innerHTML = `<span style="color:var(--yellow)">⏳ Loading ${esc(truncate(modelId, 30))}...</span>`;
 
       const loadBody = { model: modelId, echo_load_config: true };
-      if (state.modelCtxOverride > 0) loadBody.context_length = state.modelCtxOverride;
-      else loadBody.context_length = state.ctxWindow;
-      if (state.modelFlashAttn) loadBody.flash_attention = true;
-      if (!state.modelKvOffload) loadBody.offload_kv_cache_to_gpu = false;
-      if (state.modelNumExperts > 0) loadBody.num_experts = state.modelNumExperts;
-      if (state.modelEvalBatch > 0) loadBody.eval_batch_size = state.modelEvalBatch;
+      if (!state.useModelLoadDefaults) {
+        // Only override context_length when the user actually set an override —
+        // previously this substituted state.ctxWindow (a harness-side setting
+        // used for context-meter math, default 62768) even when the field was
+        // left at 0, which contradicted its own "0 = model default" hint. Now
+        // 0 genuinely omits the key, so LM Studio loads with the model's own
+        // default/last-used/per-model-preset context length. The load-config
+        // reconciliation a few lines below already syncs state.ctxWindow to
+        // whatever context length actually got loaded, so nothing else needs
+        // to change to keep the meter accurate.
+        if (state.modelCtxOverride > 0) loadBody.context_length = state.modelCtxOverride;
+        if (state.modelFlashAttn) loadBody.flash_attention = true;
+        if (!state.modelKvOffload) loadBody.offload_kv_cache_to_gpu = false;
+        if (state.modelNumExperts > 0) loadBody.num_experts = state.modelNumExperts;
+        if (state.modelEvalBatch > 0) loadBody.eval_batch_size = state.modelEvalBatch;
+      }
+      // else: send nothing but the model id — LM Studio decides context length,
+      // flash attention, KV offload, expert count, and eval batch size using
+      // whatever its own per-model preset or last-used config was.
 
       const loadStart = performance.now();
 
@@ -18620,6 +18799,18 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (s.topK !== undefined) state.topK = s.topK;
         if (s.minP !== undefined) state.minP = s.minP;
         if (s.repeatPenalty !== undefined) state.repeatPenalty = s.repeatPenalty;
+        if (s.useServerSampling !== undefined) state.useServerSampling = s.useServerSampling;
+        if (s.frequencyPenalty !== undefined) state.frequencyPenalty = s.frequencyPenalty;
+        if (s.seed !== undefined) state.seed = s.seed;
+        if (s.dryMultiplier !== undefined) state.dryMultiplier = s.dryMultiplier;
+        if (s.dryBase !== undefined) state.dryBase = s.dryBase;
+        if (s.dryAllowedLength !== undefined) state.dryAllowedLength = s.dryAllowedLength;
+        if (s.drySequenceBreakers !== undefined) state.drySequenceBreakers = s.drySequenceBreakers;
+        if (s.xtcProbability !== undefined) state.xtcProbability = s.xtcProbability;
+        if (s.xtcThreshold !== undefined) state.xtcThreshold = s.xtcThreshold;
+        if (s.mirostat !== undefined) state.mirostat = s.mirostat;
+        if (s.mirostatTau !== undefined) state.mirostatTau = s.mirostatTau;
+        if (s.mirostatEta !== undefined) state.mirostatEta = s.mirostatEta;
         if (s.enforceJsonSchema !== undefined) state.enforceJsonSchema = s.enforceJsonSchema;
         if (s.maxTokens) state.maxTokens = s.maxTokens;
         if (s.maxReadKB) state.maxReadKB = s.maxReadKB; if (s.cmdTimeout) state.cmdTimeout = s.cmdTimeout;
@@ -18634,6 +18825,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (s.modelKvOffload !== undefined) state.modelKvOffload = s.modelKvOffload;
         if (s.modelNumExperts !== undefined) state.modelNumExperts = s.modelNumExperts;
         if (s.modelEvalBatch !== undefined) state.modelEvalBatch = s.modelEvalBatch;
+        if (s.useModelLoadDefaults !== undefined) state.useModelLoadDefaults = s.useModelLoadDefaults;
         if (s.sysPrompt) document.getElementById('s-sys-prompt').value = s.sysPrompt;
         if (s.sysPromptProfiles) state.sysPromptProfiles = s.sysPromptProfiles;
         if (s.safetyProfiles) state.safetyProfiles = s.safetyProfiles;
@@ -18655,6 +18847,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           const _mcInp = document.getElementById('s-mcp-config');
           if (_mcInp) _mcInp.value = s.mcpConfig;
         }
+        if (s.mcpConfigProfiles) state.mcpConfigProfiles = s.mcpConfigProfiles;
+        if (s.mcpConfigHistory) state.mcpConfigHistory = s.mcpConfigHistory;
         if (s.shellAutoApprove !== undefined) state.shellAutoApprove = s.shellAutoApprove;
         if (s.shellAutoApproveDangerous !== undefined) state.shellAutoApproveDangerous = s.shellAutoApproveDangerous;
         if (s.gitWriteAutoApprove !== undefined) state.gitWriteAutoApprove = s.gitWriteAutoApprove;
@@ -18663,6 +18857,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       } catch { }
       renderSysProfiles();
       renderSafetyProfiles();
+      renderMcpProfiles();
       document.getElementById('s-ctx-window').value = state.ctxWindow;
       updateContextMeter();
       const _shellCb = document.getElementById('s-shell-autoapprove'); if (_shellCb) _shellCb.checked = state.shellAutoApprove;
@@ -18717,6 +18912,18 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           topK: state.topK,
           minP: state.minP,
           repeatPenalty: state.repeatPenalty,
+          useServerSampling: state.useServerSampling,
+          frequencyPenalty: state.frequencyPenalty,
+          seed: state.seed,
+          dryMultiplier: state.dryMultiplier,
+          dryBase: state.dryBase,
+          dryAllowedLength: state.dryAllowedLength,
+          drySequenceBreakers: state.drySequenceBreakers,
+          xtcProbability: state.xtcProbability,
+          xtcThreshold: state.xtcThreshold,
+          mirostat: state.mirostat,
+          mirostatTau: state.mirostatTau,
+          mirostatEta: state.mirostatEta,
           enforceJsonSchema: state.enforceJsonSchema,
           maxTokens: state.maxTokens,
           maxReadKB: state.maxReadKB,
@@ -18733,6 +18940,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           modelKvOffload: state.modelKvOffload,
           modelNumExperts: state.modelNumExperts,
           modelEvalBatch: state.modelEvalBatch,
+          useModelLoadDefaults: state.useModelLoadDefaults,
           sysPrompt: document.getElementById('s-sys-prompt').value,
           sysPromptProfiles: state.sysPromptProfiles,
           safetyProfiles: state.safetyProfiles,
@@ -18750,6 +18958,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           qwenEnableThinking: document.getElementById('s-qwen-enable-thinking')?.checked ?? true,
           qwenPreserveThinking: document.getElementById('s-qwen-preserve-thinking')?.checked ?? true,
           mcpConfig: document.getElementById('s-mcp-config')?.value || '',
+          mcpConfigProfiles: state.mcpConfigProfiles || {},
+          mcpConfigHistory: state.mcpConfigHistory || [],
           shellAutoApprove: state.shellAutoApprove,
           shellAutoApproveDangerous: state.shellAutoApproveDangerous,
           gitWriteAutoApprove: state.gitWriteAutoApprove,
@@ -18823,6 +19033,32 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const _sTopK = document.getElementById('s-top-k'); if (_sTopK) { _sTopK.value = state.topK !== undefined ? state.topK : 40; document.getElementById('s-top-k-val').textContent = state.topK !== undefined ? state.topK : 40; }
       const _sMinP = document.getElementById('s-min-p'); if (_sMinP) { _sMinP.value = state.minP !== undefined ? state.minP : 0.05; document.getElementById('s-min-p-val').textContent = (state.minP !== undefined ? state.minP : 0.05).toFixed(2); }
       const _sRepP = document.getElementById('s-repeat-penalty'); if (_sRepP) { _sRepP.value = state.repeatPenalty !== undefined ? state.repeatPenalty : 1.1; document.getElementById('s-repeat-penalty-val').textContent = (state.repeatPenalty !== undefined ? state.repeatPenalty : 1.1).toFixed(2); }
+      const _sUseServerSampling = document.getElementById('s-use-server-sampling');
+      if (_sUseServerSampling) {
+        _sUseServerSampling.checked = !!state.useServerSampling;
+        const _samplingGroup = document.getElementById('sampling-sliders-group');
+        const _advSamplingGroup = document.getElementById('advanced-samplers-group');
+        const _qwenGroup = document.getElementById('qwen-thinking-group');
+        if (_samplingGroup) { _samplingGroup.style.opacity = state.useServerSampling ? '.35' : ''; _samplingGroup.style.pointerEvents = state.useServerSampling ? 'none' : ''; }
+        if (_advSamplingGroup) { _advSamplingGroup.style.opacity = state.useServerSampling ? '.35' : ''; _advSamplingGroup.style.pointerEvents = state.useServerSampling ? 'none' : ''; }
+        if (_qwenGroup) { _qwenGroup.style.opacity = state.useServerSampling ? '.35' : ''; _qwenGroup.style.pointerEvents = state.useServerSampling ? 'none' : ''; }
+      }
+      const _sUseModelLoadDefaults = document.getElementById('s-use-model-load-defaults');
+      if (_sUseModelLoadDefaults) {
+        _sUseModelLoadDefaults.checked = !!state.useModelLoadDefaults;
+        const _loadOverridesGroup = document.getElementById('model-load-overrides-group');
+        if (_loadOverridesGroup) { _loadOverridesGroup.style.opacity = state.useModelLoadDefaults ? '.35' : ''; _loadOverridesGroup.style.pointerEvents = state.useModelLoadDefaults ? 'none' : ''; }
+      }
+      const _sFreqP = document.getElementById('s-freq-penalty'); if (_sFreqP) { _sFreqP.value = state.frequencyPenalty || 0; document.getElementById('s-freq-penalty-val').textContent = (state.frequencyPenalty || 0).toFixed(2); }
+      const _sSeed = document.getElementById('s-seed'); if (_sSeed) _sSeed.value = state.seed !== undefined ? state.seed : -1;
+      const _sDryMult = document.getElementById('s-dry-multiplier'); if (_sDryMult) { _sDryMult.value = state.dryMultiplier || 0; document.getElementById('s-dry-multiplier-val').textContent = (state.dryMultiplier || 0).toFixed(1); }
+      const _sDryBase = document.getElementById('s-dry-base'); if (_sDryBase) _sDryBase.value = state.dryBase !== undefined ? state.dryBase : 1.75;
+      const _sDryAllowed = document.getElementById('s-dry-allowed-length'); if (_sDryAllowed) _sDryAllowed.value = state.dryAllowedLength !== undefined ? state.dryAllowedLength : 2;
+      const _sXtcProb = document.getElementById('s-xtc-prob'); if (_sXtcProb) { _sXtcProb.value = state.xtcProbability || 0; document.getElementById('s-xtc-prob-val').textContent = (state.xtcProbability || 0).toFixed(2); }
+      const _sXtcThresh = document.getElementById('s-xtc-threshold'); if (_sXtcThresh) _sXtcThresh.value = state.xtcThreshold !== undefined ? state.xtcThreshold : 0.1;
+      const _sMirostat = document.getElementById('s-mirostat'); if (_sMirostat) _sMirostat.value = state.mirostat || 0;
+      const _sMirostatTau = document.getElementById('s-mirostat-tau'); if (_sMirostatTau) _sMirostatTau.value = state.mirostatTau !== undefined ? state.mirostatTau : 5.0;
+      const _sMirostatEta = document.getElementById('s-mirostat-eta'); if (_sMirostatEta) _sMirostatEta.value = state.mirostatEta !== undefined ? state.mirostatEta : 0.1;
       const _sEjs = document.getElementById('s-enforce-json-schema'); if (_sEjs) _sEjs.checked = state.enforceJsonSchema !== undefined ? state.enforceJsonSchema : true;
       document.getElementById('s-max-tokens').value = state.maxTokens; document.getElementById('s-max-read').value = state.maxReadKB;
       document.getElementById('s-cmd-timeout').value = state.cmdTimeout; document.getElementById('s-ctx-window').value = state.ctxWindow;
@@ -18848,6 +19084,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       document.getElementById('s-token-budget').value = state.tokenBudget;
       const _mcpInp = document.getElementById('s-mcp-config');
       if (_mcpInp) _mcpInp.value = state.mcpConfig || '';
+      renderMcpProfiles();
+      syncMcpHighlight();
       if (!document.getElementById('s-sys-prompt').value) document.getElementById('s-sys-prompt').value = DEFAULT_SYS;
 
       document.getElementById('settings-modal').classList.add('open');
@@ -18874,6 +19112,17 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const _topKInp = document.getElementById('s-top-k'); if (_topKInp) state.topK = parseInt(_topKInp.value) || 0;
       const _minPInp = document.getElementById('s-min-p'); if (_minPInp) state.minP = parseFloat(_minPInp.value);
       const _repPInp = document.getElementById('s-repeat-penalty'); if (_repPInp) state.repeatPenalty = parseFloat(_repPInp.value);
+      const _sUseServerSampling2 = document.getElementById('s-use-server-sampling'); if (_sUseServerSampling2) state.useServerSampling = _sUseServerSampling2.checked;
+      const _sFreqP2 = document.getElementById('s-freq-penalty'); if (_sFreqP2) state.frequencyPenalty = parseFloat(_sFreqP2.value) || 0;
+      const _sSeed2 = document.getElementById('s-seed'); if (_sSeed2) { state.seed = parseInt(_sSeed2.value); if (isNaN(state.seed)) state.seed = -1; }
+      const _sDryMult2 = document.getElementById('s-dry-multiplier'); if (_sDryMult2) state.dryMultiplier = parseFloat(_sDryMult2.value) || 0;
+      const _sDryBase2 = document.getElementById('s-dry-base'); if (_sDryBase2) state.dryBase = parseFloat(_sDryBase2.value) || 1.75;
+      const _sDryAllowed2 = document.getElementById('s-dry-allowed-length'); if (_sDryAllowed2) state.dryAllowedLength = parseInt(_sDryAllowed2.value) || 2;
+      const _sXtcProb2 = document.getElementById('s-xtc-prob'); if (_sXtcProb2) state.xtcProbability = parseFloat(_sXtcProb2.value) || 0;
+      const _sXtcThresh2 = document.getElementById('s-xtc-threshold'); if (_sXtcThresh2) state.xtcThreshold = parseFloat(_sXtcThresh2.value) || 0.1;
+      const _sMirostat2 = document.getElementById('s-mirostat'); if (_sMirostat2) state.mirostat = parseInt(_sMirostat2.value) || 0;
+      const _sMirostatTau2 = document.getElementById('s-mirostat-tau'); if (_sMirostatTau2) state.mirostatTau = parseFloat(_sMirostatTau2.value) || 5.0;
+      const _sMirostatEta2 = document.getElementById('s-mirostat-eta'); if (_sMirostatEta2) state.mirostatEta = parseFloat(_sMirostatEta2.value) || 0.1;
       const _ejsInp = document.getElementById('s-enforce-json-schema'); if (_ejsInp) state.enforceJsonSchema = _ejsInp.checked;
       state.maxTokens = Math.max(256, parseInt(document.getElementById('s-max-tokens').value) || 8192);
       state.maxReadKB = Math.max(10, parseInt(document.getElementById('s-max-read').value) || 500);
@@ -18895,9 +19144,21 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       state.smartContextThreshold = Math.max(0, parseInt(document.getElementById('s-smart-context').value) || 0);
       state.tokenBudget = Math.max(0, parseInt(document.getElementById('s-token-budget').value) || 0);
       state.mcpConfig = document.getElementById('s-mcp-config')?.value || '';
+      if (state.mcpConfig.trim()) pushMcpHistory(state.mcpConfig.trim());
       const _shellCb = document.getElementById('s-shell-autoapprove'); if (_shellCb) state.shellAutoApprove = _shellCb.checked;
       const _shellDangerCb = document.getElementById('s-shell-autoapprove-dangerous'); if (_shellDangerCb) state.shellAutoApproveDangerous = _shellDangerCb.checked && state.shellAutoApprove;
       const _gitCb = document.getElementById('s-git-autoapprove'); if (_gitCb) state.gitWriteAutoApprove = _gitCb.checked;
+      const _sUseModelLoadDefaults2 = document.getElementById('s-use-model-load-defaults'); if (_sUseModelLoadDefaults2) state.useModelLoadDefaults = _sUseModelLoadDefaults2.checked;
+      // These previously were populated INTO the UI from state whenever the
+      // modal opened, but were never read back OUT of the UI here — so
+      // editing Flash Attention / KV offload / context override / experts /
+      // eval batch and clicking Save had no effect at all; requestModelLoad()
+      // only ever saw whatever was loaded from localStorage at startup.
+      const _sModelCtx2 = document.getElementById('s-model-ctx'); if (_sModelCtx2) state.modelCtxOverride = Math.max(0, parseInt(_sModelCtx2.value) || 0);
+      const _sModelFlash2 = document.getElementById('s-model-flash'); if (_sModelFlash2) state.modelFlashAttn = _sModelFlash2.checked;
+      const _sModelKv2 = document.getElementById('s-model-kv'); if (_sModelKv2) state.modelKvOffload = _sModelKv2.checked;
+      const _sModelExperts2 = document.getElementById('s-model-experts'); if (_sModelExperts2) state.modelNumExperts = Math.max(0, parseInt(_sModelExperts2.value) || 0);
+      const _sModelEval2 = document.getElementById('s-model-eval'); if (_sModelEval2) state.modelEvalBatch = Math.max(0, parseInt(_sModelEval2.value) || 0);
       const _browserCb = document.getElementById('s-browser-autoapprove'); if (_browserCb) state.browserWriteAutoApprove = _browserCb.checked;
       persistSettings(); closeSettings(); showToast('Settings saved', 'ok');
       testConnection(); updateContextMeter();
@@ -18930,6 +19191,106 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       return s;
     }
 
+    /* ═══════════════ MCP JSON SYNTAX HIGHLIGHTING ═══════════════
+       Cheap regex-based tokenizer just for visual clarity in the settings
+       textarea — not a real parser, so it's fine if it's slightly off on
+       pathological input. Rendered into a <pre> sitting behind a transparent
+       textarea with a matching font/size so caret position lines up. */
+    function highlightMcpJson(text) {
+      if (!text) return '';
+      let out = esc(text);
+      // Keys: quoted strings immediately followed by a colon
+      out = out.replace(/"(?:\\.|[^"\\])*"(?=\s*:)/g, m => '<span class="mcp-json-key">' + m + '</span>');
+      // String values: quoted strings after a colon
+      out = out.replace(/:(\s*)"(?:\\.|[^"\\])*"/g, m => {
+        const i = m.indexOf('"');
+        return m.slice(0, i) + '<span class="mcp-json-string">' + m.slice(i) + '</span>';
+      });
+      // Numbers
+      out = out.replace(/:(\s*)(-?\d+\.?\d*)/g, (m, sp, num) => ':' + sp + '<span class="mcp-json-number">' + num + '</span>');
+      // Booleans / null
+      out = out.replace(/\b(true|false|null)\b/g, '<span class="mcp-json-bool">$1</span>');
+      // Punctuation
+      out = out.replace(/([{}\[\],])/g, '<span class="mcp-json-punct">$1</span>');
+      return out;
+    }
+    function syncMcpHighlight() {
+      const ta = document.getElementById('s-mcp-config');
+      const hl = document.getElementById('s-mcp-config-highlight');
+      if (!ta || !hl) return;
+      hl.innerHTML = highlightMcpJson(ta.value) + '\n';
+      hl.scrollTop = ta.scrollTop; hl.scrollLeft = ta.scrollLeft;
+    }
+
+    /* ═══════════════ MCP CONFIG PRESETS / HISTORY ═══════════════
+       Named saves (state.mcpConfigProfiles) plus an automatic rolling history
+       of the last 10 distinct configs actually synced (state.mcpConfigHistory),
+       both persisted via persistSettings()/loadSettings(). */
+    function renderMcpProfiles() {
+      const sel = document.getElementById('s-mcp-profile');
+      if (!sel) return;
+      sel.innerHTML = '<option value="">— Load a saved or recent config —</option>';
+      const savedNames = Object.keys(state.mcpConfigProfiles || {});
+      if (savedNames.length) {
+        const grp = document.createElement('optgroup'); grp.label = 'Saved';
+        savedNames.forEach(name => {
+          const opt = document.createElement('option');
+          opt.value = 'saved:' + name; opt.textContent = name;
+          grp.appendChild(opt);
+        });
+        sel.appendChild(grp);
+      }
+      const hist = state.mcpConfigHistory || [];
+      if (hist.length) {
+        const grp = document.createElement('optgroup'); grp.label = 'Recent';
+        hist.forEach((h, i) => {
+          const opt = document.createElement('option');
+          opt.value = 'hist:' + i;
+          const preview = h.config.replace(/\s+/g, ' ').trim().slice(0, 42);
+          opt.textContent = new Date(h.ts).toLocaleString() + ' — ' + preview + (h.config.length > 42 ? '…' : '');
+          grp.appendChild(opt);
+        });
+        sel.appendChild(grp);
+      }
+    }
+    window.loadMcpProfile = function () {
+      const sel = document.getElementById('s-mcp-profile');
+      const val = sel?.value;
+      if (!val) return;
+      let cfg = null;
+      if (val.startsWith('saved:')) cfg = (state.mcpConfigProfiles || {})[val.slice(6)];
+      else if (val.startsWith('hist:')) cfg = (state.mcpConfigHistory || [])[parseInt(val.slice(5), 10)]?.config;
+      if (cfg == null) return;
+      const ta = document.getElementById('s-mcp-config');
+      if (ta) { ta.value = cfg; syncMcpHighlight(); }
+    };
+    window.saveMcpProfile = function () {
+      const ta = document.getElementById('s-mcp-config');
+      if (!ta || !ta.value.trim()) { showToast('Nothing to save', 'warn'); return; }
+      const name = prompt('Name for this MCP config:');
+      if (!name || !name.trim()) return;
+      state.mcpConfigProfiles = state.mcpConfigProfiles || {};
+      state.mcpConfigProfiles[name.trim()] = ta.value;
+      persistSettings(); renderMcpProfiles();
+      const sel = document.getElementById('s-mcp-profile');
+      if (sel) sel.value = 'saved:' + name.trim();
+      showToast('Saved MCP config: ' + name.trim(), 'ok');
+    };
+    window.deleteMcpProfile = function () {
+      const sel = document.getElementById('s-mcp-profile');
+      const val = sel?.value;
+      if (!val || !val.startsWith('saved:')) { showToast('Select a saved config to delete', 'warn'); return; }
+      delete (state.mcpConfigProfiles || {})[val.slice(6)];
+      persistSettings(); renderMcpProfiles(); sel.value = '';
+    };
+    function pushMcpHistory(cfg) {
+      if (!cfg || !cfg.trim()) return;
+      state.mcpConfigHistory = (state.mcpConfigHistory || []).filter(h => h.config !== cfg);
+      state.mcpConfigHistory.unshift({ ts: Date.now(), config: cfg });
+      if (state.mcpConfigHistory.length > 10) state.mcpConfigHistory.length = 10;
+      persistSettings(); renderMcpProfiles();
+    }
+
     async function syncMcpServers(showNotification = false) {
       const cfgArea = document.getElementById('s-mcp-config');
       const statusArea = document.getElementById('mcp-status-area');
@@ -18951,6 +19312,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (showNotification) showToast('MCP JSON syntax error: ' + err.message, 'err');
         return;
       }
+      pushMcpHistory(rawCfg.trim());
 
       let serversObj = {};
       if (Array.isArray(parsed)) {
@@ -19843,12 +20205,17 @@ Format:
             { role: 'user', content: userText + (state.dirName ? '\n\nWorking directory: ' + state.dirName : '') }
           ],
           stream: false,
-          temperature: _isGemma ? 1.0 : _isQwen ? 0.7 : 0.3,
           max_tokens: Math.min(state.maxTokens, 3000),
           tools: [],
         };
 
-        if (_isQwen) {
+        // Same server-sampling deference as the main chat loop: when on, don't
+        // send a temperature override or force Qwen's thinking-mode kwargs —
+        // let the server's own loaded config decide.
+        if (!state.useServerSampling) {
+          body.temperature = _isGemma ? 1.0 : _isQwen ? 0.7 : 0.3;
+        }
+        if (_isQwen && !state.useServerSampling) {
           body.chat_template_kwargs = {
             enable_thinking: document.getElementById('s-qwen-enable-thinking')?.checked ?? true,
             preserve_thinking: false,
@@ -21428,6 +21795,27 @@ Format:
       document.getElementById('s-repeat-penalty')?.addEventListener('input', e => {
         document.getElementById('s-repeat-penalty-val').textContent = parseFloat(e.target.value).toFixed(2);
       });
+      document.getElementById('s-use-server-sampling')?.addEventListener('change', e => {
+        const group = document.getElementById('sampling-sliders-group');
+        const advGroup = document.getElementById('advanced-samplers-group');
+        const qwenGroup = document.getElementById('qwen-thinking-group');
+        if (group) { group.style.opacity = e.target.checked ? '.35' : ''; group.style.pointerEvents = e.target.checked ? 'none' : ''; }
+        if (advGroup) { advGroup.style.opacity = e.target.checked ? '.35' : ''; advGroup.style.pointerEvents = e.target.checked ? 'none' : ''; }
+        if (qwenGroup) { qwenGroup.style.opacity = e.target.checked ? '.35' : ''; qwenGroup.style.pointerEvents = e.target.checked ? 'none' : ''; }
+      });
+      document.getElementById('s-use-model-load-defaults')?.addEventListener('change', e => {
+        const group = document.getElementById('model-load-overrides-group');
+        if (group) { group.style.opacity = e.target.checked ? '.35' : ''; group.style.pointerEvents = e.target.checked ? 'none' : ''; }
+      });
+      document.getElementById('s-freq-penalty')?.addEventListener('input', e => {
+        document.getElementById('s-freq-penalty-val').textContent = parseFloat(e.target.value).toFixed(2);
+      });
+      document.getElementById('s-dry-multiplier')?.addEventListener('input', e => {
+        document.getElementById('s-dry-multiplier-val').textContent = parseFloat(e.target.value).toFixed(1);
+      });
+      document.getElementById('s-xtc-prob')?.addEventListener('input', e => {
+        document.getElementById('s-xtc-prob-val').textContent = parseFloat(e.target.value).toFixed(2);
+      });
 
       // Sync quick temp slider
       const tqs = document.getElementById('temp-quick-slider');
@@ -21608,6 +21996,14 @@ Format:
           }
         }
       });
+
+      /* ── MCP config editor: keep syntax-highlight overlay in sync ── */
+      const _mcpTa = document.getElementById('s-mcp-config');
+      if (_mcpTa) {
+        _mcpTa.addEventListener('input', syncMcpHighlight);
+        _mcpTa.addEventListener('scroll', syncMcpHighlight);
+        syncMcpHighlight();
+      }
 
       /* ── Clean up old conversation data from localStorage ── */
       setTimeout(async () => {
