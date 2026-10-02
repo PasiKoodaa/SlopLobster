@@ -1,18 +1,20 @@
 #!/usr/bin/env python
-"""SlopLobster Companion Server v1.4 — Shell + Git + Web Search for SlopLobster Agent."""
-import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time
+"""SlopLobster Companion Server v1.6.0 — Shell + Git + Web Search for SlopLobster Agent."""
+import http.server, subprocess, json, os, sys, signal, platform, re, urllib.request, urllib.parse, urllib.error, shutil, threading, time, queue, secrets, codecs
 from html.parser import HTMLParser
+from collections import deque
 
 try:
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
     HAS_PLAYWRIGHT = True
 except ImportError:
     HAS_PLAYWRIGHT = False
+    PWTimeout = TimeoutError
 
 _pw = None
 _pw_browser = None
 _pw_page = None
-_pw_console = []
+_pw_console = deque(maxlen=1000)
 _pw_launch_time = None
 
 PORT = 8765
@@ -20,6 +22,108 @@ DEFAULT_TIMEOUT = 60
 MAX_OUTPUT = 100000
 MAX_TIMEOUT = 600
 MAX_FETCH_LEN = 100000
+BUILD_VERSION = "1.6.0"
+# Token is generated per launch unless explicitly supplied for local automation.
+SESSION_TOKEN = os.environ.get("SLOPLOBSTER_TOKEN") or secrets.token_urlsafe(32)
+ALLOWED_ORIGINS = set(filter(None, os.environ.get("SLOPLOBSTER_ORIGINS", "null").split(",")))
+CAPABILITIES = set(os.environ.get("SLOPLOBSTER_CAPABILITIES", "command,browser,mcp,dev").split(","))
+_commands = {}
+_commands_lock = threading.Lock()
+MAX_COMMANDS = 64
+
+
+def start_command(body):
+    command = body.get("command")
+    if not isinstance(command, str) or not command.strip():
+        raise ValueError("command must be a nonempty string")
+    timeout = body.get("timeout", DEFAULT_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 5 <= timeout <= MAX_TIMEOUT:
+        raise ValueError("timeout must be between 5 and 600 seconds")
+    command_id = body.get("id") or secrets.token_hex(16)
+    if not isinstance(command_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", command_id):
+        raise ValueError("invalid command id")
+    cwd = body.get("cwd")
+    task_id = body.get('taskId')
+    if task_id:
+        task = managed_task(task_id)
+        cwd = task['path']
+        if task['kind'] == 'evaluation' and command not in task['checks']:
+            raise ValueError('Evaluation command is not one of its declared checks')
+    if cwd is not None and (not isinstance(cwd, str) or not os.path.isdir(cwd)):
+        raise ValueError("cwd must be an existing directory")
+    with _commands_lock:
+        if command_id in _commands:
+            # Idempotent reconnect: never execute an existing ID again.
+            job = _commands[command_id]
+            if (job['command'], job['cwd'], job['timeout']) != (command, cwd, timeout):
+                raise ValueError("command id already belongs to a different request")
+            return command_id
+        if len(_commands) >= MAX_COMMANDS:
+            completed = next((key for key, job in _commands.items() if job['status'] not in ('running', 'cancelling')), None)
+            if completed is None:
+                raise ValueError("too many active commands")
+            del _commands[completed]
+        job = dict(taskId=task_id, command=command, cwd=cwd, timeout=timeout, status='running', events=[], chars=0,
+                   exitCode=None, truncated=False, cancel=threading.Event(), lock=threading.Lock())
+        _commands[command_id] = job
+
+    def emit(kind, data):
+        with job['lock']:
+            if kind == 'd':
+                job['exitCode'] = int(data)
+                return
+            remaining = MAX_OUTPUT - job['chars']
+            if len(data) > remaining: job['truncated'] = True
+            data = data[:max(0, remaining)]
+            if data:
+                job['events'].append(dict(t=kind, d=data))
+                job['chars'] += len(data)
+
+    def run():
+        try:
+            stream_cmd_fresh(emit, command, cwd=cwd, timeout=timeout, cancel_event=job['cancel'])
+            with job['lock']:
+                job['status'] = 'cancelled' if job['cancel'].is_set() else ('ok' if job['exitCode'] == 0 else 'error')
+        except Exception as exc:
+            emit('e', str(exc))
+            with job['lock']:
+                job['status'] = 'error'
+                job['exitCode'] = -1
+    job['thread'] = threading.Thread(target=run, daemon=True)
+    job['thread'].start()
+    return command_id
+
+
+def stop_all_commands():
+    with _commands_lock:
+        jobs = list(_commands.values())
+        for job in jobs: job['cancel'].set()
+    deadline = time.monotonic() + 12
+    for job in jobs:
+        worker = job.get('thread')
+        if worker and worker.ident is not None:
+            worker.join(timeout=max(0, deadline-time.monotonic()))
+
+
+def command_status(command_id, cursor=0):
+    with _commands_lock: job = _commands.get(command_id)
+    if job is None: raise KeyError("Unknown command id")
+    if isinstance(cursor, bool) or not isinstance(cursor, int) or cursor < 0:
+        raise ValueError("cursor must be a nonnegative integer")
+    with job['lock']:
+        if cursor > len(job['events']): raise ValueError("cursor is beyond available events")
+        return dict(id=command_id, status=job['status'], events=job['events'][cursor:],
+                    cursor=len(job['events']), exitCode=job['exitCode'], truncated=job['truncated'])
+
+
+def cancel_command(command_id):
+    with _commands_lock: job = _commands.get(command_id)
+    if job is None: raise KeyError("Unknown command id")
+    with job['lock']:
+        if job['status'] == 'running':
+            job['status'] = 'cancelling'
+            job['cancel'].set()
+    return command_status(command_id)
 
 
 def kill_tree(pid):
@@ -27,8 +131,9 @@ def kill_tree(pid):
         if platform.system() == "Windows":
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5)
         else:
-            pgid = os.getpgid(pid)
-            if pgid > 0: os.killpg(pgid, signal.SIGKILL)
+            # All owned child processes use their own session. The group can
+            # outlive its leader, so do not look up a potentially exited PID.
+            os.killpg(pid, signal.SIGKILL)
     except Exception: pass
     try: os.kill(pid, signal.SIGKILL)
     except Exception: pass
@@ -78,7 +183,7 @@ def _pshell_invalidate():
     global _pshell_proc
     with _PSHELL_LOCK:
         if _pshell_proc:
-            try: _pshell_proc.kill()
+            try: kill_tree(_pshell_proc.pid)
             except Exception: pass
         _pshell_proc = None
 
@@ -137,7 +242,7 @@ def stream_cmd_persistent(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
                     _pshell_invalidate()
                     try:
                         proc.stdin.close()
-                        proc.stdout.close() 
+                        proc.stdout.close()
                         proc.stderr.close()
                     except Exception: pass
                     t_out.join(timeout=3)
@@ -527,16 +632,16 @@ def _translate_for_cmd_bash(cmd):
 
     return base + " " + new_rest
 
-def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
+def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
-    
+
     if first_word in ('python', 'python3'):
         if not shutil.which(first_word):
             alt = 'python3' if first_word == 'python' else 'python'
             if shutil.which(alt):
                 cmd = alt + stripped[len(first_word):]
-                
+
     if WINDOWS_BASH:
         translated = _translate_for_cmd_bash(cmd)
         kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
@@ -545,66 +650,87 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
         kw = dict(shell=True, args=translated, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     else:
         kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd, start_new_session=True)
-        
+
+    # Binary read1 drains available output without waiting for a newline or accumulating huge lines.
+    kw.pop('text', None); kw.pop('encoding', None); kw.pop('errors', None)
     proc = subprocess.Popen(**kw)
     out_buf = []; err_buf = []; lock = threading.Lock()
-    
+
     def reader(stream, buf, kind):
         try:
-            for line in iter(stream.readline, ''):
-                with lock: 
-                    buf.append(line)
-                    write_fn(kind, line)
+            decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            size = 0
+            truncated = False
+            while True:
+                chunk = stream.read1(65536 if truncated else 4096)
+                if truncated:
+                    if not chunk: break
+                    # Drain excess output with backpressure instead of decoding,
+                    # recording and transmitting every byte in a hot loop.
+                    time.sleep(.005)
+                    continue
+                line = decoder.decode(chunk, final=not chunk)
+                with lock:
+                    kept = line[:MAX_OUTPUT-size]
+                    if kept:
+                        buf.append(kept); size += len(kept)
+                        write_fn(kind, kept)
+                    if len(line)>len(kept):
+                        truncated = True
+                        write_fn(kind, '\n[Output truncated]\n')
+                if not chunk: break
             stream.close()
-        except Exception: 
+        except Exception:
             pass
-            
+
     t1 = threading.Thread(target=reader, args=(proc.stdout, out_buf, 'o'))
     t2 = threading.Thread(target=reader, args=(proc.stderr, err_buf, 'e'))
     t1.daemon = True; t2.daemon = True; t1.start(); t2.start()
-    
-    start = time.time()
-    while t1.is_alive() or t2.is_alive():
-        if time.time() - start > timeout:
+
+    start = time.monotonic()
+    timed_out = False
+    while proc.poll() is None or t1.is_alive() or t2.is_alive():
+        if (cancel_event and cancel_event.is_set()) or time.monotonic() - start > timeout:
+            timed_out = not (cancel_event and cancel_event.is_set())
             kill_tree(proc.pid)
-            with lock: 
-                # Fixed: use \n for actual newlines instead of literal \n text
-                write_fn('e', f"\n[Timed out after {timeout}s]\n")
+            with lock:
+                write_fn('e', f"\n[Timed out after {timeout}s]\n" if timed_out else "\n[Cancelled by user]\n")
             break
         time.sleep(0.03)
-        
+
     # Wait for threads to finish reading the closed pipes
     t1.join(timeout=2)
     t2.join(timeout=2)
-    
+
     # Fixed: Catch TimeoutExpired if the process is a zombie and won't die
     returncode = -1
     try:
         proc.wait(timeout=3)
         returncode = proc.returncode
     except subprocess.TimeoutExpired:
-        pass
-        
-    with lock: 
+        kill_tree(proc.pid)
+        proc.kill()
+        proc.wait(timeout=3)
+        returncode = proc.returncode
+    if timed_out: returncode = -1
+
+    with lock:
         full = ''.join(out_buf) + ''.join(err_buf)
         if "0x80072747" in full or "0x800705aa" in full or "lacked sufficient buffer space" in full:
             time.sleep(1.0)
             if WINDOWS_BASH:
                 _pshell_invalidate()
-        if len(full) > MAX_OUTPUT: 
+        if len(full) > MAX_OUTPUT:
             # Fixed: use \n for actual newlines instead of literal \n text
             full = full[:MAX_OUTPUT] + f"\n[Truncated at {MAX_OUTPUT}]"
         write_fn('d', str(int(returncode)))
-        
+
     return full, returncode
 
 def stream_cmd(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
-    # On Windows with Git Bash, reuse a persistent shell to avoid
-    # spawning a new Hyper-V/WSL VM instance per command (0x800705aa).
-    if WINDOWS_BASH:
-        stream_cmd_persistent(write_fn, cmd, cwd=cwd, timeout=timeout)
-    else:
-        stream_cmd_fresh(write_fn, cmd, cwd=cwd, timeout=timeout)
+    # Use the bounded runner for legacy clients too; persistent-shell output
+    # was unbounded and retries could replay a partially executed command.
+    return stream_cmd_fresh(write_fn, cmd, cwd=cwd, timeout=timeout)
 
 def extract_python_signatures(source, max_lines=300):
     import ast as _ast
@@ -736,7 +862,7 @@ def extract_generic_signatures(source, max_lines=300):
             continue
         if re.match(r'^(function|class|def|pubs+fn|fns|module|impl|trait|struct|enum|interface|type)s', l):
             result.append('L%d: %s' % (i+1, l[:120]))
-    return '\n'.join(result) if result else None    
+    return '\n'.join(result) if result else None
 
 def _close_browser():
     global _pw, _pw_browser, _pw_page, _pw_console, _pw_launch_time
@@ -754,7 +880,7 @@ def _close_browser():
             pass
     _pw_page = None
     _pw_browser = None
-    _pw_console = []
+    _pw_console = deque(maxlen=1000)
     _pw_launch_time = None
 
 def _browser_error_hint():
@@ -765,7 +891,7 @@ def _browser_error_hint():
         compute_driver_executable()
         return "Playwright installed but browser binary missing. Run: playwright install chromium"
     except Exception:
-        return "Playwright import works but browser launch failed. Check: playwright install chromium"    
+        return "Playwright import works but browser launch failed. Check: playwright install chromium"
 
 def _ensure_page():
     global _pw, _pw_browser, _pw_page, _pw_console, _pw_launch_time
@@ -783,26 +909,27 @@ def _ensure_page():
         _pw = sync_playwright().start()
     _pw_browser = _pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
     _pw_page = _pw_browser.new_page(viewport={"width": 1280, "height": 720})
-    _pw_console = []
+    _pw_console = deque(maxlen=1000)
     def _on_console(msg):
-        _pw_console.append({"type": msg.type, "text": msg.text, "time": time.time()})
+        _pw_console.append({"type": msg.type, "text": msg.text[:4000], "time": time.time()})
     def _on_pageerror(err):
-        _pw_console.append({"type": "error", "text": str(err), "time": time.time()})
+        _pw_console.append({"type": "error", "text": str(err)[:4000], "time": time.time()})
     _pw_page.on("console", _on_console)
     _pw_page.on("pageerror", _on_pageerror)
     _pw_launch_time = time.time()
     return _pw_page
 
 def _get_console_filtered(types=None, since=None, limit=100):
-    msgs = _pw_console
+    msgs = list(_pw_console)
     if types:
         types_set = set(types)
         msgs = [m for m in msgs if m["type"] in types_set]
     if since:
         msgs = [m for m in msgs if m["time"] > since]
-    return msgs[-limit:]    
+    return msgs[-limit:]
 
 _dev_processes = {}
+_dev_lock = threading.RLock()
 
 def _start_dev_process(cmd, port, cwd):
     port_s = str(port)
@@ -826,19 +953,28 @@ def _start_dev_process(cmd, port, cwd):
         kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd())
     else:
         kw = dict(shell=True, args=cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd or os.getcwd(), start_new_session=True)
+    kw['env'] = {**os.environ, 'PORT': str(port)}
+    kw.pop('text', None); kw.pop('encoding', None); kw.pop('errors', None)
     proc = subprocess.Popen(**kw)
     buf = []
     lock = threading.Lock()
     alive = [True]
     def reader(stream, kind):
         try:
-            for line in iter(stream.readline, ''):
-                if not alive[0]: break
-                with lock:
-                    buf.append(kind + line)
-                    if len(buf) > 2000:
-                        buf.pop(0)
+            decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            while True:
+                chunk = stream.read1(16384)
+                line = decoder.decode(chunk, final=not chunk)
+                if line:
+                    with lock:
+                        buf.append(kind + line)
+                        while len(buf)>2000 or sum(map(len,buf))>MAX_OUTPUT:
+                            del buf[0]
+                    time.sleep(.005)
+                if not chunk: break
         except Exception: pass
+        finally:
+            stream.close()
     for s in (proc.stdout, proc.stderr):
         t = threading.Thread(target=reader, args=(s, 'o' if s is proc.stdout else 'e'), daemon=True)
         t.start()
@@ -861,52 +997,101 @@ def _check_dev_ready(port, timeout=3):
 _mcp_servers = {}
 _mcp_lock = threading.Lock()
 
-def _mcp_send_and_recv(proc, req_obj, timeout=30):
-    line = json.dumps(req_obj) + "\n"
-    proc.stdin.write(line)
-    proc.stdin.flush()
-    res_line = [None]
-    done_evt = threading.Event()
-    
-    def read_stdout():
+def _mcp_reader_loop(proc, q):
+    # One persistent reader per server process, for its whole lifetime.
+    # Previously a fresh thread was spawned per call and abandoned on
+    # timeout; a late response would then be silently eaten by that zombie
+    # thread, and the next call's own fresh reader thread would race it for
+    # the following line on the same pipe -- losing or cross-matching
+    # responses. A single long-lived reader avoids that race entirely.
+    try:
+        for l in iter(lambda: proc.stdout.readline(1000001), ''):
+            if len(l)>1000000:
+                kill_tree(proc.pid)
+                break
+            l = l.strip()
+            if l and (l.startswith('{') or l.startswith('[')):
+                try:
+                    message = json.loads(l)
+                    if isinstance(message,dict) and 'id' in message:
+                        try: q.put_nowait(message)
+                        except queue.Full:
+                            q.get_nowait(); q.put_nowait(message)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    finally:
+        try: q.put_nowait(None)  # sentinel: stdout closed / process ended
+        except queue.Full:
+            q.get_nowait(); q.put_nowait(None)
+
+def _mcp_write(proc, request, timeout):
+    done = threading.Event()
+    errors = []
+    def write():
         try:
-            for l in proc.stdout:
-                l = l.strip()
-                if l and (l.startswith('{') or l.startswith('[')):
-                    res_line[0] = l
-                    done_evt.set()
-                    break
-        except Exception:
-            done_evt.set()
-            
-    t = threading.Thread(target=read_stdout, daemon=True)
-    t.start()
-    t.join(timeout=timeout)
-    if not done_evt.is_set() or not res_line[0]:
-        raise TimeoutError("MCP server response timed out after " + str(timeout) + "s")
-    return json.loads(res_line[0])
+            proc.stdin.write(json.dumps(request) + '\n')
+            proc.stdin.flush()
+        except Exception as exc: errors.append(exc)
+        finally: done.set()
+    threading.Thread(target=write, daemon=True).start()
+    if not done.wait(timeout):
+        kill_tree(proc.pid)
+        raise TimeoutError('MCP server stopped reading input; process tree stopped')
+    if errors:
+        kill_tree(proc.pid)
+        raise errors[0]
+
+
+def _mcp_send_and_recv(proc, resp_queue, req_obj, timeout=30):
+    deadline = time.monotonic() + timeout
+    _mcp_write(proc, req_obj, timeout)
+    req_id = req_obj.get("id")
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            kill_tree(proc.pid)
+            raise TimeoutError("MCP server response timed out after " + str(timeout) + "s; process tree stopped")
+        try:
+            msg = resp_queue.get(timeout=min(remaining, 1.0))
+        except queue.Empty:
+            if proc.poll() is not None:
+                raise RuntimeError("MCP server process exited unexpectedly")
+            continue
+        if msg is None:
+            kill_tree(proc.pid)
+            raise RuntimeError("MCP server closed its output stream")
+        # Discard notifications and any stale response left over from a
+        # previous call that timed out client-side but answered late --
+        # match on id so it can never be mistaken for the current call's
+        # response.
+        if isinstance(msg, dict) and msg.get("id") == req_id:
+            return msg
 
 def _mcp_init_server(name, config):
     with _mcp_lock:
         if name in _mcp_servers:
             old = _mcp_servers[name]
+            if old.get('config') == config and old.get('proc') and old['proc'].poll() is None:
+                return {'status':'connected','tools':old['tools'],'tool_count':len(old['tools'])}
             if old.get("proc") and old["proc"].poll() is None:
                 try: kill_tree(old["proc"].pid)
                 except Exception: pass
             del _mcp_servers[name]
-            
+
         cmd_base = config.get("command", "python3")
         if cmd_base in ("python", "python3"):
             cmd_base = sys.executable
         elif not shutil.which(cmd_base):
             if shutil.which("python"): cmd_base = shutil.which("python")
-            
+
         args = [cmd_base] + config.get("args", [])
         cwd = config.get("cwd") or None
         env = os.environ.copy()
         if "env" in config and isinstance(config["env"], dict):
             env.update(config["env"])
-            
+
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if platform.system() == "Windows" else 0
         proc = subprocess.Popen(
             args,
@@ -918,44 +1103,65 @@ def _mcp_init_server(name, config):
             text=True,
             encoding="utf-8",
             errors="replace",
-            creationflags=flags
+            creationflags=flags,
+            start_new_session=platform.system() != 'Windows'
         )
-        
-        # 1. initialize
-        init_req = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "SlopLobster", "version": "1.4"}
+
+        resp_queue = queue.Queue(maxsize=256)
+        def drain_stderr():
+            try:
+                stream = getattr(proc.stderr, 'buffer', proc.stderr)
+                while stream.read1(16384): pass
+            except Exception: pass
+        threading.Thread(target=drain_stderr, daemon=True).start()
+        reader_thread = threading.Thread(target=_mcp_reader_loop, args=(proc, resp_queue), daemon=True)
+        reader_thread.start()
+
+        try:
+            # 1. initialize
+            init_req = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "SlopLobster", "version": BUILD_VERSION}
+                }
             }
-        }
-        init_res = _mcp_send_and_recv(proc, init_req, timeout=15)
-        
-        # 2. initialized notification
-        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
-        proc.stdin.flush()
-        
-        # 3. tools/list
-        list_req = {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/list",
-            "params": {}
-        }
-        list_res = _mcp_send_and_recv(proc, list_req, timeout=15)
-        tools = list_res.get("result", {}).get("tools", [])
-        
-        _mcp_servers[name] = {
-            "proc": proc,
-            "tools": tools,
-            "config": config,
-            "id_counter": 3,
-            "lock": threading.Lock()
-        }
-        return {"status": "connected", "tools": tools, "tool_count": len(tools)}
+            init_res = _mcp_send_and_recv(proc, resp_queue, init_req, timeout=15)
+            if "error" in init_res:
+                kill_tree(proc.pid)
+                raise RuntimeError("MCP initialization failed: " + str(init_res["error"]))
+
+            # 2. initialized notification
+            _mcp_write(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"}, 15)
+
+            # 3. tools/list
+            list_req = {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }
+            list_res = _mcp_send_and_recv(proc, resp_queue, list_req, timeout=15)
+            tools = list_res.get("result", {}).get("tools", [])
+
+            _mcp_servers[name] = {
+                "proc": proc,
+                "tools": tools,
+                "config": config,
+                "id_counter": 3,
+                "lock": threading.Lock(),
+                "resp_queue": resp_queue,
+                "reader_thread": reader_thread,
+            }
+            return {"status": "connected", "tools": tools, "tool_count": len(tools)}
+        except Exception:
+            kill_tree(proc.pid)
+            try: proc.wait(timeout=3)
+            except subprocess.TimeoutExpired: pass
+            raise
 
 def _mcp_call_tool(server_name, tool_name, arguments, timeout=120):
     srv = _mcp_servers.get(server_name)
@@ -973,7 +1179,7 @@ def _mcp_call_tool(server_name, tool_name, arguments, timeout=120):
                 "arguments": arguments or {}
             }
         }
-        res = _mcp_send_and_recv(srv["proc"], call_req, timeout=timeout)
+        res = _mcp_send_and_recv(srv["proc"], srv["resp_queue"], call_req, timeout=timeout)
         if "error" in res:
             err_msg = res["error"].get("message", str(res["error"])) if isinstance(res["error"], dict) else str(res["error"])
             return {"error": err_msg}
@@ -988,7 +1194,445 @@ def _mcp_call_tool(server_name, tool_name, arguments, timeout=120):
         return {"output": out_str, "isError": res.get("result", {}).get("isError", False)}
 
 
+# BEGIN GENERATED FEATURES
+# Generated into the standalone companion by scripts/build.mjs.
+import pathlib, tempfile, hashlib, base64, fnmatch, difflib
+_managed_tasks = {}
+_task_lock = threading.RLock()
+
+def _git(root, *args, check=True):
+    result = subprocess.run(['git', '-C', str(root), *args], capture_output=True,
+                            encoding='utf-8', errors='replace', timeout=60)
+    if check and result.returncode:
+        raise ValueError(result.stderr.strip() or result.stdout.strip() or 'Git operation failed')
+    # NUL-delimited Git paths can contain leading/trailing whitespace.
+    return result.stdout if '-z' in args else result.stdout.rstrip('\r\n')
+
+def _project_root(value):
+    path = pathlib.Path(value).expanduser().resolve(strict=True)
+    if not path.is_dir(): raise ValueError('Project path must be a directory')
+    root = pathlib.Path(_git(path, 'rev-parse', '--show-toplevel')).resolve()
+    if path != root: raise ValueError('Use the Git repository root path')
+    return root
+
+def _task_manifest(root):
+    directory = root / '.sloplobster'
+    if directory.is_symlink() or directory.resolve()!=directory: raise ValueError('Task storage cannot be a symlink or junction')
+    directory.mkdir(exist_ok=True)
+    return directory / 'tasks.json'
+
+def _save_tasks(root):
+    file = _task_manifest(root)
+    records = [r for r in _managed_tasks.values() if r.get('root') == str(root) and r.get('kind') == 'worktree']
+    with tempfile.NamedTemporaryFile('w', encoding='utf-8', dir=file.parent, delete=False) as tmp:
+        json.dump(records, tmp); temporary = tmp.name
+    os.replace(temporary, file)
+
+def _load_tasks(root):
+    file = _task_manifest(root)
+    if file.is_symlink(): raise ValueError('Task manifest cannot be a symlink')
+    if not file.exists(): return
+    records = json.loads(file.read_text(encoding='utf-8'))
+    for record in records:
+        tid = record.get('id','')
+        if not re.fullmatch(r'[a-f0-9]{32}', tid): continue
+        expected = root / '.sloplobster' / 'worktrees' / tid
+        if record.get('path') != str(expected) or record.get('branch') != 'slop/' + tid: continue
+        record['root'] = str(root)
+        _managed_tasks.setdefault(tid, record)
+
+def managed_task(tid):
+    with _task_lock:
+        record = _managed_tasks.get(tid)
+        if not record: raise ValueError('Unknown task; list tasks for its project to restore the registry')
+        if record['status'] == 'discarded': raise ValueError('Task was discarded')
+        path = pathlib.Path(record['path'])
+        if path.is_symlink(): raise ValueError('Managed task path became a symlink')
+        if record['kind'] == 'worktree':
+            expected = pathlib.Path(record['root']) / '.sloplobster' / 'worktrees' / record['id']
+            if path.resolve() != expected: raise ValueError('Task path no longer matches its registry')
+        return record
+
+def _managed_path(record, relative='', allow_root=False):
+    if not isinstance(relative,str) or '\\' in relative or re.match(r'^[A-Za-z]:',relative):
+        raise ValueError('Expected a relative task path')
+    parts = pathlib.PurePosixPath(relative).parts
+    if relative.startswith('/') or '..' in parts or (not parts and not allow_root):
+        raise ValueError('Unsafe task path')
+    root = pathlib.Path(record['path']).resolve()
+    path = root.joinpath(*parts)
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink(): raise ValueError('Task file operations do not follow symlinks')
+    resolved = path.resolve()
+    if resolved != root and root not in resolved.parents: raise ValueError('Path escapes task workspace')
+    if any(part == '.git' for part in parts): raise ValueError('Git metadata is not a task file')
+    return path
+
+def _file_hash(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+def _task_file(body):
+    record = managed_task(body.get('taskId'))
+    path = _managed_path(record, body.get('path',''), allow_root=True)
+    action = body.get('action','stat')
+    if action in ('stat','read'):
+        if not path.exists(): raise FileNotFoundError(str(body.get('path')))
+        if path.is_dir(): return dict(kind='directory',name=path.name)
+        if path.stat().st_size > 1500000: raise ValueError('Managed file exceeds 1.5 MB read limit')
+        data = path.read_bytes()
+        result = dict(kind='file',name=path.name,size=len(data),hash=hashlib.sha256(data).hexdigest())
+        if action == 'read': result['base64'] = base64.b64encode(data).decode('ascii')
+        return result
+    if action == 'list':
+        if not path.is_dir(): raise NotADirectoryError(str(path))
+        return {'entries':[{'name':p.name,'kind':'directory' if p.is_dir() else 'file'}
+                           for p in sorted(path.iterdir()) if p.name not in ('.git','.sloplobster') and not p.is_symlink()]}
+    if path == pathlib.Path(record['path']).resolve(): raise ValueError('Cannot mutate task root')
+    if record.get('status') == 'merged': raise ValueError('Merged task is read-only; create a new task')
+    if action == 'mkdir':
+        path.mkdir(parents=True, exist_ok=True); return {'ok':True}
+    if action == 'write':
+        data = base64.b64decode(body.get('base64',''), validate=True)
+        if len(data)>1500000: raise ValueError('Managed file exceeds 1.5 MB write limit')
+        if 'expectedHash' not in body or _file_hash(path) != body['expectedHash']:
+            raise ValueError('File changed since it was read; refresh before writing')
+        path.parent.mkdir(parents=True,exist_ok=True)
+        with tempfile.NamedTemporaryFile('wb', dir=path.parent, delete=False) as tmp:
+            tmp.write(data); temporary=tmp.name
+        os.replace(temporary,path)
+        return {'ok':True,'hash':_file_hash(path)}
+    if action == 'delete':
+        if path.is_dir():
+            if body.get('recursive'): shutil.rmtree(path)
+            else: path.rmdir()
+        else: path.unlink()
+        return {'ok':True}
+    raise ValueError('Unknown file operation')
+
+def _new_port():
+    import socket
+    reserved={r.get('port') for r in _managed_tasks.values()}
+    for port in range(4000,5000):
+        if port in reserved: continue
+        try:
+            with socket.socket() as sock: sock.bind(('127.0.0.1',port))
+            return port
+        except OSError: continue
+    raise ValueError('No preview ports available')
+
+def _create_worktree(body):
+    root=_project_root(body.get('root',''))
+    with _task_lock:
+        _load_tasks(root)
+        tid=secrets.token_hex(16)
+        parent=root/'.sloplobster'/'worktrees'
+        if parent.is_symlink(): raise ValueError('Worktree storage cannot be a symlink')
+        parent.mkdir(parents=True,exist_ok=True)
+        # Ignore only harness artifacts; preserve the user's existing exclude rules.
+        exclude=pathlib.Path(_git(root,'rev-parse','--git-path','info/exclude'))
+        if not exclude.is_absolute(): exclude=root/exclude
+        existing=exclude.read_text(encoding='utf-8') if exclude.exists() else ''
+        if '\n.sloplobster/\n' not in '\n'+existing:
+            exclude.parent.mkdir(parents=True,exist_ok=True)
+            with exclude.open('a',encoding='utf-8') as file: file.write('\n.sloplobster/\n')
+        path=parent/tid; branch='slop/'+tid
+        base=_git(root,'rev-parse','HEAD')
+        _git(root,'worktree','add','-b',branch,str(path),base)
+        record=dict(id=tid,kind='worktree',root=str(root),path=str(path),branch=branch,base=base,
+                    title=str(body.get('title','Task'))[:200],status='active',port=_new_port(),created=time.time())
+        _managed_tasks[tid]=record; _save_tasks(root)
+        return record
+
+def _task_diff(record):
+    path=record['path']
+    diff=_git(path,'diff',record['base'],'--','.',' :! .sloplobster'.replace(' ',''))
+    untracked=_git(path,'ls-files','--others','--exclude-standard','-z')
+    for name in untracked.split('\0'):
+        if not name: continue
+        file=_managed_path(record,name)
+        if file.is_file():
+            if file.stat().st_size>1500000: raise ValueError('Untracked file exceeds the review limit: '+name)
+            text=file.read_text(encoding='utf-8',errors='replace').splitlines(True)
+            diff+='\n'+''.join(difflib.unified_diff([],text,fromfile='/dev/null',tofile=name))
+    if len(diff)>200000: raise ValueError('Diff exceeds the review limit; split the task before merging')
+    return diff
+
+def _task_changed_files(record):
+    names=_git(record['path'],'diff','--name-only','-z',record['base'],'--','.',':!.sloplobster').split('\0')
+    names+=_git(record['path'],'ls-files','--others','--exclude-standard','-z').split('\0')
+    return sorted(set(name for name in names if name))
+
+def _task_review_hash(record, diff):
+    digest=hashlib.sha256(diff.encode())
+    digest.update(_git(record['path'],'rev-parse','HEAD').encode())
+    for name in _task_changed_files(record):
+        path=_managed_path(record,name)
+        digest.update(name.encode())
+        digest.update((_file_hash(path) or 'deleted').encode())
+    return digest.hexdigest()
+
+def _merge_task(body):
+    record=managed_task(body.get('taskId'))
+    if record['kind']!='worktree': raise ValueError('Only Git worktree tasks can be merged')
+    root=pathlib.Path(record['root'])
+    if _git(record['path'],'symbolic-ref','--short','HEAD')!=record['branch']: raise ValueError('Task branch changed; restore its generated branch before merging')
+    if record['status']!='active': raise ValueError('Task is no longer active')
+    if _git(root,'status','--porcelain'): raise ValueError('Original workspace has uncommitted changes; commit or stash them before merging')
+    expected=body.get('reviewHash')
+    diff=_task_diff(record)
+    if not expected or _task_review_hash(record,diff)!=expected: raise ValueError('Changes differ from the reviewed diff; review again')
+    if _git(record['path'],'status','--porcelain'):
+        _git(record['path'],'add','-A','--','.',' :! .sloplobster'.replace(' ',''))
+        if _git(record['path'],'diff','--cached','--name-only'):
+            _git(record['path'],'commit','-m',str(body.get('message') or 'SlopLobster: '+record['title'])[:300])
+    result=subprocess.run(['git','-C',str(root),'merge','--no-ff','--no-edit',record['branch']],
+                          capture_output=True,encoding='utf-8',errors='replace',timeout=60)
+    if result.returncode: return {'ok':False,'status':'conflict','output':result.stdout+'\n'+result.stderr}
+    record['status']='merged'; _save_tasks(root)
+    return {'ok':True,'output':result.stdout,'task':record}
+
+def _discard_task(body):
+    record=managed_task(body.get('taskId'))
+    if body.get('confirm') is not True: raise ValueError('Discard requires explicit confirmation')
+    if any(job.get('taskId')==record['id'] and job['status'] in ('running','cancelling') for job in _commands.values()):
+        raise ValueError('Cancel running task commands before discarding')
+    dev=_dev_processes.get(str(record.get('port')))
+    if dev and dev['proc'].poll() is None: kill_tree(dev['proc'].pid)
+    if record['kind']=='worktree':
+        expected=pathlib.Path(record['root'])/'.sloplobster'/'worktrees'/record['id']
+        actual=pathlib.Path(record['path']).resolve()
+        if actual != expected or actual.is_symlink(): raise ValueError('Unsafe discard target')
+        _git(record['root'],'worktree','remove','--force',str(actual))
+        _git(record['root'],'branch','-D',record['branch'],check=False)
+        record['status']='discarded'; _save_tasks(pathlib.Path(record['root']))
+    else:
+        record['_temporary'].cleanup(); record['status']='discarded'
+    return {'ok':True}
+
+def _evaluation_create(body):
+    files=body.get('files',{})
+    if not isinstance(files,dict) or len(files)>100: raise ValueError('Evaluation needs at most 100 fixture files')
+    temporary=tempfile.TemporaryDirectory(prefix='sloplobster-eval-')
+    tid=secrets.token_hex(16)
+    record=dict(id=tid,kind='evaluation',path=temporary.name,status='active',port=None,
+                allowedWrites=body.get('allowedWrites',[]),checks=body.get('checks',[]),_temporary=temporary,baseline={})
+    _managed_tasks[tid]=record
+    try:
+        for name, content in files.items():
+            path=_managed_path(record,name)
+            if not isinstance(content,str): raise ValueError('Fixture file content must be text')
+            path.parent.mkdir(parents=True,exist_ok=True); path.write_text(content,encoding='utf-8')
+            record['baseline'][name]=_file_hash(path)
+    except Exception:
+        temporary.cleanup(); del _managed_tasks[tid]; raise
+    return {'id':tid,'kind':'evaluation'}
+
+def _evaluation_result(body):
+    record=managed_task(body.get('taskId'))
+    if record['kind']!='evaluation': raise ValueError('Not an evaluation workspace')
+    files={}
+    for path in pathlib.Path(record['path']).rglob('*'):
+        if path.is_file() and not path.is_symlink():
+            name=path.relative_to(record['path']).as_posix()
+            files[name]=_file_hash(path)
+    changed=[name for name in set(files)|set(record['baseline']) if files.get(name)!=record['baseline'].get(name)]
+    unintended=[name for name in changed if not any(fnmatch.fnmatchcase(name,pattern) for pattern in record['allowedWrites'])]
+    assertions=[]
+    for assertion in body.get('assertions',[]):
+        path=_managed_path(record,assertion.get('path',''))
+        text=path.read_text(encoding='utf-8') if path.is_file() else ''
+        passed=path.is_file() and ('equals' not in assertion or text==assertion['equals']) and ('contains' not in assertion or assertion['contains'] in text)
+        assertions.append({'path':assertion['path'],'passed':passed})
+    return {'changedFiles':changed,'unintendedWrites':unintended,'assertions':assertions,
+            'passed':bool(assertions) and all(a['passed'] for a in assertions) and not unintended}
+
+def feature_api(path, body):
+    if path=='/features/tasks/create': return _create_worktree(body)
+    if path=='/features/tasks/list':
+        root=_project_root(body.get('root',''))
+        with _task_lock:
+            _load_tasks(root)
+            return {'tasks':[r for r in _managed_tasks.values() if r.get('root')==str(root) and r['status']!='discarded']}
+    if path=='/features/tasks/file': return _task_file(body)
+    if path=='/features/tasks/diff':
+        record=managed_task(body.get('taskId'))
+        diff=_task_diff(record)
+        return {'diff':diff,'changedFiles':_task_changed_files(record),'reviewHash':_task_review_hash(record,diff)}
+    if path=='/features/tasks/merge': return _merge_task(body)
+    if path=='/features/tasks/discard': return _discard_task(body)
+    if path=='/features/evaluations/create': return _evaluation_create(body)
+    if path=='/features/evaluations/result': return _evaluation_result(body)
+    if path=='/features/recipes/discover':
+        root=pathlib.Path(body.get('root') or os.getcwd()).resolve(strict=True)
+        files={}
+        for name in ('package.json','pnpm-lock.yaml','yarn.lock','bun.lock','pyproject.toml','pytest.ini','requirements.txt','Cargo.toml','go.mod'):
+            file=root/name
+            if file.is_file() and not file.is_symlink() and file.stat().st_size<100000:
+                files[name]=file.read_text(encoding='utf-8',errors='replace')
+        return {'files':files}
+    raise ValueError('Unknown feature endpoint')
+
+
+# Isolated browser/embedding services keep slow calls off HTTP health/cancel paths.
+class CompanionHTTPServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 32
+
+class ServiceProcess:
+    def __init__(self, kind):
+        self.kind = kind
+        self.proc = None
+        self.responses = None
+        self.browser_open = False
+        self._busy = threading.Lock()
+        self._state_lock = threading.Lock()
+
+    def _start(self):
+        with self._state_lock:
+            if self.proc is not None and self.proc.poll() is None:
+                return self.proc, self.responses
+            kw = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                      text=True, encoding='utf-8', errors='replace', bufsize=1)
+            if platform.system() == 'Windows':
+                kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+            else:
+                kw['start_new_session'] = True
+            proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), '--service-worker', self.kind], **kw)
+            responses = queue.Queue(maxsize=4)
+            self.proc, self.responses = proc, responses
+        def read_responses():
+            try:
+                while True:
+                    line = proc.stdout.readline(16000001)
+                    if not line: break
+                    if len(line)>16000000: raise ValueError('Service response exceeds 16 MB')
+                    responses.put_nowait(json.loads(line))
+            except Exception as exc:
+                try: responses.put_nowait({'code':502,'data':{'error':str(exc)}})
+                except queue.Full: pass
+            finally:
+                proc.stdout.close()
+                try: responses.put_nowait({'code':502,'data':{'error':'Service worker exited'}})
+                except queue.Full: pass
+        threading.Thread(target=read_responses, daemon=True).start()
+        return proc, responses
+
+    def stop(self, expected=None):
+        with self._state_lock:
+            proc, responses = self.proc, self.responses
+            if expected is not None and proc is not expected: return
+            self.proc = None
+            self.responses = None
+            self.browser_open = False
+        if responses is not None:
+            try: responses.put_nowait({'code':503,'data':{'error':'Service worker stopped'}})
+            except queue.Full: pass
+        if proc is not None:
+            kill_tree(proc.pid)
+            try: proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try: proc.wait(timeout=2)
+                except subprocess.TimeoutExpired: pass
+            if proc.poll() is not None:
+                proc.stdin.close()
+
+    def call(self, path, body, timeout):
+        if not self._busy.acquire(blocking=False):
+            return 503, {'error':self.kind+' worker is busy; wait for the current operation'}
+        proc = None
+        try:
+            proc, responses = self._start()
+            def send():
+                try:
+                    proc.stdin.write(json.dumps({'path':path,'body':body})+'\n')
+                    proc.stdin.flush()
+                except Exception as exc:
+                    try: responses.put_nowait({'code':502,'data':{'error':str(exc)}})
+                    except queue.Full: pass
+            threading.Thread(target=send, daemon=True).start()
+            try:
+                response = responses.get(timeout=timeout)
+            except queue.Empty:
+                self.stop(proc)
+                return 504, {'error':self.kind+' operation timed out; its worker and child processes were stopped. Retry explicitly to start a new worker.'}
+            with self._state_lock:
+                if self.proc is proc:
+                    self.browser_open = bool(response.get('browser_open', False))
+            if response['code'] == 502: self.stop(proc)
+            return response['code'], response['data']
+        finally:
+            self._busy.release()
+
+_browser_service = ServiceProcess('browser')
+_embed_service = ServiceProcess('embed')
+_embedding_model = None
+_embedding_threads_configured = False
+
+def encode_embeddings(texts):
+    global _embedding_model, _embedding_threads_configured
+    if not isinstance(texts, list) or not texts or len(texts)>100 or not all(isinstance(t,str) for t in texts):
+        raise ValueError('texts must contain 1-100 strings')
+    if sum(map(len,texts))>500000: raise ValueError('Embedding batch exceeds 500,000 characters')
+    if _embedding_model is None:
+        threads = max(1, min(4, int(os.environ.get('SLOPLOBSTER_EMBED_THREADS','2'))))
+        os.environ['OMP_NUM_THREADS'] = str(threads)
+        os.environ['MKL_NUM_THREADS'] = str(threads)
+        import torch
+        if not _embedding_threads_configured:
+            torch.set_num_threads(threads)
+            torch.set_num_interop_threads(1)
+            _embedding_threads_configured = True
+        from sentence_transformers import SentenceTransformer
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    embeddings = _embedding_model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return {'embeddings':embeddings.tolist(),'dim':int(embeddings.shape[1]),'backend':'companion'}
+
+def run_service_worker(kind):
+    import contextlib
+    if kind not in ('browser', 'embed'): raise ValueError('Invalid service worker')
+    for line in sys.stdin:
+        try:
+            request = json.loads(line)
+            path, body = request['path'], request['body']
+            if (kind=='browser' and not path.startswith('/browser_')) or (kind=='embed' and path!='/embed'):
+                raise ValueError('Invalid worker operation')
+            result = {}
+            handler = object.__new__(Handler)
+            handler.path = path
+            handler._in_service_worker = True
+            handler._check_access = lambda authenticate=True: True
+            handler.read_body = lambda: body
+            handler.send_json = lambda code,data: result.update(code=code,data=data)
+            # Library progress output cannot corrupt the JSON protocol.
+            with contextlib.redirect_stdout(sys.stderr):
+                handler.do_POST()
+            result['browser_open'] = _pw_browser is not None and _pw_browser.is_connected()
+        except Exception as exc:
+            result = {'code':500,'data':{'error':str(exc)}}
+        sys.stdout.write(json.dumps(result,ensure_ascii=False)+'\n')
+        sys.stdout.flush()
+
+# END GENERATED FEATURES
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    timeout = 15  # Idle sockets and incomplete request bodies cannot wait forever.
+    def _check_access(self, authenticate=True):
+        expected_port = self.server.server_address[1]
+        if self.headers.get('Host', '') not in (f'127.0.0.1:{expected_port}', f'localhost:{expected_port}'):
+            self.send_json(403, {'error': 'Invalid Host header'})
+            return False
+        origin = self.headers.get('Origin')
+        if origin is not None and origin not in ALLOWED_ORIGINS:
+            self.send_json(403, {'error': 'Origin is not paired with this companion'})
+            return False
+        if authenticate and not secrets.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + SESSION_TOKEN):
+            self.send_json(401, {'error': 'Pair this companion: enter its session token in Settings > Companion session token'})
+            return False
+        return True
+
     def handle_one_request(self):
         try:
             super().handle_one_request()
@@ -996,14 +1640,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
     def do_OPTIONS(self):
+        if not self._check_access(authenticate=False): return
         self.send_response(204)
         self._cors()
         self.end_headers()
 
     def do_GET(self):
+        if not self._check_access(): return
         if self.path in ("/status", "/ping"):
             self.send_json(200, {
                 "status": "ok",
+                "version": BUILD_VERSION,
+                "capabilities": sorted(CAPABILITIES),
+                "command_lifecycle": True,
                 "platform": platform.system(),
                 "release": platform.release(),
                 "python": platform.python_version(),
@@ -1013,13 +1662,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "python_env": PYTHON_ENV,
                 "node_env": NODE_ENV,
                 "playwright": HAS_PLAYWRIGHT,
-                "browser_open": _pw_browser is not None and _pw_browser.is_connected()
+                "browser_open": _browser_service.browser_open
             })
         else:
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        if self.path.startswith('/dev_'):
+            with _dev_lock: return self._dispatch_post()
+        return self._dispatch_post()
+
+    def _dispatch_post(self):
+        if not self._check_access(): return
         path = self.path.split('?')[0]
+        capability = ('command' if path == '/execute' or path.startswith('/commands/') else
+                      'browser' if path.startswith('/browser_') else
+                      'mcp' if path.startswith(('/mcp/', '/api/mcp/')) else
+                      'dev' if path.startswith('/dev_') else None)
+        if path.startswith('/features/'): capability = 'command'
+        if capability and capability not in CAPABILITIES:
+            return self.send_json(403, {'error': capability + ' capability disabled by companion policy'})
+        if not getattr(self, '_in_service_worker', False) and (path.startswith('/browser_') or path=='/embed'):
+            try:
+                body = self.read_body()
+                if path=='/browser_close':
+                    _browser_service.stop()
+                    return self.send_json(200, {'ok':True})
+                service = _embed_service if path=='/embed' else _browser_service
+                limit = 120 if path=='/embed' else 15 if path=='/browser_evaluate' else 45
+                if path=='/browser_wait_for': limit=max(5,min(65,float(body.get('timeout',10000))/1000+5))
+                code, result = service.call(path, body, limit)
+                return self.send_json(code, result)
+            except Exception as exc:
+                return self.send_json(500, {'error':str(exc)})
+        if path.startswith('/features/'):
+            try:
+                body = self.read_body()
+                with _task_lock:
+                    result = feature_api(path, body)
+                return self.send_json(200, result)
+            except Exception as exc:
+                name = 'NotFoundError' if isinstance(exc, FileNotFoundError) else 'TypeMismatchError' if isinstance(exc, (NotADirectoryError, IsADirectoryError)) else 'OperationError'
+                return self.send_json(400, {'error': str(exc), 'errorName': name})
+        if path in ('/commands/start', '/commands/status', '/commands/cancel'):
+            try:
+                body = self.read_body()
+                if path == '/commands/start':
+                    return self.send_json(200, {'id': start_command(body)})
+                if path == '/commands/cancel':
+                    return self.send_json(200, cancel_command(body.get('id')))
+                return self.send_json(200, command_status(body.get('id'), body.get('cursor', 0)))
+            except KeyError:
+                return self.send_json(404, {'error': 'Unknown command id; do not retry execution with a new id'})
+            except (ValueError, TypeError) as exc:
+                return self.send_json(400, {'error': str(exc)})
         if path == '/execute':
             try:
                 body = self.read_body()
@@ -1047,8 +1743,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 wfn('e', "[Error: " + str(e) + "]")
                 wfn('d', "1")
-            return  
-        elif path == '/search':  
+            return
+        elif path == '/search':
             try:
                 body = self.read_body()
                 query = body.get("query", "").strip()
@@ -1328,15 +2024,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(texts) > 100:
                     return self.send_json(400, {"error": "max 100 texts per batch"})
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    model = SentenceTransformer('all-MiniLM-L6-v2')
-                    embeddings = model.encode(texts, normalize_embeddings=True)
-                    return self.send_json(200, {"embeddings": embeddings.tolist(), "dim": int(embeddings.shape[1]), "backend": "companion"})
+                    return self.send_json(200, encode_embeddings(texts))
                 except ImportError:
                     return self.send_json(200, {"error": "sentence-transformers not installed", "fallback": True, "hint": "pip install sentence-transformers", "backend": "none"})
             except Exception as e:
-                return self.send_json(500, {"error": str(e)})    
-       
+                return self.send_json(500, {"error": str(e)})
+
         elif path == '/dev_start':
             try:
                 body = self.read_body()
@@ -1345,6 +2038,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     return self.send_json(400, {"error": "command is required"})
                 port = int(body.get("port", 3000))
                 cwd = body.get("cwd") or None
+                if body.get("taskId"):
+                    task = managed_task(body["taskId"])
+                    cwd = task["path"]; port = task["port"]
+                    cmd = cmd.replace("{port}", str(port))
                 result = _start_dev_process(cmd, port, cwd)
                 self.send_json(200, result)
             except Exception as e:
@@ -1395,7 +2092,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     del _dev_processes[port_s]
                 self.send_json(200, {"ok": True, "killed": killed, "port": port})
             except Exception as e:
-                self.send_json(500, {"error": str(e)})    
+                self.send_json(500, {"error": str(e)})
 
         elif path in ('/mcp/sync', '/api/mcp/sync'):
             try:
@@ -1426,7 +2123,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif path in ('/mcp/status', '/api/mcp/status'):
             try:
                 status = {}
-                for name, srv in _mcp_servers.items():
+                for name, srv in list(_mcp_servers.items()):
                     alive = srv.get("proc") and srv["proc"].poll() is None
                     status[name] = {"alive": alive, "tool_count": len(srv.get("tools", []))}
                 self.send_json(200, {"servers": status})
@@ -1442,9 +2139,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length) or "{}")
 
     def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self.headers.get('Origin')
+        if origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
     def send_json(self, code, data):
         p = json.dumps(data, ensure_ascii=False).encode()
@@ -1461,18 +2161,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
-    server = http.server.HTTPServer(("127.0.0.1", port), Handler)
+    server = CompanionHTTPServer(("127.0.0.1", port), Handler)
     server.socket.settimeout(None)
     server.timeout = None
-    print("\n  SlopLobster Companion v1.4  |  http://127.0.0.1:" + str(port) + "  |  " + platform.system() + "  |  Ctrl+C to stop\n")
+    print("\n  SlopLobster Companion " + BUILD_VERSION + "  |  http://127.0.0.1:" + str(port) + "  |  " + platform.system() + "  |  Ctrl+C to stop\n")
+    print("  Companion session token (paste into SlopLobster Settings): " + SESSION_TOKEN)
+    print("  Enabled capabilities: " + ', '.join(sorted(CAPABILITIES)) + "\n")
     sys.stdout.flush()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n  Stopped.")
     finally:
+        stop_all_commands()
+        for entry in list(_dev_processes.values()):
+            if entry['proc'].poll() is None: kill_tree(entry['proc'].pid)
+        for entry in list(_mcp_servers.values()):
+            if entry['proc'].poll() is None: kill_tree(entry['proc'].pid)
+        _pshell_invalidate()
+        _browser_service.stop()
+        _embed_service.stop()
         server.server_close()
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv)>2 and sys.argv[1]=='--service-worker':
+        run_service_worker(sys.argv[2])
+    else:
+        main()
