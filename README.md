@@ -155,7 +155,7 @@ The companion runs on `http://127.0.0.1:8765` and provides:
 
 ### 3. Open SlopLobster
 
-Open `index.html` in **Chrome** or **Edge** (required for the File System Access API). That's it — no build step, no `npm install`, no server to start.
+Open `SlopLobster.html` in **Chrome** or **Edge** (required for the File System Access API). That's it — no build step, no `npm install`, no server to start.
 
 ### 4. Open a Workspace
 
@@ -336,7 +336,10 @@ SlopLobster-companion.py
 ### Security
 
 - Binds to `127.0.0.1` only — no external access
-- No authentication needed for localhost
+- All endpoints require a per-launch bearer token. Paste the token printed by the companion into Settings > Companion session token. The frontend retains it in this browser tab only.
+- Host and Origin validation restrict requests to the paired local UI. For an HTTP-hosted UI, set `SLOPLOBSTER_ORIGINS` to its exact origin; the default `null` origin supports the local HTML file.
+- Server-side capabilities are controlled with `SLOPLOBSTER_CAPABILITIES`, a comma-separated subset of `command,browser,mcp,dev`. An empty value disables these capabilities. Authenticated status, search, fetch, and AST extraction remain available.
+- `SLOPLOBSTER_TOKEN` can supply a stable token for local automation; otherwise a fresh token is generated each launch.
 - File operations are sandboxed by the browser's File System Access API (not the companion)
 - SlopLobster validates all paths for traversal attacks before sending to the companion
 - Dangerous shell commands, git pushes, and browser write actions confirm by default (see Settings → Dangerous Action Permissions)
@@ -437,7 +440,7 @@ Uses a full **Longest Common Subsequence (LCS)** algorithm for precise diffs. Fo
 - Use `execute_command` with curl instead, via the companion server
 
 **Companion connection drops mid-conversation**
-- SlopLobster automatically falls back to the virtual shell
+- Interrupted real commands pause with an unknown outcome; they are never replayed through the virtual shell
 - Tool calls that require the companion will fail gracefully
 - Reconnect by clicking the 🔄 button or restarting the companion
 
@@ -458,3 +461,57 @@ Uses a full **Longest Common Subsequence (LCS)** algorithm for precise diffs. Fo
 | Storage | localStorage (conversations, settings) + workspace files (progress/memory) |
 
 ---
+
+
+## Harness reliability (1.5.0)
+
+The HTML and companion must be updated together. Start the companion, open Settings in the HTML, and paste its printed Companion session token. Restarting the companion generates a new token. The HTML download button produces the same script as the canonical Python file.
+
+Independent file reads can run in parallel. Mutations and commands form ordered barriers, including edit approval and application. Shared reader/writer locks also coordinate worker tools. An edit and its test command in the same batch therefore execute in order. Unknown MCP tools and shell commands are treated conservatively as mutations.
+
+Commands have stable IDs, bounded output, explicit exit codes, and cancellation. Resuming an interrupted task collects the existing job's status before another model turn. The companion retains jobs in memory (up to 64, evicting completed jobs when needed). Restarting it loses those records; inspect the workspace before deciding whether an unknown command should be repeated.
+
+Compaction persists a task checkpoint containing the objective, user instructions, checklist, plan, and invariants separately from the generated summary. Failed or empty summaries pause the run and preserve the full conversation. Mutation arguments requiring JSON repair are rejected before execution. Pending file approvals reject stale previews, including initially empty and newly created files.
+
+
+## Harness features (1.6.0)
+
+Open **Harness** in the top toolbar. Options persist in this browser; queue tasks, evidence, knowledge, recipes, and evaluation results persist in IndexedDB for the selected project.
+
+| Feature | Default | How to use it |
+| --- | --- | --- |
+| Isolated tasks | Off | Set the absolute Git repository root in Options, then enable automatic isolation or create a task in Isolation. |
+| Completion evidence | On | Review changed files, check results, screenshots, and unresolved checklist items in Evidence. |
+| Project recipes | On | Discover suggested setup/build/lint/test/preview commands, review them, and save. Commands run only when requested and remain subject to approval. |
+| Unattended queue | Off | Enable it, add prompts, acceptance criteria, iteration/token budgets, and explicitly mark independent tasks. |
+| Session knowledge | On | Search prior project fixes and decisions, open their source conversations, and mark reviewed entries verified. |
+| Automatic knowledge retrieval | Off | Enable to add matching project knowledge to new model turns. |
+| Model evaluations | Manual | Select models, edit fixture tasks/settings, and run a benchmark explicitly. |
+
+Restart the updated companion **1.6.0**, then enter its newly printed session token in Settings. Refresh the HTML page. The companion token belongs to the companion; LM Studio must separately have CORS enabled.
+
+Isolated tasks use a generated branch and worktree under `.sloplobster/worktrees/`, with their own preview port. Files and shell commands route to that worktree. Worktrees start from committed HEAD; commit desired starting changes first. Review the diff before **Commit & merge**; a changed review or dirty original workspace blocks merging. **Discard** permanently removes the task worktree and branch after confirmation. This is Git isolation, not an operating-system sandbox: approved shell commands still have the user's normal access. MCP tools are omitted while an isolated task is active because their working directory cannot be guaranteed. Preview commands can use `{port}`; the server also sets `PORT`.
+
+Evidence treats successful checks after the latest recorded file edit as verification of those checks. Agent claims alone do not verify completion. Explicit acceptance criteria remain unverified until reviewed. Screenshots are captured when the agent uses screenshot tools.
+
+Recipe discovery never executes commands. Saved recipes are retained in browser storage and, when a project directory is open, in `.sloplobster/recipe.json`; they are loaded on future project sessions. Review discovered suggestions before running them.
+
+The queue parks a task when it asks a question, stops on its budgets, and preserves its conversation for resumption. Later work proceeds only when marked independent or when preceding tasks have been reviewed as done. Existing command and edit approvals still apply; enabling the queue does not enable automatic approval. Answer a parked question or make a paused task ready, then start the queue again. Browser reloads convert interrupted running tasks to paused.
+
+Knowledge entries include a source conversation and optional tool-call link. Entries saved by the model begin unverified. Automatic retrieval is optional and scoped to the project.
+
+Evaluations use disposable text fixtures and a restricted file/check tool set. Each task defines `files`, `allowedWrites`, exact/substring file `assertions`, and optional predeclared shell `checks`. Shell checks require explicit confirmation before the benchmark starts; they run with normal user permissions. Variants specify a name, temperature, and maximum response tokens. Results compare verified completion rates, elapsed time, output/context tokens, unintended writes, and tool corrections. Tokens are labelled estimated when the server omits usage. Export JSON for comparisons. No live model benchmark runs automatically.
+
+Conversation deletion removes its IndexedDB record, workspace JSON when a project is open, and browser cache entries. Deleted IDs are excluded from stale indexes and legacy imports, and pending saves are drained before removal. Workspace permission or database failures appear as an error instead of a successful deletion. Conversation storage for an isolated task uses its original project directory.
+
+A companion connection banner appears below the toolbar when its token is missing, rejected, or the server cannot be reached. Paste the token printed in the companion terminal and choose **Connect companion**; Settings are not required for pairing. The banner clears after successful authentication, and the token is retained for the current browser tab session. A server restart requires its newly printed token.
+
+Git review preserves whitespace in filenames and includes those files before merge. Queued tasks with missing conversations are blocked with an explanation. Shell commands invalidate earlier verification until checks run again. Feature data and the Git project path are now associated with the selected folder; configure its Git path in Harness Options when first pairing a folder. Basic runs with all optional harness features disabled do not require feature storage.
+
+### Companion responsiveness and CPU use
+
+Slow browser and embedding requests run in separate, reusable worker processes. Status checks and shell cancellation stay available while they run. Browser JavaScript evaluation has a 15-second hard limit, other browser operations normally have 45 seconds (selector waits up to 65), and embeddings have 120 seconds. A hard timeout stops the worker and its child processes; the error asks you to retry explicitly. Closing the browser also stops a stuck browser worker.
+
+The embedding model is cached between batches. CPU inference defaults to two threads; set `SLOPLOBSTER_EMBED_THREADS` before launching the companion to select 1–4 threads. Unchanged MCP configurations reuse their running server, stderr is continuously drained, and failed startup or timed-out communication stops the process tree. Shell output and preview logs are bounded even when a process never prints a newline; excess shell output is discarded with backpressure. Shutdown waits for active shell commands to cancel.
+
+After updating, stop and restart the companion and reload `SlopLobster.html`. If you use the companion downloaded from the GUI, download the updated copy first. A fresh session token appears on restart unless you explicitly configured `SLOPLOBSTER_TOKEN`.
