@@ -632,7 +632,49 @@ def _translate_for_cmd_bash(cmd):
 
     return base + " " + new_rest
 
-def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
+_NUL_REDIRECT = re.compile(r'(?:\d|&)?(?:>>?|<)\s*nul(?![\w./\\:-])', re.IGNORECASE)
+
+def _fix_nul_redirects(cmd):
+    """`>nul`, `2>nul` and `<nul` are cmd.exe idioms (models emit them constantly). In bash and sh "nul" is just a file
+    name, so the redirect silently creates a file called "nul" in the working directory. Rewrite those redirects to
+    /dev/null, outside quotes only, whenever the shell is not cmd.exe."""
+    if SHELL_NAME == "cmd.exe" or not isinstance(cmd, str) or "nul" not in cmd.lower(): return cmd
+    out, i, quote = [], 0, ""
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd): out.append(cmd[i:i + 2]); i += 2; continue
+            if ch == quote: quote = ""
+            out.append(ch); i += 1; continue
+        if ch in ("'", '"'): quote = ch; out.append(ch); i += 1; continue
+        if ch == "\\" and i + 1 < len(cmd): out.append(cmd[i:i + 2]); i += 2; continue
+        m = _NUL_REDIRECT.match(cmd, i)
+        if m: out.append(m.group(0)[:-3] + "/dev/null"); i = m.end(); continue
+        out.append(ch); i += 1
+    return "".join(out)
+
+def _stray_nul_path(directory):
+    try:
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.lower() == "nul" and entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_size <= 1000000:
+                    return entry.path
+    except OSError: pass
+    return None
+
+def _extended_path(path):
+    # "nul" is a reserved device name on Windows, so Explorer and plain del cannot remove such a file; \\?\ paths can.
+    return "\\\\?\\" + os.path.abspath(path) if platform.system() == "Windows" else path
+
+def _remove_stray_nul(directory):
+    """Delete a file named "nul" that the command we just ran created. Windows only: there it can never be a real file."""
+    if platform.system() != "Windows": return False
+    path = _stray_nul_path(directory)
+    if not path: return False
+    try: os.remove(_extended_path(path)); return True
+    except OSError: return False
+
+def _stream_cmd_fresh_impl(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
 
@@ -726,6 +768,18 @@ def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_ev
         write_fn('d', str(int(returncode)))
 
     return full, returncode
+
+def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
+    fixed = _fix_nul_redirects(cmd)
+    if fixed != cmd:
+        write_fn("e", "[companion: rewrote a cmd.exe redirect to nul as /dev/null; this shell is " + SHELL_NAME + ", where \"nul\" would create a file]\n")
+        cmd = fixed
+    directory = cwd or os.getcwd()
+    existed = _stray_nul_path(directory) is not None
+    try:
+        return _stream_cmd_fresh_impl(write_fn, cmd, cwd=cwd, timeout=timeout, cancel_event=cancel_event)
+    finally:
+        if not existed and SHELL_NAME != "cmd.exe": _remove_stray_nul(directory)
 
 def stream_cmd(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT):
     # Use the bounded runner for legacy clients too; persistent-shell output
@@ -932,6 +986,7 @@ _dev_processes = {}
 _dev_lock = threading.RLock()
 
 def _start_dev_process(cmd, port, cwd):
+    cmd = _fix_nul_redirects(cmd)
     port_s = str(port)
     if port_s in _dev_processes:
         try:
