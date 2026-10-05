@@ -37,7 +37,7 @@ SlopLobster gives you a Claude Code / Cursor-like agent experience powered by an
 - **Environment-fix nudges** — when the agent fixes a failing command by switching to a different one, it's nudged once to `save_memory` if that looks like a real environment fact rather than a typo
 - **Session token budget** — optional hard cap on cumulative output tokens for the browser session, mainly as a guardrail for unattended sub-agent/swarm runs
 - **Sub-agents** — spawn focused read-only agents for context gathering, keeping the main context clean
-- **Swarms** — spawn multiple parallel workers with shared memory/messaging for larger tasks
+- **Swarms** — a dependency graph of workers (`depends_on`) with shared memory and messaging. Independent workers can run concurrently when their `owns` file globs are disjoint (enforced on every write); failed workers block their dependents (or `continue`/`abort` per worker), incomplete workers are reported honestly instead of as "Done", progress is checkpointed so a re-run resumes, a worker with `kind: "critic"` and `reviews: "<author>"` is a read-only adversarial reviewer that must cite evidence and end with `VERDICT: APPROVE` or `VERDICT: REVISE` (on REVISE the author is sent back with the critique, up to `max_revisions`; a critic that still objects blocks its dependents), `check_command` makes a worker pass its own tests before it counts as done, a task contract (`contract`: acceptance criteria, token budget, deadline; 20% reserved for verification) is judged by an independent read-only verifier that sees only the project, never the workers' accounts, and failing criteria send just their owner back for targeted repair; a critic also gates every worker that builds on its author's output; shared-memory entries are hypotheses until marked verified with evidence; every run keeps an event log and metrics (verified rate, tokens per verified result, latency, repair frequency) that the `swarm_history` tool reports; round limits are soft budgets (sub-agents and workers get extended while they keep finding new things, are stopped early if they only repeat themselves or fail, and always write a final report even when cut off), long worker conversations are kept inside the model's context by trimming the oldest large tool outputs, token usage is shown live, and an optional `verify_command` decides whether the result is reported as verified. With `isolate: true` (companion + Git project root required) every worker gets its own Git worktree: dependents start from their upstream workers' branches, finished work is merged onto one integration branch, merge conflicts are reported instead of overwritten, and nothing reaches your working tree until you review and merge that branch in Harness → Isolation
 - **Deep research** — multi-step web research tool for open-ended questions
 - **Plan mode** — break complex tasks into reviewable steps before executing
 
@@ -473,6 +473,19 @@ Commands have stable IDs, bounded output, explicit exit codes, and cancellation.
 
 Compaction persists a task checkpoint containing the objective, user instructions, checklist, plan, and invariants separately from the generated summary. Failed or empty summaries pause the run and preserve the full conversation. Mutation arguments requiring JSON repair are rejected before execution. Pending file approvals reject stale previews, including initially empty and newly created files.
 
+### Development and regression checks
+
+Canonical sources are `SlopLobster-companion.py` and the modules in `src/`. The generated backend block comes from `src/companion-features.py`; feature logic and UI come from `src/features-core.js` and `src/features-ui.js`. Run `node scripts/build.mjs` after changing them to update their embedded copies in the single-file HTML. Other UI code remains in `SlopLobster.html`; users of the distributed HTML do not need Node or a build step.
+
+```text
+node scripts/build.mjs --check
+node scripts/verify-html.mjs
+node --test tests/harness.test.cjs tests/features.test.cjs
+node tests/browser-smoke.mjs
+python -m unittest discover -s tests -p "test*.py" -v
+```
+
+The tests use scripted tool batches and local temporary workspaces. They need no model download, LM Studio connection, or third-party dependencies, and cover ordering, worker conflicts, compaction failure, nested schema validation, reconnects, cancellation, idempotency, bounded output, and companion access policy.
 
 ## Harness features (1.6.0)
 

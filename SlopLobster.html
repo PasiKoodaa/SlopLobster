@@ -4193,6 +4193,10 @@
     .swarm-worker.running { border-color: rgba(234,179,8,.3); }
     .swarm-worker.done    { border-color: rgba(34,197,94,.2); }
     .swarm-worker.error   { border-color: rgba(239,68,68,.2); }
+    .swarm-worker.incomplete { border-color: rgba(249,115,22,.35); }
+    .swarm-worker.blocked, .swarm-worker.skipped { border-color: var(--border); opacity: .7; }
+    .swarm-worker-status.incomplete { color: #f97316; }
+    .swarm-worker-status.blocked, .swarm-worker-status.skipped { color: var(--tx-3); }
     .swarm-worker.pending { opacity: .55; }
     .swarm-worker-hdr { display: flex; align-items: center; gap: 7px; padding: 6px 10px; cursor: pointer; }
     .swarm-worker-hdr:hover { background: var(--bg-3); }
@@ -6322,7 +6326,7 @@
 (function (root) {
   'use strict';
   const readTools = new Set(['read_file', 'read_file_lines', 'read_file_summary', 'view_image',
-    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'web_search', 'fetch_url']);
+    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'web_search', 'fetch_url', 'swarm_history']);
   function isReadOnly(name) { return readTools.has(name); }
   const coordinators = new Set(['spawn_sub_agent', 'spawn_swarm', 'deep_research', 'ask_user', 'think']);
   let readers = 0, writer = false;
@@ -6356,10 +6360,14 @@
       } else {
         const start = i;
         while (i < calls.length && isReadOnly(calls[i].function.name)) i++;
-        const settled = await Promise.allSettled(calls.slice(start, i).map((call, j) => execute(call, start + j)));
-        const failure = settled.find(r => r.status === 'rejected');
-        if (failure) throw failure.reason; // all reads have finished before releasing the barrier
-        results.push(...settled.map(r => r.value));
+        const group = calls.slice(start, i);
+        const settled = await Promise.allSettled(group.map((call, j) => execute(call, start + j)));
+        // Cancellation propagates, but only after every read has finished.
+        const aborted = settled.find(r => r.status === 'rejected' && r.reason?.name === 'AbortError');
+        if (aborted) throw aborted.reason;
+        // Any other failure becomes that call's own error result so sibling results are never lost.
+        results.push(...settled.map((r, j) => r.status === 'fulfilled' ? r.value
+          : { tc: group[j], status: 'error', error: 'tool_failed', retryable: false, output: 'Error: ' + (r.reason?.message || r.reason) }));
       }
     }
     return results;
@@ -6400,11 +6408,14 @@
     return null;
   }
 
-  function normalizeResult(result) {
+  function normalizeResult(result, toolName) {
     if (!result || typeof result !== 'object') return { status: 'error', output: 'Error: tool returned an invalid result', error: 'invalid_result', retryable: false };
     const output = String(result.output ?? '');
     // Legacy handlers remain supported while structured handlers provide explicit status.
-    const failed = result.status ? result.status !== 'ok' : result.isError || result.error || (result.exitCode != null && result.exitCode !== 0) || /^(?:ERROR\b|Error:|\[(?:Error|.* Error)\])/im.test(output);
+    // The text heuristic only applies to legacy handlers. Read tools return file/page content, which may
+    // legitimately contain the word "Error:", so only explicit signals can fail them.
+    const heuristic = !(toolName && isReadOnly(toolName)) && /^(?:ERROR\b|Error:|\[(?:Error|.* Error)\])/im.test(output);
+    const failed = result.status ? result.status !== 'ok' : result.isError || result.error || (result.exitCode != null && result.exitCode !== 0) || heuristic;
     return { ...result, output, status: result.status || (failed ? 'error' : 'ok'),
       error: result.error || (failed ? 'tool_failed' : null), retryable: result.retryable ?? false };
   }
@@ -6412,10 +6423,14 @@
   function captureTaskState(state) {
     const previous = state.taskState || {};
     const directives = [...(previous.directives || [])];
+    const clip = text => text.length > 4000 ? text.slice(0, 4000) + ' …[truncated]' : text;
     for (const m of state.messages || []) {
       if (m._harnessContext || m.role !== 'user' || typeof m.content !== 'string' || /^\[(?:SYSTEM|ORIGINAL TASK|Previous conversation|HARNESS TASK STATE)/i.test(m.content) || /^A detailed progress file was saved/.test(m.content)) continue;
-      if (!directives.includes(m.content)) directives.push(m.content);
+      const text = clip(m.content);
+      if (!directives.includes(text)) directives.push(text);
     }
+    // Keep the first instruction (the original task framing) and the most recent ones.
+    while (directives.length > 40) directives.splice(1, 1);
     return { objective: state.originalTask || previous.objective || '', directives,
       plan: state.currentPlan || null, checklist: state.planItems || [], invariants: state.invariants || [],
       beliefs: state.beliefs || [], pendingSteering: (state.pendingSteerMessages || []).map(m => m.text) };
@@ -6475,16 +6490,27 @@ async function commandRequest(path, body, signal) {
   return response.json();
 }
 
-function commandDelay(signal) {
+// Cancel must not be fire-and-forget: a lost cancel leaves a process running on the user's machine.
+async function cancelCommandReliably(commandId) {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { await commandRequest('/commands/cancel', { id: commandId }); return true; }
+    catch (error) { if ([400, 401, 403, 404].includes(error.status)) return false; await new Promise(r => setTimeout(r, 300 * 2 ** attempt)); }
+  }
+  console.warn('[companion] could not confirm cancellation of ' + commandId);
+  return false;
+}
+
+function commandDelay(signal, ms = 250) {
   return new Promise((resolve, reject) => {
     const onAbort = () => { clearTimeout(timer); reject(signal.reason || new DOMException('Aborted', 'AbortError')); };
-    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, 250);
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, ms);
     if (signal?.aborted) onAbort(); else signal?.addEventListener('abort', onAbort, { once: true });
   });
 }
 
 async function followCommandJob(job, signal, onLine) {
   const key = 'command:' + job.commandId;
+  let polls = 0;
   try {
     while (true) {
       const data = await commandRequest('/commands/status', { id: job.commandId, cursor: job.cursor || 0 }, signal);
@@ -6503,7 +6529,8 @@ async function followCommandJob(job, signal, onLine) {
           commandId: job.commandId, error: data.status === 'ok' ? null : data.status, retryable: false };
       }
       await dbSet('agent_states', { ...job, id: key });
-      await commandDelay(signal);
+      // Fast at first for short commands, then back off so long builds do not hammer the companion.
+      await commandDelay(signal, Math.min(2000, 250 * 1.5 ** Math.min(polls++, 8)));
     }
   } catch (error) {
     // A transport failure is an unknown outcome, never permission to repeat a command.
@@ -6522,7 +6549,7 @@ async function executeCompanionJob(command, timeout, externalSignal, onLine, too
   if (externalSignal) signals.push(externalSignal);
   if (state.running && state.abortCtrl?.signal) signals.push(state.abortCtrl.signal);
   const signal = AbortSignal.any(signals);
-  const cancel = () => { commandRequest('/commands/cancel', { id: commandId }).catch(() => {}); };
+  const cancel = () => { cancelCommandReliably(commandId); };
   signal.addEventListener('abort', cancel, { once: true });
   let started = false;
   try {
@@ -6546,9 +6573,19 @@ async function executeCompanionJob(command, timeout, externalSignal, onLine, too
 async function reconcileCommandJobs() {
   const jobs = (await dbGetAll('agent_states')).filter(job => job.commandId && job.convId === state.activeConvId);
   for (const job of jobs) {
-    if (job.companionUrl !== state.compUrl) throw new Error('An unfinished command belongs to another companion URL');
+    // One unrecoverable job must never block the rest: skip foreign ones, and keep going after failures.
+    if (job.companionUrl !== state.compUrl) {
+      appendMsg('system', 'Skipped unfinished command ' + job.commandId + ': it belongs to another companion (' + job.companionUrl + '). Reconnect there to recover it.');
+      continue;
+    }
     appendMsg('system', 'Recovering command ' + job.commandId + '…');
-    const result = await followCommandJob(job, state.abortCtrl?.signal);
+    let result;
+    try { result = await followCommandJob(job, state.abortCtrl?.signal); }
+    catch (error) {
+      if (error.status === 404) { await dbDelete('agent_states', 'command:' + job.commandId); appendMsg('system', 'Command ' + job.commandId + ' is no longer known to the companion (it likely restarted); its outcome is unknown.'); }
+      else appendMsg('system', 'Could not recover command ' + job.commandId + ': ' + error.message);
+      continue;
+    }
     const content = result.output || 'Command completed with exit code ' + result.exitCode;
     const previous = job.toolCallId && state.messages.find(m => m.role === 'tool' && m.tool_call_id === job.toolCallId);
     const pending = job.toolCallId && state.messages.some(m => m.tool_calls?.some(tc => tc.id === job.toolCallId));
@@ -6627,13 +6664,17 @@ async function pairCompanionFromBanner() {
       maxIters:Math.max(1,Math.min(200,Number(options.maxIters)||32)), tokenBudget:Math.max(256,Math.min(100000,Number(options.tokenBudget)||8000)),
       status:'pending', created:Date.now()};
   }
+  // A failed task blocks later dependent tasks unless the user marks it skipped; independent tasks always proceed.
   function nextQueueTask(tasks) {
     for (let i=0;i<tasks.length;i++) {
       const task=tasks[i];
       if (task.status!=='pending') continue;
-      if (task.independent || tasks.slice(0,i).every(t => t.status==='done' || t.status==='discarded')) return task;
+      if (task.independent || tasks.slice(0,i).every(t => ['done','discarded','skipped'].includes(t.status))) return task;
     }
     return null;
+  }
+  function blockedQueueTasks(tasks) {
+    return tasks.filter((task,i) => task.status==='pending' && !task.independent && tasks.slice(0,i).some(t => ['failed','error','blocked'].includes(t.status)));
   }
   function evidenceSummary(events) {
     const writes=new Set(), checks=[], issues=[], screenshots=[];
@@ -6651,18 +6692,22 @@ async function pairCompanionFromBanner() {
     const verified=verification.length>0 && verification.every(c => c.status==='ok' && c.exitCode===0 && c.index>lastWrite);
     return {files:[...writes], checks:verification, issues, screenshots, verified, outcome:issues.length?'blocked':verified?'verified':'needs_review'};
   }
-  function searchKnowledge(records, query, workspace, limit=5) {
+  // embeddingScores: optional {recordId: cosine}. Blends semantic similarity with keyword matches when available.
+  function searchKnowledge(records, query, workspace, limit=5, embeddingScores=null) {
     const words=[...new Set(String(query).toLowerCase().match(/[a-z0-9_]{2,}/g)||[])];
     return records.filter(r => r.workspace===workspace).map(record => {
       const text=(record.title+' '+record.text).toLowerCase();
-      const score=words.reduce((sum,w) => sum+(text.includes(w)?1:0),0)+(record.verified?0.2:0);
+      const cosine=embeddingScores?.[record.id];
+      const semantic=Number.isFinite(cosine) && cosine>=0.35 ? cosine*Math.max(2,words.length/2) : 0;
+      const score=words.reduce((sum,w) => sum+(text.includes(w)?1:0),0)+semantic+(record.verified?0.2:0);
       return {...record, score};
     }).filter(r => r.score>0.2).sort((a,b)=>b.score-a.score || b.created-a.created).slice(0,limit);
   }
   function recipeCandidates(files) {
     const candidates=[];
-    if (files['package.json']) {
-      const p=JSON.parse(files['package.json']);
+    let p=null;
+    if (files['package.json']) { try { p=JSON.parse(files['package.json']); } catch { p=null; } }
+    if (p && typeof p==='object') {
       const runner=Object.hasOwn(files,'pnpm-lock.yaml')?'pnpm':Object.hasOwn(files,'yarn.lock')?'yarn':Object.hasOwn(files,'bun.lock')?'bun':'npm';
       const recipe={name:p.name||'Node project', setup:runner+' install', build:'', lint:'', test:'', preview:''};
       for (const name of ['build','lint','test']) if (p.scripts?.[name]) recipe[name]=runner+' run '+name;
@@ -6683,9 +6728,370 @@ async function pairCompanionFromBanner() {
     }
     return spec;
   }
-  const api={defaults,preferences,newQueueTask,nextQueueTask,evidenceSummary,searchKnowledge,recipeCandidates,validateBenchmark};
+  const api={defaults,preferences,newQueueTask,nextQueueTask,blockedQueueTasks,evidenceSummary,searchKnowledge,recipeCandidates,validateBenchmark};
   root.HarnessFeatures=api;
   if (typeof module!=='undefined' && module.exports) module.exports=api;
+})(globalThis);
+
+/* Pure swarm primitives: worker graph, scheduling, ownership, shared memory. Embedded into the HTML by build. */
+(function (root) {
+  'use strict';
+  const WRITE_TOOLS = new Set(['edit_file', 'write_file', 'write_file_chunked', 'delete_file', 'move_file']);
+  const MAX_MEMORY_VALUE = 2000, CONTEXT_PREVIEW = 500;
+
+  function globToRegExp(glob) {
+    let re = '';
+    for (let i = 0; i < glob.length; i++) {
+      const c = glob[i];
+      if (c === '*') { if (glob[i + 1] === '*') { re += '.*'; i++; if (glob[i + 1] === '/') i++; } else re += '[^/]*'; }
+      else if (c === '?') re += '[^/]';
+      else re += c.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    }
+    return new RegExp('^' + re + '$');
+  }
+  function normPath(p) { return String(p || '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+/g, '/'); }
+  function pathAllowed(path, owns) {
+    if (!owns || !owns.length) return true;
+    const p = normPath(path);
+    return owns.some(g => globToRegExp(normPath(g)).test(p));
+  }
+  function staticPrefix(glob) { const g = normPath(glob), i = g.search(/[*?]/); return i < 0 ? g : g.slice(0, i); }
+  // Conservative: two ownership sets may overlap unless their static prefixes diverge.
+  function ownsOverlap(a, b) {
+    if (!a?.length || !b?.length) return true;
+    return a.some(x => b.some(y => { const px = staticPrefix(x), py = staticPrefix(y); return px.startsWith(py) || py.startsWith(px); }));
+  }
+
+  function normalizeWorkers(defs) {
+    if (!Array.isArray(defs) || !defs.length) throw new Error('workers must be a non-empty array');
+    if (defs.length > 12) throw new Error('A swarm supports at most 12 workers');
+    const names = new Set();
+    const explicit = defs.some(w => Array.isArray(w.depends_on));
+    const workers = defs.map((w, i) => {
+      const name = String(w.name || '').trim();
+      if (!name) throw new Error('Worker ' + (i + 1) + ' needs a name');
+      if (names.has(name)) throw new Error('Duplicate worker name: ' + name);
+      names.add(name);
+      if (!w.role || !w.task) throw new Error('Worker ' + name + ' needs role and task');
+      const kind = w.kind || 'worker';
+      if (!['worker', 'critic'].includes(kind)) throw new Error('Worker ' + name + ': kind must be worker or critic');
+      if (kind === 'critic' && !w.reviews) throw new Error('Critic ' + name + ' must name the worker it reviews in "reviews"');
+      const onFailure = w.on_failure || 'block';
+      if (!['block', 'abort', 'continue'].includes(onFailure)) throw new Error('Worker ' + name + ': on_failure must be block, abort or continue');
+      const tokenBudget = Number(w.token_budget) > 0 ? Math.max(256, Math.min(500000, Math.floor(Number(w.token_budget)))) : 0;
+      const clamp = (v, lo, hi, d) => Number.isFinite(+v) && v !== '' && v != null ? Math.max(lo, Math.min(hi, Math.floor(+v))) : d;
+      return { ...w, name, index: i, kind, reviews: kind === 'critic' ? String(w.reviews).trim() : '',
+        max_revisions: clamp(w.max_revisions, 0, 2, 1), check_command: typeof w.check_command === 'string' ? w.check_command.trim() : '', check_retries: clamp(w.check_retries, 0, 3, 2), model: typeof w.model === 'string' ? w.model.trim() : '', tokenBudget, owns: Array.isArray(w.owns) ? w.owns.map(String) : [], on_failure: onFailure,
+        retries: Math.max(0, Math.min(2, Number.isFinite(+w.retries) ? +w.retries : 1)),
+        // Legacy behaviour: without explicit dependencies, workers run in listed order.
+        depends_on: explicit ? (w.depends_on || []).map(String) : (i ? [String(defs[i - 1].name).trim()] : []) };
+    });
+    const byKind = new Map(workers.map(w => [w.name, w]));
+    for (const w of workers) if (w.kind === 'critic') {
+      const target = byKind.get(w.reviews);
+      if (!target) throw new Error('Critic ' + w.name + ' reviews unknown worker: ' + w.reviews);
+      if (target.name === w.name) throw new Error('Critic ' + w.name + ' cannot review itself');
+      if (target.kind === 'critic') throw new Error('Critic ' + w.name + ' cannot review another critic');
+      if (!w.depends_on.includes(target.name)) w.depends_on.push(target.name); // a critic always runs after its author
+    }
+    // Verify before accepting progress: anything built on a reviewed author's output waits for the critic's verdict,
+    // so a revision can never leave already-finished dependents holding stale results.
+    const reaches = (from, target, seen = new Set()) => from.depends_on.some(n => n === target || (!seen.has(n) && seen.add(n) && reaches(byKind.get(n), target, seen)));
+    for (const critic of workers.filter(x => x.kind === 'critic')) {
+      for (const x of workers) {
+        if (x === critic || x.kind === 'critic' || !x.depends_on.includes(critic.reviews) || x.depends_on.includes(critic.name)) continue;
+        if (!reaches(critic, x.name)) x.depends_on.push(critic.name); // skip if the critic already depends on x (would be a cycle)
+      }
+    }
+    for (const w of workers) for (const d of w.depends_on) {
+      if (!names.has(d)) throw new Error('Worker ' + w.name + ' depends on unknown worker: ' + d);
+      if (d === w.name) throw new Error('Worker ' + w.name + ' cannot depend on itself');
+    }
+    const state = new Map();
+    const byName = new Map(workers.map(w => [w.name, w]));
+    const visit = (w, trail) => {
+      if (state.get(w.name) === 2) return;
+      if (state.get(w.name) === 1) throw new Error('Dependency cycle: ' + [...trail, w.name].join(' -> '));
+      state.set(w.name, 1);
+      w.depends_on.forEach(d => visit(byName.get(d), [...trail, w.name]));
+      state.set(w.name, 2);
+    };
+    workers.forEach(w => visit(w, []));
+    return workers;
+  }
+
+  // Writers that may run at the same time must declare disjoint ownership.
+  function concurrencyConflicts(workers, writeCapable) {
+    const conflicts = [];
+    const closure = new Map();
+    const deps = w => { if (!closure.has(w.name)) { const s = new Set(); w.depends_on.forEach(d => { s.add(d); deps(workers.find(x => x.name === d)).forEach(x => s.add(x)); }); closure.set(w.name, s); } return closure.get(w.name); };
+    for (let i = 0; i < workers.length; i++) for (let j = i + 1; j < workers.length; j++) {
+      const a = workers[i], b = workers[j];
+      if (deps(a).has(b.name) || deps(b).has(a.name)) continue; // ordered, never concurrent
+      if (writeCapable(a) && writeCapable(b) && ownsOverlap(a.owns, b.owns)) conflicts.push([a.name, b.name]);
+    }
+    return conflicts;
+  }
+
+  /* statuses: pending running done incomplete error blocked skipped */
+  const satisfied = (w, st) => st[w.name] === 'done' || (w.on_failure === 'continue' && ['incomplete', 'error'].includes(st[w.name]));
+  async function runSchedule(workers, run, options = {}) {
+    const concurrency = Math.max(1, Math.min(8, options.concurrency || 1));
+    const st = Object.fromEntries(workers.map(w => [w.name, options.initial?.[w.name] || 'pending']));
+    const results = {}, attempts = {};
+    let aborted = false, running = 0;
+    const settle = () => {
+      for (const w of workers) if (st[w.name] === 'pending') {
+        const failed = w.depends_on.some(d => ['incomplete', 'error', 'blocked', 'skipped'].includes(st[d]) && !satisfied(workers.find(x => x.name === d), st));
+        if (failed) st[w.name] = 'blocked';
+      }
+    };
+    await new Promise(resolve => {
+      const pump = () => {
+        settle();
+        if ((options.signal?.aborted || options.shouldStop?.()) && !aborted) { aborted = true; workers.forEach(w => { if (st[w.name] === 'pending') st[w.name] = 'skipped'; }); }
+        const ready = workers.filter(w => st[w.name] === 'pending' && w.depends_on.every(d => satisfied(workers.find(x => x.name === d), st)));
+        for (const w of ready) {
+          if (running >= concurrency) break;
+          st[w.name] = 'running'; running++; attempts[w.name] = (attempts[w.name] || 0) + 1;
+          options.onStatus?.(w, 'running', st);
+          Promise.resolve().then(() => run(w, attempts[w.name], results)).catch(e => ({ status: 'error', error: e.message })).then(res => {
+            running--; results[w.name] = res;
+            const ok = res.status === 'done';
+            if (!ok && !options.signal?.aborted && attempts[w.name] <= w.retries && res.retryable !== false) st[w.name] = 'pending';
+            else st[w.name] = ok ? 'done' : (options.signal?.aborted ? 'skipped' : res.status === 'incomplete' ? 'incomplete' : 'error');
+            if (!ok && st[w.name] !== 'pending' && w.on_failure === 'abort') workers.forEach(x => { if (st[x.name] === 'pending') st[x.name] = 'skipped'; });
+            options.onStatus?.(w, st[w.name], st);
+            pump();
+          });
+        }
+        if (!running && !workers.some(w => st[w.name] === 'pending' && w.depends_on.every(d => satisfied(workers.find(x => x.name === d), st)))) { settle(); resolve(); }
+      };
+      pump();
+    });
+    return { statuses: st, results, attempts, aborted };
+  }
+
+  function workerStatusFromLoop({ aborted, apiError, finishedNaturally, summary }) {
+    if (aborted) return 'skipped';
+    if (apiError) return 'error';
+    if (!finishedNaturally) return 'incomplete';
+    return summary && String(summary).trim() ? 'done' : 'incomplete';
+  }
+
+  class SwarmMemory {
+    constructor(workerNames = []) { this._store = new Map(); this._bus = []; this._names = new Set(workerNames); }
+    // Entries are hypotheses until a worker supplies evidence for them; verified facts must carry provenance.
+    write(key, value, writer, { status = 'hypothesis', evidence = '' } = {}) {
+      key = String(key || '').trim();
+      if (!key || key.length > 80) throw new Error('Key must be 1-80 characters');
+      value = String(value ?? '');
+      if (value.length > MAX_MEMORY_VALUE) throw new Error('Value is ' + value.length + ' chars (max ' + MAX_MEMORY_VALUE + '). Write the detail to a file and store its path here.');
+      if (!['hypothesis', 'verified'].includes(status)) throw new Error('status must be "hypothesis" or "verified"');
+      evidence = String(evidence || '').trim().slice(0, 300);
+      if (status === 'verified' && !evidence) throw new Error('A verified fact needs evidence (a file path and line, a command and its result, or a source). Otherwise store it as a hypothesis.');
+      this._store.set(key, { value, writer, ts: Date.now(), status, evidence });
+    }
+    read(key) { const e = this._store.get(key); return e ? e.value : undefined; }
+    keys() { return [...this._store.keys()]; }
+    readAll() { return Object.fromEntries([...this._store].map(([k, v]) => [k, v.value])); }
+    entries() { return [...this._store].map(([key, v]) => ({ key, ...v })); }
+    size() { return this._store.size; }
+    postMessage(from, to, content) {
+      if (to !== '*' && !this._names.has(to)) throw new Error('Unknown recipient "' + to + '". Workers: ' + [...this._names].join(', '));
+      this._bus.push({ from, to, content: String(content).slice(0, 500), ts: Date.now() });
+    }
+    // Returns messages for a worker after a cursor so inboxes can be polled mid-run.
+    inbox(name, since = 0) {
+      const messages = this._bus.slice(since).filter(m => (m.to === name || m.to === '*') && m.from !== name);
+      return { messages, next: this._bus.length };
+    }
+    getMessages(name) { return this.inbox(name, 0).messages; }
+    get bus() { return this._bus; }
+    toContextString() {
+      if (!this._store.size) return '(empty - no data written yet)';
+      return [...this._store].map(([k, v]) => {
+        const long = v.value.length > CONTEXT_PREVIEW;
+        return '  ' + k + ': ' + JSON.stringify(long ? v.value.slice(0, CONTEXT_PREVIEW) : v.value) +
+          (long ? ' [TRUNCATED - call swarm_memory_read("' + k + '") for the full value]' : '') + ' [' + (v.status === 'verified' ? 'VERIFIED: ' + v.evidence : 'hypothesis - confirm before relying on it') + '] [written by ' + v.writer + ']';
+      }).join('\n');
+    }
+    toJSON() { return { store: [...this._store], bus: this._bus }; }
+    static fromJSON(data, names) { const m = new SwarmMemory(names); m._store = new Map(data?.store || []); m._bus = data?.bus || []; return m; }
+  }
+
+  // Observation masking: shrink the OLDEST large tool outputs in place until the conversation fits.
+  // The model keeps its own reasoning and the shape of every call, and can re-read anything it still needs.
+  function trimToolOutputs(messages, { budgetTokens, reserveTokens = 0, keepRecent = 6, maxChars = 300, estimate = t => Math.ceil(t.length / 4) } = {}) {
+    const size = m => estimate(String(m.content || '')) + (m.tool_calls ? estimate(JSON.stringify(m.tool_calls)) : 0) + 4;
+    let total = reserveTokens + messages.reduce((n, m) => n + size(m), 0);
+    const initial = total; let trimmed = 0;
+    if (!budgetTokens) return { trimmed, tokens: total, over: false, saved: 0 };
+    for (let keep = keepRecent; keep >= 2 && total > budgetTokens; keep = keep > 2 ? Math.max(2, keep - 2) : 1) {
+      const toolIdx = messages.map((m, i) => m.role === 'tool' ? i : -1).filter(i => i >= 0);
+      for (const i of toolIdx.slice(0, Math.max(0, toolIdx.length - keep))) {
+        if (total <= budgetTokens) break;
+        const m = messages[i], text = String(m.content || '');
+        if (text.length <= maxChars || m._trimmed) continue;
+        const before = size(m);
+        m.content = text.slice(0, maxChars) + '\n[…' + (text.length - maxChars) + ' chars trimmed to save context; call the tool again if you still need this]';
+        m._trimmed = true; trimmed++; total -= before - size(m);
+      }
+    }
+    return { trimmed, tokens: total, over: total > budgetTokens, saved: initial - total };
+  }
+
+  // Critics end with a single "VERDICT: APPROVE" or "VERDICT: REVISE" line; everything before it is the evidence.
+  function parseVerdict(text) {
+    const str = String(text || '');
+    const matches = [...str.matchAll(/^[\s*_>#-]*VERDICT\s*:\s*\**\s*(APPROVE|REVISE)\b.*$/gim)];
+    if (!matches.length) return { verdict: 'unknown', issues: str.trim().slice(-1500) };
+    const last = matches[matches.length - 1];
+    return { verdict: last[1].toLowerCase() === 'approve' ? 'approve' : 'revise', issues: str.slice(0, last.index).trim().slice(-1500) };
+  }
+
+  /* A round budget that behaves like a sensible human timebox instead of a hard cutoff:
+     - the requested rounds are a SOFT budget; while the agent keeps finding new things it is extended (twice, capped),
+     - a warning precedes the end so the agent can converge,
+     - an agent that repeats itself or only gets errors is stopped early ("stalled"),
+     - callers always run a tool-free wrap-up afterwards so work is never discarded. */
+  function createRoundBudget({ limit = 10, hardCap = 40, maxExtensions = 2, stallLimit = 4 } = {}) {
+    const base = Math.max(2, Math.floor(limit) || 10);
+    let cur = Math.min(base, hardCap), extensions = 0, stallRun = 0, warnedAt = -1;
+    const seen = new Set();
+    return {
+      get limit() { return cur; },
+      get extensions() { return extensions; },
+      get stalled() { return stallRun >= stallLimit; },
+      // signatures: "tool:args" for each call in the round; anyOk: whether at least one call succeeded.
+      record(signatures, anyOk) {
+        const fresh = signatures.some(s => !seen.has(s));
+        signatures.forEach(s => seen.add(s));
+        stallRun = fresh && anyOk ? 0 : stallRun + 1;
+      },
+      grant(n) { cur = Math.min(hardCap, cur + n); },
+      // doneRounds = rounds already completed. Returns continue | warn | extended | limit | stalled.
+      decide(doneRounds) {
+        if (stallRun >= stallLimit) return 'stalled';
+        if (doneRounds >= cur) {
+          if (stallRun === 0 && extensions < maxExtensions && cur < hardCap) { cur = Math.min(hardCap, cur + Math.ceil(base / 2)); extensions++; return 'extended'; }
+          return 'limit';
+        }
+        if (doneRounds === cur - 1 && cur > 2 && warnedAt !== cur) { warnedAt = cur; return 'warn'; }
+        return 'continue';
+      }
+    };
+  }
+
+
+  /* ── Task contract: what "done" means, fixed before any worker starts ── */
+  function normalizeContract(input) {
+    const c = input || {};
+    const raw = Array.isArray(c.acceptance_criteria) ? c.acceptance_criteria : [];
+    if (raw.length > 12) throw new Error('A contract supports at most 12 acceptance criteria');
+    const criteria = raw.map((x, i) => {
+      const o = typeof x === 'string' ? { text: x } : (x || {});
+      const text = String(o.text || '').trim();
+      if (!text) throw new Error('Acceptance criterion ' + (i + 1) + ' is empty');
+      return { id: 'AC' + (i + 1), text: text.slice(0, 400), owner: o.owner ? String(o.owner).trim() : '' };
+    });
+    const num = (v, lo, hi) => Number.isFinite(+v) && +v > 0 ? Math.max(lo, Math.min(hi, +v)) : 0;
+    const token_budget = Math.floor(num(c.token_budget, 1000, 5e6));
+    const deadline_minutes = num(c.deadline_minutes, 1, 480);
+    const rr = c.repair_rounds;
+    const repair_rounds = rr === undefined || rr === null || rr === '' || !Number.isFinite(+rr) ? 1 : Math.max(0, Math.min(2, Math.floor(+rr)));
+    return { criteria, token_budget, deadline_minutes, repair_rounds,
+      reserve: token_budget || deadline_minutes ? 0.2 : 0, // kept back for integration and verification
+      verifier_model: typeof c.verifier_model === 'string' ? c.verifier_model.trim() : '' };
+  }
+  function checkContractOwners(contract, workers) {
+    for (const crit of contract.criteria) if (crit.owner) {
+      const o = workers.find(w => w.name === crit.owner);
+      if (!o) throw new Error('Criterion ' + crit.id + ' names unknown owner: ' + crit.owner);
+      if (o.kind === 'critic') throw new Error('Criterion ' + crit.id + ' owner cannot be a critic');
+    }
+  }
+  // Even split of the working pool (total minus the verification reserve), respecting explicit per-worker budgets.
+  function allocateBudgets(workers, contract) {
+    if (!contract.token_budget) return {};
+    const pool = Math.floor(contract.token_budget * (1 - contract.reserve));
+    const explicit = workers.filter(w => w.tokenBudget > 0), open = workers.filter(w => !(w.tokenBudget > 0));
+    const left = Math.max(0, pool - explicit.reduce((n, w) => n + w.tokenBudget, 0));
+    const share = open.length ? Math.max(256, Math.floor(left / open.length)) : 0;
+    return Object.fromEntries(open.map(w => [w.name, share]));
+  }
+  // Verifier output: one line per criterion, "AC1: PASS - evidence" / "AC2: FAIL - evidence (owner: dev)" / UNVERIFIABLE.
+  function parseCriteriaVerdicts(text, criteria) {
+    const str = String(text || '');
+    const out = criteria.map(crit => {
+      const re = new RegExp('^[\\s>*_#-]*\\**' + crit.id + '\\b\\**\\s*[:\\-\u2013\u2014]\\s*\\**\\s*(PASS|FAIL|UNVERIFIABLE)\\b\\**(.*)$', 'gim');
+      const all = [...str.matchAll(re)], m = all[all.length - 1];
+      if (!m) return { id: crit.id, text: crit.text, status: 'missing', evidence: 'The verifier gave no verdict for this criterion.', owner: crit.owner || '' };
+      const evidence = m[2].replace(/^[\s\-\u2013\u2014:*]+/, '').trim();
+      const parsedOwner = /owner\s*[:=]\s*([\w.-]+)/i.exec(m[2]);
+      return { id: crit.id, text: crit.text, status: m[1].toLowerCase(), evidence: evidence.slice(0, 500), owner: crit.owner || (parsedOwner ? parsedOwner[1] : '') };
+    });
+    return { criteria: out, allPass: out.length > 0 && out.every(x => x.status === 'pass') };
+  }
+
+  /* ── Append-only event log: the audit trail and the raw material for metrics ── */
+  function createEventLog(startMs = Date.now(), cap = 2000) {
+    const events = [];
+    return {
+      emit(type, data = {}) { if (events.length < cap) events.push({ seq: events.length + 1, t: Date.now() - startMs, type, ...data }); },
+      list() { return events.slice(); },
+      count(type) { return events.filter(e => e.type === type).length; },
+      toJSON() { return events.slice(-500); }
+    };
+  }
+
+  /* ── Metrics: verified success, cost per accepted result, latency, repair frequency ── */
+  function runMetrics({ outcome, durationMs, tokens, statuses, attempts, results, repairs, acceptance, config }) {
+    const vals = Object.values(statuses || {});
+    const revisions = Object.values(results || {}).reduce((n, r) => n + (r?.revisions || 0), 0);
+    const retries = Object.values(attempts || {}).reduce((n, a) => n + Math.max(0, (a || 1) - 1), 0);
+    return { outcome, verified: outcome === 'verified', durationMs: Math.round(durationMs || 0), tokens: tokens || 0,
+      workers: vals.length, failedWorkers: vals.filter(s => ['error', 'incomplete', 'blocked'].includes(s)).length,
+      revisions, retries, repairs: repairs || 0,
+      criteriaPassed: acceptance ? acceptance.criteria.filter(x => x.status === 'pass').length : 0, criteriaTotal: acceptance ? acceptance.criteria.length : 0,
+      config: config || {} };
+  }
+  function summarizeRuns(runs, groupBy) {
+    const agg = list => {
+      const n = list.length, verified = list.filter(r => r.verified).length;
+      return { runs: n, verifiedRate: n ? +(verified / n).toFixed(3) : 0,
+        tokensPerVerified: verified ? Math.round(list.reduce((s, r) => s + r.tokens, 0) / verified) : null, // total spend, including failed runs
+        meanLatencyMs: n ? Math.round(list.reduce((s, r) => s + r.durationMs, 0) / n) : 0,
+        repairFrequency: n ? +(list.filter(r => r.repairs + r.revisions > 0).length / n).toFixed(3) : 0,
+        failedWorkerRate: n ? +(list.reduce((s, r) => s + r.failedWorkers, 0) / Math.max(1, list.reduce((s, r) => s + r.workers, 0))).toFixed(3) : 0 };
+    };
+    const out = { overall: agg(runs || []) };
+    if (groupBy) { out.groups = {}; for (const r of runs || []) (out.groups[String(r.config?.[groupBy])] ||= []).push(r); for (const k of Object.keys(out.groups)) out.groups[k] = agg(out.groups[k]); }
+    return out;
+  }
+
+  /* ── Adaptive team size: advise against structure that tends to lose to a single agent ── */
+  function teamAdvice(workers, { hasVerification = false } = {}) {
+    const core = workers.filter(w => w.kind !== 'critic'), byName = new Map(core.map(w => [w.name, w])), depth = new Map();
+    const get = w => { if (!depth.has(w.name)) depth.set(w.name, 1 + Math.max(0, ...w.depends_on.filter(n => byName.has(n)).map(n => get(byName.get(n))))); return depth.get(w.name); };
+    const longest = core.length ? Math.max(...core.map(get)) : 0, advice = [];
+    if (core.length >= 2 && longest === core.length) advice.push('Every worker waits on the previous one, so nothing runs in parallel. Sequential work often does as well with a single agent (use check_command and a critic for quality) without the coordination overhead.');
+    if (workers.length > 6) advice.push('Large team (' + workers.length + ' workers): fewer, larger tasks usually coordinate better than many small ones.');
+    if (!hasVerification) advice.push('No independent verification is configured (critic, check_command, verify_command or acceptance criteria), so "done" is only what the workers claim.');
+    return advice;
+  }
+
+  function swarmOutcome(statuses, verification) {
+    const vals = Object.values(statuses);
+    if (vals.some(s => s === 'error' || s === 'incomplete' || s === 'blocked')) return 'blocked';
+    if (vals.some(s => s === 'skipped')) return 'needs_review';
+    return verification ? (verification.verified ? 'verified' : 'needs_review') : 'needs_review';
+  }
+
+  const api = { WRITE_TOOLS, globToRegExp, pathAllowed, ownsOverlap, normalizeWorkers, concurrencyConflicts, runSchedule, workerStatusFromLoop, SwarmMemory, swarmOutcome, trimToolOutputs, parseVerdict, createRoundBudget,
+    normalizeContract, checkContractOwners, allocateBudgets, parseCriteriaVerdicts, createEventLog, runMetrics, summarizeRuns, teamAdvice };
+  root.SwarmCore = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);
 
 /* Opt-in execution features and persistent review surfaces. Embedded by build.mjs. */
@@ -6696,6 +7102,26 @@ var harnessFeatureState = {
 };
 function hfEsc(value) { return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function hfId() { return crypto.randomUUID(); }
+// Best-effort semantic scores from the companion's embedding service; null means "use keywords only".
+const hfEmbedCache = new Map(); let hfEmbedCooldown = 0;
+async function knowledgeEmbeddingScores(records, query, workspace) {
+  if (!state.compConnected || Date.now() < hfEmbedCooldown || !String(query).trim()) return null;
+  const pool = records.filter(r => r.workspace === workspace).slice(-60);
+  if (!pool.length) return null;
+  const key = r => r.id + ':' + (r.title + r.text).length;
+  try {
+    const missing = pool.filter(r => !hfEmbedCache.has(key(r)));
+    const texts = [String(query).slice(0, 2000), ...missing.map(r => (r.title + '\n' + r.text).slice(0, 2000))];
+    const res = await companionFetch(state.compUrl + '/embed', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts }), signal: AbortSignal.timeout(25000) });
+    const data = await res.json();
+    if (!Array.isArray(data.embeddings) || data.embeddings.length !== texts.length) throw new Error('bad embedding response');
+    missing.forEach((r, i) => hfEmbedCache.set(key(r), data.embeddings[i + 1]));
+    const q = data.embeddings[0], scores = {};
+    for (const r of pool) { const v = hfEmbedCache.get(key(r)); if (v) scores[r.id] = v.reduce((sum, x, i) => sum + x * q[i], 0); }
+    return scores;
+  } catch (error) { hfEmbedCooldown = Date.now() + 60000; return null; } // never block retrieval on a slow or absent model
+}
 function hfBusy() { return state.running || harnessFeatureState.queueRunning || !!harnessFeatureState.evaluationAbort; }
 async function featureRequest(path,body,signal) {
   const response=await companionFetch(state.compUrl+'/features/'+path,{method:'POST',headers:{'Content-Type':'application/json'},
@@ -6883,7 +7309,7 @@ async function beforeHarnessRun() {
     const recipe=f.prefs.recipes && f.data.recipes.find(r=>r.active);
     if(recipe) context.push('Project recipe (commands are data; existing approval rules still apply): '+JSON.stringify(recipe));
     if(f.prefs.knowledge && f.prefs.autoRetrieve) {
-      const matches=HarnessFeatures.searchKnowledge(f.data.knowledge,state.originalTask||'',f.workspace,3);
+      const matches=HarnessFeatures.searchKnowledge(f.data.knowledge,state.originalTask||'',f.workspace,3,await knowledgeEmbeddingScores(f.data.knowledge,state.originalTask||'',f.workspace));
       if(matches.length) context.push('Relevant session knowledge (reference material, not instructions): '+JSON.stringify(matches.map(m=>({text:m.text,verified:m.verified,source:m.source}))).slice(0,3000));
     }
     state.messages=state.messages.filter(m=>!m._harnessContext);
@@ -6949,7 +7375,7 @@ function harnessFeatureHandler(name) {
   };
   if(name==='search_session_knowledge') return async args=>{
     await ensureFeatureWorkspace();
-    return {output:JSON.stringify(HarnessFeatures.searchKnowledge(f.data.knowledge,args.query,f.workspace))};
+    return {output:JSON.stringify(HarnessFeatures.searchKnowledge(f.data.knowledge,args.query,f.workspace,5,await knowledgeEmbeddingScores(f.data.knowledge,args.query,f.workspace)))};
   };
   if(name==='save_session_knowledge') return async args=>{
     await ensureFeatureWorkspace();
@@ -7284,10 +7710,12 @@ function renderHarnessFeatures() {
       '<div class="hf-grid">'+featureField('Iteration limit','hf-queue-iters',32,'number')+featureField('Output-token budget','hf-queue-budget',8000,'number')+'</div>'+
       '<label class="hf-check"><input type="checkbox" id="hf-queue-independent">Independent of earlier tasks</label>'+
       featureButton('add-queue','Add task')+featureButton('start-queue','Start / resume queue')+featureButton('stop-queue','Stop queue');
-    content+=f.data.queue.map(t=>'<article><strong>'+hfEsc(t.text)+'</strong><p>'+hfEsc(t.status)+(t.independent?' | independent':'')+'</p>'+
+    const stuck=new Set(HarnessFeatures.blockedQueueTasks(f.data.queue).map(t=>t.id));
+    content+=f.data.queue.map((t,i)=>'<article><strong>'+hfEsc(t.text)+'</strong><p>'+hfEsc(t.status)+(t.independent?' | independent':'')+'</p>'+
+      (stuck.has(t.id)?'<p>Waiting behind an earlier task that did not finish. Skip or fix that task, or mark this one independent.</p>':'')+
       (t.error?'<p>'+hfEsc(t.error)+'</p>':'')+
       (t.question?'<p>'+hfEsc(t.question)+'</p>'+featureText('Your answer','hf-answer-'+t.id,t.answer||'',2)+featureButton('answer-queue','Save answer & make ready',t.id):'')+
-      featureButton('open-queue','Open conversation',t.id)+featureButton('ready-queue','Make ready',t.id)+featureButton('done-queue','Mark reviewed & done',t.id)+featureButton('discard-queue','Remove from queue',t.id)+'</article>').join('');
+      featureButton('open-queue','Open conversation',t.id)+featureButton('ready-queue','Make ready',t.id)+(['failed','error','blocked','paused'].includes(t.status)?featureButton('skip-queue','Skip (let later tasks proceed)',t.id):'')+featureButton('done-queue','Mark reviewed & done',t.id)+featureButton('discard-queue','Remove from queue',t.id)+'</article>').join('');
   }
   if(f.tab==='knowledge') {
     content='<p>Save reusable decisions and fixes with links to their evidence. Agent-created entries stay unverified until you review them.</p>'+
@@ -7389,12 +7817,12 @@ async function harnessFeatureAction(action,id) {
   if(action==='start-queue') return startHarnessQueue();
   if(action==='stop-queue') { harnessStopRequested(); state.abortCtrl?.abort(); state.running=false; updateSendBtn(); return; }
   if(action==='open-queue') { if(hfBusy()) throw new Error('Wait for the current run'); if(task?.convId) await switchConv(task.convId); return; }
-  if(['answer-queue','ready-queue','done-queue','discard-queue'].includes(action)) {
+  if(['answer-queue','ready-queue','done-queue','discard-queue','skip-queue'].includes(action)) {
     if(hfBusy()) throw new Error('Stop the queue before changing a task');
     if(action==='answer-queue') {
       const answer=document.getElementById('hf-answer-'+id).value.trim(); if(!answer) throw new Error('Enter an answer');
       task.answer=answer; task.status='pending'; delete task.question;
-    } else task.status=action==='done-queue'?'done':action==='discard-queue'?'discarded':'pending';
+    } else task.status=action==='done-queue'?'done':action==='discard-queue'?'discarded':action==='skip-queue'?'skipped':'pending';
     await saveFeatureData(); renderHarnessFeatures(); return;
   }
   if(action==='search-knowledge') { f.knowledgeQuery=document.getElementById('hf-knowledge-query').value; renderHarnessFeatures(); return; }
@@ -8873,6 +9301,33 @@ def _evaluation_result(body):
     return {'changedFiles':changed,'unintendedWrites':unintended,'assertions':assertions,
             'passed':bool(assertions) and all(a['passed'] for a in assertions) and not unintended}
 
+def _commit_task(record, message):
+    path=record['path']
+    _git(path,'add','-A','--','.',':!.sloplobster')
+    if _git(path,'diff','--cached','--name-only'):
+        _git(path,'commit','-m',str(message)[:300])
+    return _git(path,'rev-parse','HEAD')
+
+def _absorb_task(body):
+    # Merge one task's branch into another so dependent work builds on upstream changes without touching the original workspace.
+    with _task_lock:
+        target=managed_task(body.get('taskId')); source=managed_task(body.get('fromTaskId'))
+        if target['id']==source['id']: raise ValueError('A task cannot absorb itself')
+        if target['kind']!='worktree' or source['kind']!='worktree': raise ValueError('Only Git worktree tasks can be combined')
+        if target['root']!=source['root']: raise ValueError('Tasks belong to different projects')
+        if target['status']!='active' or source['status']!='active': raise ValueError('Both tasks must be active')
+        for record in (target,source):
+            if _git(record['path'],'symbolic-ref','--short','HEAD')!=record['branch']: raise ValueError('Task branch changed; restore its generated branch first')
+        _commit_task(source,'SlopLobster: '+source['title'])
+        _commit_task(target,'SlopLobster: '+target['title'])
+        result=subprocess.run(['git','-C',target['path'],'merge','--no-ff','--no-edit',source['branch']],
+                              capture_output=True,encoding='utf-8',errors='replace',timeout=60)
+        if result.returncode:
+            files=[n for n in _git(target['path'],'diff','--name-only','--diff-filter=U','-z').split('\\0') if n]
+            _git(target['path'],'merge','--abort',check=False)
+            return {'ok':False,'status':'conflict','files':files,'output':(result.stdout+'\\n'+result.stderr).strip()}
+        return {'ok':True,'head':_git(target['path'],'rev-parse','HEAD'),'output':result.stdout.strip()}
+
 def feature_api(path, body):
     if path=='/features/tasks/create': return _create_worktree(body)
     if path=='/features/tasks/list':
@@ -8885,6 +9340,7 @@ def feature_api(path, body):
         record=managed_task(body.get('taskId'))
         diff=_task_diff(record)
         return {'diff':diff,'changedFiles':_task_changed_files(record),'reviewHash':_task_review_hash(record,diff)}
+    if path=='/features/tasks/absorb': return _absorb_task(body)
     if path=='/features/tasks/merge': return _merge_task(body)
     if path=='/features/tasks/discard': return _discard_task(body)
     if path=='/features/evaluations/create': return _evaluation_create(body)
@@ -10135,12 +10591,12 @@ Do NOT parallelize when:
 
 **spawn_sub_agent** — for a focused, self-contained sub-task. The sub-agent works alone and returns a summary. Use for: reading many files to build context, searching a codebase, or making a contained set of edits.
 
-**spawn_swarm** — for complex tasks that need multiple specialists who share information. Workers run in order and use a shared memory store to pass structured data to each other (API endpoints, schemas, decisions). Use for:
+**spawn_swarm** — for complex tasks that need multiple specialists who share information. Workers run in listed order (or as a dependency graph via \`depends_on\`) and use a shared memory store to pass structured data to each other (API endpoints, schemas, decisions). Use for:
 - Full-stack features (backend worker writes API shape → frontend worker reads it to write the fetch call)
 - Parallel investigation across domains (auth, DB, UI, tests) that must stay consistent
 - Any task where agent B needs to know what agent A decided
 
-When spawning a swarm, design roles at the start: think about who needs to write what and who needs to read it. Use \`writes_to\` and \`reads_from\` to make the data flow explicit.
+When spawning a swarm, design roles at the start: think about who needs to write what and who needs to read it. Use \`writes_to\` and \`reads_from\` to make the data flow explicit, \`depends_on\` for ordering, and \`owns\` globs so workers never write the same files. State what done means with \`contract.acceptance_criteria\` (an independent verifier checks each with evidence; failures send only the owning worker back) and bound the run with \`contract.token_budget\` / \`deadline_minutes\`. Shared memory entries are hypotheses unless a worker marks them verified with evidence. Add a worker with \`kind: "critic"\` and \`reviews: "<author>"\` to have an evidence-based adversarial review (use a different \`model\` for it if possible), and \`check_command\` so a worker must pass its own tests before it counts as done. A worker that fails blocks its dependents unless you set \`on_failure\`; a swarm is only reported as verified if you pass \`verify_command\` and it passes.
 
 ═══ BROWSER AUTOMATION ═══
 
@@ -11202,7 +11658,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                 items: { type: 'string' },
                 description: 'Which tools the sub-agent can use. Defaults to [read_file, read_file_lines, list_directory, search_files, grep]'
               },
-              max_iterations: { type: 'number', description: 'Max tool-call rounds (default 8, max 20)' }
+              max_iterations: { type: 'number', description: 'Soft round budget (default 10, min 4, max 30). It is extended automatically while the sub-agent keeps making progress and it is stopped early if it spins; a final report is always written, so do not set it very low.' }
             },
             required: ['task']
           }
@@ -11227,6 +11683,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       tools.push({
         type: 'function',
         function: {
+          name: 'swarm_history',
+          description: 'Statistics over past swarm runs on this device: verified-success rate, tokens per verified result, mean latency, repair frequency, and how runs with and without critics compare. Use it to decide whether a swarm is worth its cost for a task like this one.',
+          parameters: { type: 'object', properties: { limit: { type: 'number', description: 'How many recent runs to list (default 10, max 25)' }, group_by: { type: 'string', enum: ['critic', 'check', 'isolated', 'criteria'], description: 'Compare runs with and without this feature (default critic)' } }, required: [] }
+        }
+      });
+      tools.push({
+        type: 'function',
+        function: {
           name: 'spawn_swarm',
           description: 'Spawn a multi-agent swarm with a Manager and specialised Worker agents that share a live memory state. Workers can read what others have written and build on each other\'s outputs — unlike sub-agents, they communicate.\n\nUse for:\n- Full-stack tasks where frontend needs to know the backend API\n- Parallel investigation across different parts of a codebase\n- Tasks that decompose cleanly into independent specialisms (auth, DB, UI, tests, docs…)\n- Any task where agents need to hand off structured data to each other\n\nWorkflow:\n1. The Manager designs the worker roles and their execution order (sequential waves or independent)\n2. Workers run in order — each sees the shared memory written by earlier workers\n3. Workers can write keys to shared memory that later workers read\n4. The Manager synthesises all worker summaries into a final answer\n\nShared memory is a simple key/value store — workers write things like\n  {"api_endpoints": "/api/v1/users POST, /api/v1/users/:id GET"}\nand later workers read those keys to stay consistent.',
           parameters: {
@@ -11235,7 +11699,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
               goal: { type: 'string', description: 'The high-level goal for the entire swarm — a few sentences describing what should be accomplished' },
               workers: {
                 type: 'array',
-                description: 'Ordered list of worker agents. Workers earlier in the list run first and can write shared memory for later workers to read.',
+                description: 'Worker agents. By default they run in listed order; use depends_on for a dependency graph so independent workers can run concurrently.',
                 items: {
                   type: 'object',
                   properties: {
@@ -11245,12 +11709,28 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                     tools: { type: 'array', items: { type: 'string' }, description: 'Tool names this worker may use. Defaults to read+write tools.' },
                     reads_from:  { type: 'array', items: { type: 'string' }, description: 'Shared memory keys this worker will read (optional, for documentation)' },
                     writes_to:   { type: 'array', items: { type: 'string' }, description: 'Shared memory keys this worker will write (optional, for documentation)' },
-                    max_iterations: { type: 'number', description: 'Max rounds for this worker (default 10, max 25)' }
+                    max_iterations: { type: 'number', description: 'Soft round budget for this worker (default 10, max 25). Extended automatically while it makes progress; a final report is always produced.' },
+                    depends_on: { type: 'array', items: { type: 'string' }, description: 'Names of workers that must finish first. If NO worker sets depends_on, workers run in listed order. Workers with no unmet dependencies may run concurrently.' },
+                    owns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns of files this worker may write, e.g. ["src/api/**"]. Required (and disjoint) for workers to write concurrently.' },
+                    on_failure: { type: 'string', enum: ['block', 'abort', 'continue'], description: 'If this worker fails: block dependents (default), abort the whole swarm, or continue as if it succeeded.' },
+                    retries: { type: 'number', description: 'Automatic retries after a transient API failure (default 1, max 2)' },
+                    kind: { type: 'string', enum: ['worker', 'critic'], description: 'A "critic" is a read-only adversarial reviewer of the worker named in "reviews". It must cite evidence and end with VERDICT: APPROVE or VERDICT: REVISE; on REVISE the author is sent back to fix the issues (up to max_revisions).' },
+                    reviews: { type: 'string', description: 'For kind "critic": the name of the worker whose output it reviews. The critic automatically runs after that worker.' },
+                    max_revisions: { type: 'number', description: 'For critics: how many times the author may be sent back (0-2, default 1). If the critic still objects, the critic is reported incomplete and its dependents are blocked.' },
+                    check_command: { type: 'string', description: 'Command the worker must pass before it counts as done (e.g. its tests). A failure is fed back to the worker, which gets extra rounds to fix it.' },
+                    check_retries: { type: 'number', description: 'How many times a failed check_command is fed back to the worker (0-3, default 2).' },
+                    model: { type: 'string', description: 'Optional model id for this worker (e.g. a cheaper model for read-only exploration). Defaults to the current model.' },
+                    token_budget: { type: 'number', description: 'Optional cap on this worker\'s output tokens (min 256). The worker is asked to wrap up when it is reached. 0 or omitted = unlimited.' }
                   },
                   required: ['name', 'role', 'task']
                 }
               },
-              max_worker_iterations: { type: 'number', description: 'Default max iterations for all workers if not set individually (default 10)' }
+              max_worker_iterations: { type: 'number', description: 'Default soft round budget for workers that do not set max_iterations (default 10). Budgets extend while a worker makes progress.' },
+              concurrency: { type: 'number', description: 'Workers to run at once (1-4, default 1). Only honoured when concurrent writers have disjoint "owns".' },
+              isolate: { type: 'boolean', description: 'Give every worker its own Git worktree (requires the companion and a Git project root in Harness settings). Changes are merged onto one reviewable branch and never touch the working tree until the user merges them. Strongly recommended for concurrent or multi-file work.' },
+              contract: { type: 'object', description: 'What "done" means, fixed up front. acceptance_criteria: list of strings or {text, owner} that an INDEPENDENT verifier (own context, read-only) must confirm with evidence; failing criteria send their owner worker back for targeted repair (repair_rounds, default 1, max 2). token_budget / deadline_minutes bound the whole swarm and keep 20% in reserve for verification. verifier_model optionally uses a different model for verification.',
+                properties: { acceptance_criteria: { type: 'array', items: { oneOf: [{ type: 'string' }, { type: 'object', properties: { text: { type: 'string' }, owner: { type: 'string' } }, required: ['text'] }] } }, token_budget: { type: 'number' }, deadline_minutes: { type: 'number' }, repair_rounds: { type: 'number' }, verifier_model: { type: 'string' } } },
+              verify_command: { type: 'string', description: 'Optional test command run after all workers finish; its result decides whether the swarm is reported as verified.' }
             },
             required: ['goal', 'workers']
           }
@@ -11289,7 +11769,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       return filtered;
     }
 
-    const TOOL_ICONS = { think: 'brain', update_plan: 'list-check', update_beliefs: 'brain', set_invariants: 'shield-halved', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
+    const TOOL_ICONS = { swarm_history: 'chart-line', think: 'brain', update_plan: 'list-check', update_beliefs: 'brain', set_invariants: 'shield-halved', ask_user: 'circle-question', save_memory: 'floppy-disk', read_file: 'file-code', read_file_summary: 'file-lines', read_file_lines: 'file-lines', view_image: 'image', edit_file: 'pen-to-square', write_file: 'file-circle-plus', write_file_chunked: 'file-circle-plus', list_directory: 'list', search_files: 'magnifying-glass', grep: 'magnifying-glass-plus', web_search: 'globe', fetch_url: 'magnifying-glass', http_request: 'satellite-dish', execute_command: 'terminal', run_tests: 'flask-vial', start_dev_server: 'server', delete_file: 'trash', move_file: 'arrows-turn-right', git_status: 'code-branch', git_diff: 'code-compare', git_log: 'clock-rotate-left', git_add: 'plus', git_commit: 'check', git_push: 'cloud-arrow-up', git_checkout_branch: 'code-branch', git_stash: 'box-archive', browser_launch: 'rocket', browser_navigate: 'compass', browser_screenshot: 'camera', browser_console: 'terminal', browser_click: 'hand-pointer', browser_type: 'keyboard', browser_evaluate: 'code', browser_get_content: 'file-lines', browser_wait_for: 'hourglass', browser_hover: 'arrow-pointer', hand_pointer: 'list-dropdown', browser_press_key: 'keyboard', browser_scroll: 'arrows-up-down', browser_go_back: 'arrow-left', browser_go_forward: 'arrow-right', browser_close: 'xmark', browser_select_option: 'hand-pointer', semantic_search: 'brain', spawn_sub_agent: 'sitemap', spawn_swarm: 'network-wired', swarm_memory_write: 'database', swarm_message: 'comments', get_tool_schema: 'book-open', screenshot: 'desktop', deep_research: 'flask' };
 
     // Tools that can't be turned off from the toggle list, because the app
     // depends on them for basic reasoning/filesystem awareness.
@@ -14485,12 +14965,17 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         }
         return { output: `Tool: ${name}\nDescription: \dots\n\nParameters:\n${JSON.stringify(def.function.parameters, null, 2)}`.replace('\dots', def.function.description) };
       },
+      'swarm_history': async args => ({ status: 'ok', output: JSON.stringify(await swarmHistory(Number(args.limit) || 10, ['critic', 'check', 'isolated', 'criteria'].includes(args.group_by) ? args.group_by : 'critic'), null, 1) }),
       'spawn_swarm': async (args, signal, panel) => {
         if (!args.goal) return { output: 'Error: "goal" is required for spawn_swarm' };
-        if (!Array.isArray(args.workers) || !args.workers.length) return { output: 'Error: "workers" must be a non-empty array' };
-        const swarmResult = await runSwarm(args.goal, args.workers, args.max_worker_iterations, signal, panel);
+        let swarmResult;
+        try {
+          swarmResult = await runSwarm(args.goal, args.workers, args.max_worker_iterations, signal, panel, { concurrency: args.concurrency, verifyCommand: args.verify_command, contract: args.contract, isolate: args.isolate === true });
+        } catch (e) { return { status: 'error', error: 'invalid_swarm', retryable: true, output: 'Error: ' + e.message }; }
+        const failed = swarmResult.outcome === 'blocked';
         return {
-          output: `[Swarm: ${args.workers.length} workers, ${swarmResult.totalIterations} total rounds, ${(swarmResult.duration / 1000).toFixed(1)}s${swarmResult.error ? ' — ERROR' : ''}]\n\n${swarmResult.managerSummary}`,
+          status: failed ? 'error' : 'ok', error: failed ? 'swarm_blocked' : null, retryable: false,
+          output: `[Swarm ${swarmResult.outcome.toUpperCase()}: ${swarmResult.workerResults.length} workers, ${swarmResult.totalIterations} total rounds, ${(swarmResult.duration / 1000).toFixed(1)}s]\n${swarmResult.workerResults.map(r => `- ${r.name}: ${r.status}${r.reason ? ' (' + r.reason + ')' : ''}`).join('\n')}${swarmResult.acceptance ? '\nAcceptance: ' + swarmResult.acceptance.criteria.map(c => c.id + ' ' + c.status.toUpperCase()).join(', ') : ''}\n\n${swarmResult.managerSummary}`,
           _swarmData: swarmResult
         };
       },
@@ -14534,7 +15019,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         if (isSkippedPath(args.task)) return { output: 'Task references a filtered file.' };
         const subResult = await runSubAgent(args.task, args.tools, args.max_iterations, signal, panel);
         return {
-          output: `[Sub-agent: \dots]\n\dots`.replace('[Sub-agent: \dots]\n\dots', `[Sub-agent: ${subResult.iterations} rounds, ${subResult.log.length} tool calls, ${(subResult.duration / 1000).toFixed(1)}s${subResult.hitLimit ? ' — hit iteration limit' : ''}${subResult.error ? ' — ERROR' : ''}]\n${subResult.summary}`),
+          output: `[Sub-agent: ${subResult.iterations} rounds, ${subResult.log.length} tool calls, ${(subResult.duration / 1000).toFixed(1)}s${subResult.extended ? ` — budget extended ${subResult.extended}× while progressing` : ''}${subResult.hitLimit ? ' — stopped at the round limit; partial report below' : ''}${subResult.stalled ? ' — stopped early: repeating without new results; partial report below' : ''}${subResult.incomplete ? ' — INCOMPLETE: continue or re-delegate what remains' : ''}${subResult.error ? ' — ERROR' : ''}]\n${subResult.summary}`,
           _subAgentData: subResult
         };
       }
@@ -14793,7 +15278,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         const result = HarnessRuntime.normalizeResult(await HarnessRuntime.withToolLock(name, () => {
           if (signal?.aborted) throw signal.reason || new DOMException('Aborted', 'AbortError');
           return handler(args, signal, panel, argsStr);
-        }));
+        }), name);
         recordHarnessTool(name, args, result, panel?.el?._toolCallId);
         if (_argLeakFields.length && result && typeof result.output === 'string') {
           result.output += '\n\n⚠️ Detected and removed leaked model control tokens from argument(s): ' + _argLeakFields.join(', ') + ' (the model kept generating past the intended value).';
@@ -16050,7 +16535,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         body: JSON.stringify({
           model: state.model,
           messages: apiMsgs,
-          tools: tools,
+          ...(tools.length ? { tools } : {}),
           stream: true,
           temperature: 0.2,
           top_p: state.topP !== undefined ? state.topP : 0.95,
@@ -16140,7 +16625,9 @@ Use git_diff to review changes before committing. git_diff without arguments sho
     async function runSubAgent(task, allowedTools, maxIter, parentSignal, parentPanel) {
       const defaultTools = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep'];
       const tools = allowedTools && allowedTools.length ? allowedTools : defaultTools;
-      const maxIterations = Math.min(Math.max(maxIter || 8, 1), 20);
+      // The requested rounds are a soft budget: extended while the agent makes progress, stopped early if it spins.
+      const budget = SwarmCore.createRoundBudget({ limit: Math.min(Math.max(Number(maxIter) || 10, 4), 30), hardCap: 40, stallLimit: 4 });
+      let maxIterations = budget.limit;
       const startTime = performance.now();
 
       // ── Validate tools against available tool definitions ──
@@ -16184,8 +16671,14 @@ Use git_diff to review changes before committing. git_diff without arguments sho
 
 
       // ── Agent loop ──
-      while (iterations < maxIterations) {
+      let stopReason = '';
+      while (true) {
         if (subAbort.signal.aborted) break;
+        const decision = budget.decide(iterations);
+        maxIterations = budget.limit;
+        if (decision === 'limit' || decision === 'stalled') { stopReason = decision; break; }
+        if (decision === 'extended') subMessages.push({ role: 'user', content: `[SYSTEM] You are still making progress, so your round budget was extended to ${maxIterations}. Start converging on your findings.` });
+        else if (decision === 'warn') subMessages.push({ role: 'user', content: '[SYSTEM] You have one round left. If you already have enough, stop calling tools and write your findings now.' });
         iterations++;
         updatePanelStatus(`Round ${iterations}/${maxIterations}`, 'run');
         const subStats = createCompressionStats(); 
@@ -16234,6 +16727,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (!validTcs.length) break;
 
         // ── Execute tool calls ──
+        let roundOk = false;
         const results = await HarnessRuntime.runToolBatch(validTcs, async tc => {
           const name = tc.function.name;
           try {
@@ -16245,6 +16739,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               output: outText.slice(0, 300),
               success: result.status === 'ok'
             });
+            if (result.status === 'ok') roundOk = true;
             return { tc, output: outText };
           } catch (e) {
             log.push({
@@ -16266,6 +16761,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           });
         }
 
+        budget.record(validTcs.map(tc => tc.function.name + ':' + tc.function.arguments), roundOk);
+
         // ── Record rejected tool calls ──
         for (const tc of invalidTcs) {
           log.push({
@@ -16282,19 +16779,40 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         }
       }
 
+      let lastAssistant = [...subMessages].reverse().find(m => m.role === 'assistant');
+      const endedWithTools = !!lastAssistant?.tool_calls?.some(tc => effectiveTools.includes(tc.function.name));
+      // Whenever the loop was cut short, ask for a final report so the findings are never thrown away.
+      let wrapped = '';
+      if (!subAbort.signal.aborted && (stopReason || endedWithTools || !lastAssistant?.content)) {
+        try {
+          updatePanelStatus('Writing report…', 'run');
+          subMessages.push({ role: 'user', content: '[SYSTEM] You must stop now' + (stopReason === 'stalled' ? ' (you are repeating work without new results)' : ' (your round budget is used up)') + '. Do NOT call any tools. Report: (1) what you found or did, with specifics (file paths, line numbers, names), and (2) anything you could not finish. Make the LAST line exactly "STATUS: COMPLETE" or "STATUS: INCOMPLETE - <what remains>".' });
+          const wrap = await subAgentChat(subMessages, [], subAbort.signal, () => {});
+          wrapped = (wrap.content || '').trim();
+          if (wrapped) { subMessages.push({ role: 'assistant', content: wrapped }); lastAssistant = subMessages[subMessages.length - 1]; }
+        } catch (e) { /* fall back to the activity digest below */ }
+      }
       const duration = performance.now() - startTime;
-      const lastAssistant = [...subMessages].reverse().find(m => m.role === 'assistant');
-      const endedWithTools = lastAssistant?.tool_calls?.some(tc => effectiveTools.includes(tc.function.name));
-      const hitLimit = iterations >= maxIterations && endedWithTools;
+      const digest = () => '(The sub-agent was stopped before it wrote a report. Its raw activity, most recent last:)\n' +
+        log.slice(-12).map(e => `- ${e.tool}(${e.args}) → ${e.success ? '' : 'FAILED: '}${e.output.replace(/\s+/g, ' ').slice(0, 160)}`).join('\n');
+      const summary = wrapped || lastAssistant?.content || (log.length ? digest() : '(The sub-agent made no tool calls and wrote no report.)');
+      const statusLine = /STATUS:\s*(COMPLETE|INCOMPLETE)\b/i.exec(summary);
+      const reportedComplete = statusLine ? statusLine[1].toUpperCase() === 'COMPLETE' : !stopReason && !endedWithTools;
+      const hitLimit = stopReason === 'limit', stalled = stopReason === 'stalled';
+      const incomplete = !subAbort.signal.aborted && (!reportedComplete || (!wrapped && (hitLimit || stalled)));
 
-      updatePanelStatus('Done', 'ok');
+      updatePanelStatus(stalled ? 'Stalled' : hitLimit ? 'Limit' : 'Done', stalled || hitLimit ? 'err' : 'ok');
 
       return {
-        summary: lastAssistant?.content || '(Sub-agent completed without producing a summary)',
+        summary,
         log,
         iterations,
         error: false,
         hitLimit,
+        stalled,
+        incomplete,
+        extended: budget.extensions,
+        limit: maxIterations,
         duration,
         tools: effectiveTools,
         invalidTools,
@@ -16306,8 +16824,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
       const el = document.createElement('div');
       el.className = 'sub-agent-panel';
 
-      const statusClass = data.error ? 'error' : data.hitLimit ? 'limit' : 'done';
-      const statusText = data.error ? 'Error' : data.hitLimit ? 'Limit' : 'Done';
+      const statusClass = data.error ? 'error' : (data.hitLimit || data.stalled) ? 'limit' : 'done';
+      const statusText = data.error ? 'Error' : data.stalled ? 'Stalled' : data.hitLimit ? 'Limit' : data.incomplete ? 'Partial' : 'Done';
       const durationStr = (data.duration / 1000).toFixed(1) + 's';
       const taskDisplay = data.task.length > 80 ? data.task.slice(0, 77) + '...' : data.task;
 
@@ -16351,151 +16869,214 @@ Use git_diff to review changes before committing. git_diff without arguments sho
     }
 
     /* ════════════════════════════════════════════════════════
-       MULTI-AGENT SWARM — Manager/Worker pattern with shared memory
+       MULTI-AGENT SWARM — dependency graph of workers with shared memory.
+       Scheduling, ownership and memory live in SwarmCore (pure, unit-tested);
+       this block wires them to the model, tools, UI and checkpoints.
        ════════════════════════════════════════════════════════ */
 
-    /**
-     * Shared memory store for a swarm run.
-     * Key→{value, writer, timestamp}
-     */
-    class SwarmMemory {
-      constructor() { this._store = new Map(); this._bus = []; }
-      write(key, value, writerName) {
-        this._store.set(key, { value, writer: writerName, ts: Date.now() });
-      }
-      read(key) {
-        const e = this._store.get(key);
-        return e ? e.value : undefined;
-      }
-      readAll() {
-        const out = {};
-        for (const [k, v] of this._store) out[k] = v.value;
-        return out;
-      }
-      entries() { return [...this._store.entries()].map(([k, v]) => ({ key: k, ...v })); }
-      postMessage(from, to, content) {
-        this._bus.push({ from, to, content, ts: Date.now() });
-      }
-      getMessages(toName) {
-        return this._bus.filter(m => m.to === toName || m.to === '*');
-      }
-      get bus() { return this._bus; }
-      size() { return this._store.size; }
-      /** Serialise to a JSON string for injection into worker prompts */
-      toContextString() {
-        if (!this._store.size) return '(empty — no data written yet)';
-        
-        return [...this._store.entries()]
-          .map(([k, v]) => {
-            const valStr = JSON.stringify(v.value);
-            
-            // Increased limit to 500 chars to better fit schemas/endpoints
-            const MAX_LEN = 500;
-            
-            if (valStr.length > MAX_LEN) {
-              // Explicitly mark truncated data so the worker knows it's incomplete
-              const truncatedVal = valStr.slice(0, MAX_LEN) + '... [TRUNCATED]';
-              return `  ${k}: ${truncatedVal} [written by ${v.writer}]`;
-            }
-            
-            return `  ${k}: ${valStr} [written by ${v.writer}]`;
-          })
-          .join('\n');
-      }
+    const SwarmMemory = SwarmCore.SwarmMemory;
+    const SWARM_STATUS_LABEL = { pending: 'Pending', running: 'Running…', done: 'Done', incomplete: 'Incomplete', error: 'Error', blocked: 'Blocked', skipped: 'Skipped' };
+    const SWARM_COLORS = ['#f59e0b','#22d3ee','#a78bfa','#4ade80','#fb923c','#f472b6','#38bdf8','#a3e635'];
+    const SWARM_PSEUDO_TOOLS = [
+      { name: 'swarm_memory_write', description: 'Write a key/value pair (max 2000 chars) to the swarm\'s shared memory so other workers can read it. Entries are HYPOTHESES by default; mark one status "verified" only with evidence (file:line, a command and its result, or a source). For anything larger, write a file and store its path.',
+        parameters: { type: 'object', properties: { key: { type: 'string', description: 'Short descriptive key, e.g. "api_endpoints"' }, value: { type: 'string', description: 'The value (max 2000 chars)' }, status: { type: 'string', enum: ['hypothesis', 'verified'], description: 'Default hypothesis. "verified" requires evidence.' }, evidence: { type: 'string', description: 'Provenance for a verified fact: file:line, command + result, or source (max 300 chars).' } }, required: ['key', 'value'] } },
+      { name: 'swarm_memory_read', description: 'Read the full value of a shared-memory key (context shows only a 500-char preview). Omit key to list all keys.',
+        parameters: { type: 'object', properties: { key: { type: 'string', description: 'Key to read; omit to list keys' } }, required: [] } },
+      { name: 'swarm_message', description: 'Post a message (max 500 chars) to another worker by name, or "*" to broadcast. Recipients see it before their next round.',
+        parameters: { type: 'object', properties: { to: { type: 'string', description: 'Target worker name or "*"' }, content: { type: 'string', description: 'Message content' } }, required: ['to', 'content'] } },
+      { name: 'swarm_check_messages', description: 'Check for new messages from other workers. New messages are also delivered automatically between rounds.', parameters: { type: 'object', properties: {}, required: [] } }
+    ].map(f => ({ type: 'function', function: f }));
+
+    function buildVerifierSysPrompt(w, ctx) {
+      return [
+        'You are the INDEPENDENT VERIFIER of a multi-agent swarm. You did not do the work and you have not been shown the workers\' own accounts of it. Judge ONLY from the actual state of the project and from checks you run yourself.', '',
+        '## Overall goal', ctx.goal, '',
+        '## Rules',
+        '- For every acceptance criterion, gather your own evidence: read the relevant files, run tests or other read-only checks (run_tests).',
+        '- PASS requires concrete evidence you saw. If you cannot check a criterion, say UNVERIFIABLE with the reason. Never guess PASS.',
+        '- You are read-only: do not modify files.',
+        '- A failing scripted check, if one is given, is evidence but not the whole verdict; decide each criterion on its own.',
+        '- For each FAIL, name the worker most responsible as "(owner: <name>)" using one of: ' + (ctx.ownerNames.join(', ') || '(none)') + '.', '',
+        '## Output', 'End with exactly one line per criterion, nothing after them:', '  AC1: PASS - <evidence>', '  AC2: FAIL - <evidence> (owner: <worker>)', '  AC3: UNVERIFIABLE - <why>',
+        ctx.env ? '\n## Environment\n' + ctx.env : ''
+      ].join('\n');
     }
 
-    /**
-     * Build a worker-specific system prompt that knows about shared memory.
-     */
-    function buildWorkerSysPrompt(workerDef, memory, workerIdx, totalWorkers, swarmGoal, toolNames) {
-      const hasWrite = toolNames.some(t => ['edit_file','write_file','delete_file','move_file'].includes(t));
-      const hasShellMem = toolNames.includes('swarm_memory_write');
+    function buildWorkerSysPrompt(w, ctx) {
+      if (w.kind === 'verifier') return buildVerifierSysPrompt(w, ctx);
+      const writes = ctx.toolNames.some(t => SwarmCore.WRITE_TOOLS.has(t));
       const lines = [
-        `You are **${workerDef.name}**, a specialised worker agent in a multi-agent swarm.`,
-        '',
-        `## Swarm Goal`,
-        swarmGoal,
-        '',
-        `## Your Role (worker ${workerIdx + 1} of ${totalWorkers})`,
-        workerDef.role,
-        '',
-        `## Your Task`,
-        workerDef.task,
-        '',
-        `## Shared Memory (written by previous workers)`,
-        memory.toContextString(),
-        '',
-        `## How to use Shared Memory`,
-        `- Use the **swarm_memory_write** tool to publish key/value pairs for later workers to read.`,
-        `- Keep keys short and descriptive: "api_endpoints", "db_schema", "auth_strategy", etc.`,
-        `- Values should be concise strings that later workers can directly use in code or decisions.`,
-        `- You can call swarm_memory_write multiple times — once per distinct piece of information.`,
-        '',
-        `## Rules`,
-        `- Complete ONLY your assigned task — do not attempt tasks assigned to other workers.`,
-        `- Read shared memory FIRST to understand what earlier workers have already done.`,
-        `- Write important decisions/outputs to shared memory so later workers stay consistent.`,
-        `- When done, write a clear summary of what you accomplished as your final message.`,
+        `You are **${w.name}**, a specialised worker agent in a multi-agent swarm.`, '',
+        '## Swarm Goal', ctx.goal, '',
+        `## Your Role (worker ${w.index + 1} of ${ctx.total})`, w.role, '',
+        '## Your Task', w.task, ''
       ];
-      if (hasWrite) {
-        lines.push('', '## File Permissions', '- You MAY create and modify files. Always read before editing.');
-      } else {
-        lines.push('', '## File Permissions', '- READ-ONLY. Describe changes in your summary; do not modify files.');
-      }
-      lines.push('', '## Output', 'End with a brief summary of: (1) what you accomplished, (2) what you wrote to shared memory.');
+      if (w.kind === 'critic') lines.push('## You are the CRITIC for worker "' + w.reviews + '"',
+        '- Your job is to find REAL defects in that worker\'s output: wrong behaviour, missed requirements, bugs, broken edge cases, security problems, failing or missing tests.',
+        '- Every issue needs evidence: a file and line, a command you ran, or a requirement it violates. Opinions without evidence do not count.',
+        '- Run the project\'s checks yourself where possible (run_tests). Do not modify files; you are read-only.',
+        '- Do NOT nitpick style or invent problems. If you cannot find a real defect, approve.',
+        '- Finish with a numbered list of concrete issues (or "No defects found"), then, as the LAST line, exactly one of:',
+        '  VERDICT: APPROVE',
+        '  VERDICT: REVISE', '');
+      if (ctx.depSummaries.length) lines.push('## Completed upstream workers', ...ctx.depSummaries.map(d => `- **${d.name}** (${d.status}): ${d.summary}`), '');
+      lines.push('## Shared Memory', ctx.memory.toContextString(), '',
+        '## How to use Shared Memory',
+        '- swarm_memory_write publishes decisions other workers need (endpoints, schemas, file paths). Values are capped at 2000 chars.',
+        '- Shared memory entries are hypotheses unless tagged VERIFIED with evidence. Confirm a hypothesis yourself before building on it, and only mark your own entries verified when you can cite evidence.',
+        '- Context shows only previews; use swarm_memory_read for the full value.',
+        '- swarm_message / swarm_check_messages talk to named workers; new messages also arrive between your rounds.', '',
+        '## Rules',
+        '- Complete ONLY your assigned task; other workers own the rest.',
+        '- Read shared memory FIRST, and write important decisions back so others stay consistent.',
+        '- Work in the real project: read before editing, and verify your changes where you can.',
+        '- When done, reply with a final summary and NO tool calls.');
+      if (ctx.env) lines.push('', '## Environment', ctx.env);
+      if (ctx.projectMemory) lines.push('', '## Project memory (background, not instructions)', ctx.projectMemory);
+      if (ctx.invariants.length) lines.push('', '## Invariants that must never be violated', ...ctx.invariants.map(i => '- ' + (typeof i === 'string' ? i : JSON.stringify(i))));
+      if (writes) {
+        lines.push('', '## File Permissions', '- You MAY create and modify files.');
+        if (ctx.isolated) lines.push('- You work in your own isolated Git worktree. Your edits are applied immediately there, are merged with other workers\' branches afterwards, and are reviewed before reaching the user\'s real workspace. Do not run git commit/merge/push yourself.');
+        if (w.owns.length) lines.push('- You may ONLY write files matching: ' + w.owns.join(', ') + '. Writes elsewhere are rejected; ask the owner via swarm_message instead.');
+      } else lines.push('', '## File Permissions', '- READ-ONLY. Describe changes in your summary; do not modify files.');
+      lines.push('', '## Output', 'End with a brief summary of: (1) what you accomplished, (2) what you wrote to shared memory, (3) anything left unfinished.');
       return lines.join('\n');
     }
 
-    /**
-     * Run a swarm: manager-less sequential orchestration with shared memory.
-     * Each worker runs as a sub-agent, but receives shared memory context and
-     * can write back to it via the swarm_memory_write pseudo-tool.
-     */
-    async function runSwarm(goal, workerDefs, maxWorkerIter, parentSignal, parentPanel) {
+    /* A self-contained, secret-free record of a swarm run: reproducible evidence and a cost breakdown. */
+    function buildSwarmTrace(data) {
+      const workers = (data.workerResults || []).map(r => ({
+        name: r.name, role: r.role, kind: r.kind || 'worker', status: r.status || (r.error ? 'error' : 'done'), reason: r.reason || '', model: r.model || '',
+        verdict: r.verdict || undefined, criticIssues: r.issues || undefined, revisions: r.revisions || 0, check: r.check || undefined,
+        outputTokensEstimate: r.tokens || 0, trimmedToolOutputs: r.trimmedOutputs || 0, rounds: r.iterations || 0, summary: r.summary || '',
+        toolCalls: (r.log || []).map(e => ({ tool: e.tool, args: e.args, success: e.success, output: String(e.output || '').slice(0, 300) })),
+        spec: (data.workers || []).find(w => w.name === r.name) ? (({ name, role, depends_on, owns, on_failure, retries, model, token_budget, max_iterations }) => ({ depends_on, owns, on_failure, retries, model, token_budget, max_iterations }))(data.workers.find(w => w.name === r.name)) : undefined
+      }));
+      return { schema: 'sloplobster.swarm-trace/1', exportedAt: new Date().toISOString(), goal: data.goal, outcome: data.outcome || (data.error ? 'blocked' : 'needs_review'),
+        durationMs: Math.round(data.duration || 0), totalRounds: data.totalIterations || 0,
+        totalOutputTokensEstimate: workers.reduce((n, w) => n + w.outputTokensEstimate, 0),
+        statuses: data.statuses || {}, notes: data.notes || [], verification: data.verification || null, isolation: data.isolation || null, contract: data.contract || null, acceptance: data.acceptance ? data.acceptance.criteria : null, metrics: data.metrics || null, events: data.events || [], memoryDetail: data.memoryDetail || [],
+        workers, sharedMemory: data.memory || {}, messageBus: data.messageBus || [], managerSummary: data.managerSummary || '' };
+    }
+    function makeSwarmTraceButton(data) {
+      const btn = document.createElement('button');
+      btn.className = 'hdr-btn'; btn.type = 'button'; btn.style.cssText = 'margin-top:8px;font-size:11px';
+      btn.innerHTML = '<i class="fas fa-download"></i> Export run trace';
+      btn.onclick = e => {
+        e.stopPropagation();
+        const blob = new Blob([JSON.stringify(buildSwarmTrace(data), null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'swarm-trace-' + Date.now() + '.json'; a.click();
+        setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+      };
+      return btn;
+    }
+
+    // Run history feeds the stats below: verified rate, cost per verified result, latency, repair frequency.
+    async function persistSwarmRun(goal, metrics) {
+      try {
+        await dbSet('agent_states', { id: 'swarm-run:' + Date.now() + ':' + Math.random().toString(36).slice(2, 8), kind: 'swarm-run', ts: Date.now(), goal: String(goal).slice(0, 200), ...metrics });
+        const all = (await dbGetAll('agent_states')).filter(r => r.kind === 'swarm-run').sort((x, y) => x.ts - y.ts);
+        for (const old of all.slice(0, Math.max(0, all.length - 100))) await dbDelete('agent_states', old.id);
+      } catch { /* history is best-effort */ }
+    }
+    async function swarmHistory(limit = 10, groupBy = 'critic') {
+      const runs = (await dbGetAll('agent_states')).filter(r => r.kind === 'swarm-run').sort((x, y) => y.ts - x.ts);
+      return { stats: SwarmCore.summarizeRuns(runs, groupBy), recent: runs.slice(0, Math.max(1, Math.min(25, limit))).map(r => ({ when: new Date(r.ts).toISOString(), goal: r.goal, outcome: r.outcome, tokens: r.tokens, seconds: Math.round(r.durationMs / 1000), workers: r.workers, failedWorkers: r.failedWorkers, revisions: r.revisions, repairs: r.repairs, criteria: r.criteriaTotal ? r.criteriaPassed + '/' + r.criteriaTotal : '' })) };
+    }
+
+    function swarmCheckpointKey() { return 'swarm:' + state.activeConvId; }
+
+    async function runSwarm(goal, workerDefs, maxWorkerIter, parentSignal, parentPanel, options = {}) {
       const startTime = performance.now();
-      const memory = new SwarmMemory();
+      const workers = SwarmCore.normalizeWorkers(workerDefs);
+      const names = workers.map(w => w.name);
+      const byName = new Map(workers.map(w => [w.name, w]));
+      let memory = new SwarmMemory(names);
       const defaultMax = Math.min(Math.max(maxWorkerIter || 10, 1), 25);
-      const workerResults = [];
-      let totalIterations = 0;
-      let swarmError = false;
-
-      // Inject swarm_memory_write into each worker's available tools
-      const swarmMemTool = {
-        type: 'function',
-        function: {
-          name: 'swarm_memory_write',
-          description: 'Write a key/value pair to the swarm\'s shared memory so later workers can read it. Call this for every important decision, API endpoint, schema, or output that later workers need to stay consistent with your work.',
-          parameters: {
-            type: 'object',
-            properties: {
-              key:   { type: 'string', description: 'Short descriptive key, e.g. "api_endpoints", "db_schema"' },
-              value: { type: 'string', description: 'The value — keep it concise (under 500 chars)' }
-            },
-            required: ['key', 'value']
-          }
-        }
-      };
-
-      // Also allow posting a message to a named worker or '*' (broadcast)
-      const swarmMsgTool = {
-        type: 'function',
-        function: {
-          name: 'swarm_message',
-          description: 'Post a message to another worker or all workers ("*") via the shared message bus. Use this to flag something important the next worker should know.',
-          parameters: {
-            type: 'object',
-            properties: {
-              to:      { type: 'string', description: 'Target worker name or "*" for broadcast' },
-              content: { type: 'string', description: 'Message content (max 500 chars)' }
-            },
-            required: ['to', 'content']
-          }
-        }
-      };
-
       const allToolDefs = getToolDefs();
-      const defaultWorkerToolNames = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep',
-                                      'edit_file', 'write_file', 'execute_command', 'think'];
+      const coordinatorTools = new Set(['spawn_swarm', 'spawn_sub_agent', 'ask_user']);
+      const defaultWorkerToolNames = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep', 'edit_file', 'write_file', 'execute_command', 'think'];
+      const criticToolNames = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep', 'think', 'run_tests'];
+      // Critics are read-only by construction: they can inspect and run checks but never modify files.
+      const toolNamesFor = w => (w.kind === 'critic' || w.kind === 'verifier') ? criticToolNames : ((w.tools && w.tools.length) ? w.tools : defaultWorkerToolNames).filter(t => !coordinatorTools.has(t));
+      const writeCapable = w => toolNamesFor(w).some(t => SwarmCore.WRITE_TOOLS.has(t) || t === 'execute_command');
+      const notes = [];
+      // ── Task contract: what "done" means, the budget, and the deadline are fixed before any worker starts ──
+      const contract = SwarmCore.normalizeContract(options.contract);
+      SwarmCore.checkContractOwners(contract, workers);
+      const events = SwarmCore.createEventLog();
+      const emit = (type, data) => events.emit(type, data);
+      const startMs = Date.now(), totalMs = contract.deadline_minutes * 60000;
+      const workerDeadline = totalMs ? startMs + totalMs * (1 - contract.reserve) : 0, hardDeadline = totalMs ? startMs + totalMs : 0;
+      const tokenPool = contract.token_budget ? Math.floor(contract.token_budget * (1 - contract.reserve)) : 0;
+      const allocated = SwarmCore.allocateBudgets(workers, contract);
+      for (const w of workers) if (!(w.tokenBudget > 0) && allocated[w.name]) w.tokenBudget = allocated[w.name];
+      // Workers stop starting once the working share of the time or tokens is spent; the reserve is kept for verification.
+      function stopLaunching() { return !!((workerDeadline && Date.now() > workerDeadline) || (tokenPool && swarmTokens >= tokenPool)); }
+      const withinContract = () => !swarmCtl.signal.aborted && !(hardDeadline && Date.now() > hardDeadline) && !(contract.token_budget && swarmTokens >= contract.token_budget);
+      const hasVerification = workers.some(w => w.kind === 'critic' || w.check_command) || !!(options.verifyCommand || '').trim() || contract.criteria.length > 0;
+      for (const advice of SwarmCore.teamAdvice(workers, { hasVerification })) notes.push('Advice: ' + advice);
+      if (contract.criteria.length || contract.token_budget || contract.deadline_minutes) notes.push('Contract: ' + [contract.criteria.length && contract.criteria.length + ' acceptance criteria', contract.token_budget && '~' + contract.token_budget + ' token budget', contract.deadline_minutes && contract.deadline_minutes + ' min deadline'].filter(Boolean).join(', ') + (contract.reserve ? ' (20% reserved for verification)' : ''));
+      emit('contract', { criteria: contract.criteria.length, tokenBudget: contract.token_budget, deadlineMinutes: contract.deadline_minutes, workers: workers.length });
+      const swarmCtl = new AbortController(), swarmCtl0 = swarmCtl;
+      let swarmTokens = 0, metaBase = '';
+      const updateMeta = () => { const el = document.getElementById('swarm-live-meta'); if (el && metaBase) el.textContent = metaBase + ' · ~' + (swarmTokens >= 1000 ? (swarmTokens / 1000).toFixed(1) + 'k' : swarmTokens) + ' tok'; };
+
+      // ── Optional isolation: one Git worktree per worker plus an integration worktree ──
+      const hf = harnessFeatureState;
+      let iso = null;
+      if (options.isolate) {
+        const root = (hf.prefs.projectRoot || '').trim();
+        if (!state.compConnected) notes.push('Isolation unavailable (companion not connected): workers shared the open workspace.');
+        else if (!root) notes.push('Isolation unavailable (no Git project root set in Harness settings): workers shared the open workspace.');
+        else if (featureTask()) notes.push('Isolation skipped: this conversation already works in an isolated task, which the workers shared.');
+        else {
+          try {
+            const integration = await featureRequest('tasks/create', { root, title: 'Swarm: ' + goal.slice(0, 120) }, swarmCtl0.signal);
+            iso = { root, integration, tasks: new Map(), caches: new Map([['__integration', new Map()]]), conflicts: [], kept: new Set() };
+          } catch (e) { notes.push('Isolation unavailable (' + e.message + '): workers shared the open workspace.'); }
+        }
+      }
+
+      // Workers may overlap only when every concurrent pair of writers owns disjoint paths
+      // (isolated workers write to separate worktrees, so conflicts surface at merge time instead).
+      let concurrency = Math.max(1, Math.min(4, Math.floor(options.concurrency || 1)));
+      if (concurrency > 1 && !iso) {
+        const conflicts = SwarmCore.concurrencyConflicts(workers, writeCapable);
+        if (conflicts.length) {
+          concurrency = 1;
+          notes.push('Ran sequentially: concurrent writers need disjoint "owns" globs (conflicts: ' + conflicts.map(c => c.join('/')).join(', ') + ').');
+        }
+      }
+
+      // ── Resume from a checkpoint of the same swarm (same goal and worker names) ──
+      const results = {};
+      const initial = {};
+      let resumed = 0;
+      try {
+        const cp = await dbGet('agent_states', swarmCheckpointKey());
+        if (cp && cp.goal === goal && JSON.stringify(cp.names) === JSON.stringify(names) && !!cp.isolation === !!iso) {
+          memory = SwarmMemory.fromJSON(cp.memory, names);
+          let live = null;
+          if (iso) live = new Map((await featureRequest('tasks/list', { root: iso.root })).tasks.map(t => [t.id, t]));
+          for (const n of names) if (cp.statuses?.[n] === 'done' && cp.results?.[n]) {
+            // An isolated worker's output lives in its worktree: if that is gone, the work must be redone.
+            const isCritic = workers.find(x => x.name === n).kind === 'critic'; // critics own no worktree
+            const rec = iso && !isCritic && live.get(cp.isolation.tasks?.[n]);
+            if (iso && !isCritic && !rec) continue;
+            if (rec) { iso.tasks.set(n, rec); iso.caches.set(n, new Map()); }
+            initial[n] = 'done'; results[n] = cp.results[n]; resumed++;
+          }
+          if (resumed) notes.push(`Resumed from checkpoint: ${resumed} worker(s) already done were not re-run.`);
+        }
+      } catch { /* checkpoints are best-effort */ }
+
+      if (parentSignal) { if (parentSignal.aborted) swarmCtl.abort(); else parentSignal.addEventListener('abort', () => swarmCtl.abort(), { once: true }); }
+      let budgetHit = false;
+      const checkBudget = () => {
+        if (state.tokenBudget > 0 && _sessionTotalOut >= state.tokenBudget) { budgetHit = true; swarmCtl.abort(); }
+        return budgetHit;
+      };
 
       function updateParentStatus(text, cls) {
         if (!parentPanel?.el) return;
@@ -16503,7 +17084,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         if (st) { st.className = 'tool-status ' + cls; st.textContent = text; }
       }
 
-      // ── Live swarm UI panel (created before workers run) ──
+      // ── Live swarm UI panel ──
       const swarmLiveEl = document.createElement('div');
       swarmLiveEl.className = 'swarm-panel';
       swarmLiveEl._swarmMemory = memory;
@@ -16514,7 +17095,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           <span class="swarm-label">Swarm</span>
           <span class="swarm-goal" title="${esc(goal)}">${esc(goalDisplay)}</span>
           <span class="swarm-status running" id="swarm-live-status">Running</span>
-          <span class="swarm-meta" id="swarm-live-meta">${workerDefs.length} workers</span>
+          <span class="swarm-meta" id="swarm-live-meta">${workers.length} workers${concurrency > 1 ? ' · ×' + concurrency : ''}${iso ? ' · isolated' : ''}</span>
         </div>
         <div class="swarm-body" id="swarm-live-body">
           <div class="swarm-mem" id="swarm-live-mem">
@@ -16522,326 +17103,519 @@ Use git_diff to review changes before committing. git_diff without arguments sho
               <i class="fas fa-database"></i> Shared Memory
               <span class="mem-count" id="swarm-mem-count">0 keys</span>
             </div>
-            <div class="swarm-mem-body open" id="swarm-mem-body">
-              <div class="swarm-mem-empty">No data written yet</div>
-            </div>
+            <div class="swarm-mem-body open" id="swarm-mem-body"><div class="swarm-mem-empty">No data written yet</div></div>
           </div>
           <div class="swarm-bus" id="swarm-live-bus" style="display:none">
-            <div class="swarm-bus-hdr" onclick="event.stopPropagation();toggleSwarmBus(this)">
-              <i class="fas fa-comments"></i> Message Bus
-            </div>
+            <div class="swarm-bus-hdr" onclick="event.stopPropagation();toggleSwarmBus(this)"><i class="fas fa-comments"></i> Message Bus</div>
             <div class="swarm-bus-body" id="swarm-bus-body"></div>
           </div>
           <div class="swarm-workers" id="swarm-live-workers">
-            ${workerDefs.map((w, i) => {
-              const colors = ['#f59e0b','#22d3ee','#a78bfa','#4ade80','#fb923c','#f472b6','#38bdf8','#a3e635'];
-              const bg = colors[i % colors.length];
-              return `<div class="swarm-worker pending" id="swarm-worker-${i}">
+            ${workers.map((w, i) => `<div class="swarm-worker pending" id="swarm-worker-${i}">
                 <div class="swarm-worker-hdr" onclick="toggleSwarmWorker(this)">
-                  <div class="swarm-worker-avatar" style="background:${bg}">${esc(w.name.slice(0,2).toUpperCase())}</div>
+                  <div class="swarm-worker-avatar" style="background:${SWARM_COLORS[i % SWARM_COLORS.length]}">${esc(w.name.slice(0, 2).toUpperCase())}</div>
                   <span class="swarm-worker-name">${esc(w.name)}</span>
-                  <span class="swarm-worker-role">${esc(w.role)}</span>
+                  <span class="swarm-worker-role" title="${esc(w.depends_on.length ? 'after: ' + w.depends_on.join(', ') : 'no dependencies')}">${esc(w.role)}</span>
                   <span class="swarm-worker-status pending" id="swarm-wstatus-${i}">Pending</span>
                   <span class="swarm-worker-iter" id="swarm-witer-${i}"></span>
                 </div>
                 <div class="swarm-worker-body" id="swarm-wbody-${i}"></div>
-              </div>`;
-            }).join('')}
+              </div>`).join('')}
           </div>
         </div>`;
       $msg().appendChild(swarmLiveEl);
       if (parentPanel?.el) parentPanel.el._swarmLiveEl = swarmLiveEl;
       scrollBottom();
 
+      const logHtml = (log, n) => (n ? log.slice(-n) : log).map(e =>
+        `<div class="swarm-worker-log-entry"><span class="swarm-worker-log-tool">${esc(e.tool)}</span><span class="${e.success ? 'swarm-worker-log-ok' : 'swarm-worker-log-err'}">${e.success ? '✓' : '✗'}</span><span class="swarm-worker-log-out" title="${esc(e.output)}">${esc(e.output)}</span></div>`).join('');
+      function setWorkerUI(w, status, extra = {}) {
+        const i = w.index;
+        const el = document.getElementById(`swarm-worker-${i}`), st = document.getElementById(`swarm-wstatus-${i}`), it = document.getElementById(`swarm-witer-${i}`), body = document.getElementById(`swarm-wbody-${i}`);
+        if (el) el.className = 'swarm-worker ' + status;
+        if (st) { st.className = 'swarm-worker-status ' + status; st.textContent = extra.label || SWARM_STATUS_LABEL[status] || status; }
+        if (it && extra.iter !== undefined) it.textContent = extra.iter;
+        if (body && extra.html !== undefined) { body.innerHTML = extra.html; if (extra.open) body.classList.add('open'); }
+      }
       function refreshMemoryUI() {
-        const body = document.getElementById('swarm-mem-body');
-        const count = document.getElementById('swarm-mem-count');
+        const body = document.getElementById('swarm-mem-body'), count = document.getElementById('swarm-mem-count');
         if (!body) return;
         const entries = memory.entries();
         if (count) count.textContent = entries.length + ' key' + (entries.length !== 1 ? 's' : '');
-        if (!entries.length) {
-          body.innerHTML = '<div class="swarm-mem-empty">No data written yet</div>';
-          return;
-        }
-        body.innerHTML = entries.map(e =>
-          `<div class="swarm-mem-entry">
-            <span class="swarm-mem-key">${esc(e.key)}</span>
-            <span class="swarm-mem-val" title="${esc(String(e.value))}">${esc(String(e.value).slice(0, 100))}</span>
-            <span class="swarm-mem-writer">← ${esc(e.writer)}</span>
-          </div>`
-        ).join('');
+        body.innerHTML = entries.length ? entries.map(e => `<div class="swarm-mem-entry"><span class="swarm-mem-key">${esc(e.key)}</span><span class="swarm-mem-val" title="${esc(e.value)}">${esc(String(e.value).slice(0, 100))}</span><span class="swarm-mem-writer">← ${esc(e.writer)}</span></div>`).join('') : '<div class="swarm-mem-empty">No data written yet</div>';
       }
-
       function refreshBusUI() {
-        const busEl = document.getElementById('swarm-live-bus');
-        const body = document.getElementById('swarm-bus-body');
+        const busEl = document.getElementById('swarm-live-bus'), body = document.getElementById('swarm-bus-body');
         if (!body || !memory.bus.length) return;
         if (busEl) busEl.style.display = '';
-        body.innerHTML = memory.bus.map(m =>
-          `<div class="swarm-bus-msg">
-            <span class="swarm-bus-from">${esc(m.from)}</span>
-            <span class="swarm-bus-arrow">→</span>
-            <span class="swarm-bus-to">${esc(m.to)}</span>
-            <span class="swarm-bus-content">${esc(m.content.slice(0, 200))}</span>
-          </div>`
-        ).join('');
+        body.innerHTML = memory.bus.map(m => `<div class="swarm-bus-msg"><span class="swarm-bus-from">${esc(m.from)}</span><span class="swarm-bus-arrow">→</span><span class="swarm-bus-to">${esc(m.to)}</span><span class="swarm-bus-content">${esc(m.content.slice(0, 200))}</span></div>`).join('');
+      }
+      metaBase = `${workers.length} workers${concurrency > 1 ? ' · ×' + concurrency : ''}${iso ? ' · isolated' : ''}`; updateMeta();
+      refreshMemoryUI(); refreshBusUI();
+      for (const w of workers) if (initial[w.name] === 'done') {
+        const r = results[w.name];
+        setWorkerUI(w, 'done', { label: 'Done (resumed)', iter: `${r.iterations || 0}r`, html: `<div class="swarm-worker-summary">${renderMd(r.summary || '')}</div>` });
       }
 
-      // ── Run each worker in order ──
-      for (let wi = 0; wi < workerDefs.length; wi++) {
-        if (parentSignal?.aborted) break;
-
-        const wDef = workerDefs[wi];
-        const wEl = document.getElementById(`swarm-worker-${wi}`);
-        const wStatus = document.getElementById(`swarm-wstatus-${wi}`);
-        const wIter = document.getElementById(`swarm-witer-${wi}`);
-        const wBody = document.getElementById(`swarm-wbody-${wi}`);
-
-        if (wEl) wEl.className = 'swarm-worker running';
-        if (wStatus) { wStatus.className = 'swarm-worker-status running'; wStatus.textContent = 'Running…'; wStatus._reasoningChars = 0; }
-        updateParentStatus(`Worker ${wi + 1}/${workerDefs.length}: ${wDef.name}`, 'run');
-        scrollBottom();
-
-        // Resolve tools
-        const wToolNames = (wDef.tools && wDef.tools.length)
-          ? wDef.tools
-          : defaultWorkerToolNames;
-        const filteredDefs = allToolDefs.filter(t => wToolNames.includes(t.function.name));
-        filteredDefs.push(swarmMemTool, swarmMsgTool);
-
-        // Messages to inject (from bus addressed to this worker)
-        const incomingMessages = memory.getMessages(wDef.name);
-        let incomingBlock = '';
-        if (incomingMessages.length) {
-          incomingBlock = '\n\n## Messages from other workers\n' +
-            incomingMessages.map(m => `- From **${m.from}**: ${m.content}`).join('\n');
+      // The workspace lease swaps the active workspace for exactly one tool call at a time, so isolated
+      // workers can generate in parallel but their file/command tools never see each other's worktree.
+      let leaseTail = Promise.resolve();
+      function withWorkspace(rec, cache, fn) {
+        if (!iso || !rec) return fn();
+        const run = leaseTail.then(async () => {
+          if (swarmCtl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+          const saved = { dir: state.dirHandle, name: state.dirName, cache: state.fileCache, task: hf.currentTask, approve: state.requireEditApproval };
+          state.dirHandle = new ManagedDirectoryHandle('', rec.id); state.dirName = rec.title + ' [' + rec.branch + ']';
+          state.fileCache = cache || new Map(); hf.currentTask = rec;
+          state.requireEditApproval = false; // edits land on a disposable branch that is reviewed before merging
+          try { return await fn(); }
+          finally { state.dirHandle = saved.dir; state.dirName = saved.name; state.fileCache = saved.cache; hf.currentTask = saved.task; state.requireEditApproval = saved.approve; }
+        });
+        leaseTail = run.catch(() => {});
+        return run;
+      }
+      let absorbTail = Promise.resolve();
+      const queueAbsorb = (targetId, sourceId) => { const run = absorbTail.then(() => featureRequest('tasks/absorb', { taskId: targetId, fromTaskId: sourceId }, swarmCtl.signal)); absorbTail = run.catch(() => {}); return run; };
+      async function prepareWorkspace(w) {
+        if (!iso) return { rec: null };
+        if (w.kind === 'critic') return { rec: iso.tasks.get(w.reviews) || null }; // review inside the author's worktree
+        if (w.kind === 'verifier') return { rec: iso.integration }; // verify the combined result
+        let rec = iso.tasks.get(w.name);
+        if (!rec) { rec = await featureRequest('tasks/create', { root: iso.root, title: 'swarm:' + w.name }, swarmCtl.signal); iso.tasks.set(w.name, rec); iso.caches.set(w.name, new Map()); }
+        for (const d of w.depends_on) {
+          const dep = iso.tasks.get(d);
+          if (!dep || results[d]?.status !== 'done') continue;
+          const r = await queueAbsorb(rec.id, dep.id);
+          if (!r.ok) return { rec, conflict: r.files || [] };
         }
+        return { rec };
+      }
+      if (iso) for (const n of Object.keys(initial)) if (iso.tasks.has(n)) await queueAbsorb(iso.integration.id, iso.tasks.get(n).id).catch(() => {});
 
-        // Build worker task with shared memory context
-        const maxIter = Math.min(Math.max(wDef.max_iterations || defaultMax, 1), 25);
-        const sysPrompt = buildWorkerSysPrompt(wDef, memory, wi, workerDefs.length, goal, filteredDefs.map(t => t.function.name));
-        const taskMsg = wDef.task + incomingBlock +
-          (state.dirName ? '\n\nWorking directory: ' + state.dirName : '');
+      async function saveCheckpoint(statuses, finished) {
+        try {
+          if (finished) { await dbDelete('agent_states', swarmCheckpointKey()); return; }
+          const slim = {};
+          for (const [n, r] of Object.entries(results)) slim[n] = { ...r, log: (r.log || []).slice(-30) };
+          await dbSet('agent_states', { id: swarmCheckpointKey(), kind: 'swarm', convId: state.activeConvId, goal, names, ts: Date.now(),
+            statuses: Object.fromEntries(Object.entries(statuses).map(([n, s]) => [n, s === 'running' ? 'pending' : s])), results: slim, memory: memory.toJSON(), events: events.toJSON(),
+            isolation: iso ? { root: iso.root, integration: iso.integration.id, tasks: Object.fromEntries([...iso.tasks].map(([n, t]) => [n, t.id])) } : null });
+        } catch { /* best-effort */ }
+      }
 
-        const subMessages = [{ role: 'user', content: taskMsg }];
-        let iterations = 0;
+      // One streamed chat completion for a worker. Throws on transport/HTTP errors.
+      async function workerStream(messages, tools, signal, onReasoning, model) {
+        const acc = { content: '', reasoning: '', toolCalls: [] };
+        const body = { model: model || state.model, messages, stream: true, temperature: 0.2, max_tokens: Math.min(state.maxTokens, 8000) };
+        if (tools?.length) body.tools = tools;
+        const res = await fetch(`${state.apiUrl}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal });
+        if (!res.ok) throw new Error('API ' + res.status);
+        const reader = res.body.getReader(), dec = new TextDecoder();
+        let buf = '';
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          const lines = buf.split('\n'); buf = lines.pop();
+          for (const line of lines) {
+            const t = line.trim();
+            if (!t.startsWith('data:')) continue;
+            const data = t.slice(5).trim();
+            if (data === '[DONE]') continue;
+            try { applySSEDelta(JSON.parse(data), acc, { onReasoning }); } catch { /* skip bad chunk */ }
+          }
+        }
+        const outTok = estimateTokens(acc.content + acc.reasoning + acc.toolCalls.filter(Boolean).map(t => t.function.arguments).join(''));
+        _updateSessionTok(outTok);
+        acc.outTok = outTok;
+        return acc;
+      }
+
+      async function runWorker(w, attempt, extra = {}) {
+        let ws;
+        try { ws = await prepareWorkspace(w); }
+        catch (e) { return { name: w.name, role: w.role, status: 'error', summary: '(not started) ' + e.message, reason: 'Could not prepare an isolated workspace: ' + e.message, log: [], iterations: 0, error: true, retryable: false }; }
+        if (ws.conflict) { const why = 'Upstream workers changed the same files (' + ws.conflict.join(', ') + '); their work cannot be combined automatically.'; return { name: w.name, role: w.role, status: 'error', summary: '(not started) ' + why, reason: why, log: [], iterations: 0, error: true, retryable: false }; }
+        const wsRec = ws.rec;
+        const toolNames = toolNamesFor(w);
+        const defs = allToolDefs.filter(t => toolNames.includes(t.function.name)).concat(SWARM_PSEUDO_TOOLS);
+        let maxIter = Math.min(Math.max(w.max_iterations || defaultMax, 1), 25);
+        const wsCache = iso?.caches.get(w.kind === 'critic' ? w.reviews : w.kind === 'verifier' ? '__integration' : w.name);
+        const wb = SwarmCore.createRoundBudget({ limit: maxIter, hardCap: 40 });
+        const depSummaries = w.depends_on.map(d => ({ name: d, status: results[d]?.status || 'done', summary: String(results[d]?.summary || '').slice(0, 600) }));
+        const sysPrompt = buildWorkerSysPrompt(w, {
+          memory, goal, total: workers.length, toolNames, depSummaries, isolated: !!iso, ownerNames: workers.filter(x => x.kind !== 'critic').map(x => x.name),
+          env: state.compInfo?.python_cmd ? `Python command: \`${state.compInfo.python_cmd}\` (use this exactly).` : '',
+          projectMemory: (state.projectMemoryText || '').slice(0, 1500), invariants: state.invariants || []
+        });
+        let inboxCursor = 0;
+        const first = memory.inbox(w.name, 0); inboxCursor = first.next;
+        const subMessages = [{ role: 'user', content: w.task +
+          (first.messages.length ? '\n\n## Messages from other workers\n' + first.messages.map(m => `- From **${m.from}**: ${m.content}`).join('\n') : '') +
+          (extra.authorSummary ? '\n\n## The author\'s own summary of their work\n' + extra.authorSummary : '') +
+          (extra.diff ? '\n\n## Changes to review (git diff against the project base)\n```diff\n' + extra.diff + '\n```' : '') +
+          (extra.critique ? '\n\n## Critic feedback you must address (revision ' + extra.revision + ')\nA reviewer found these problems with your previous work. Fix each one that is real, verify, and say in your summary which you fixed and which you disagree with and why.\n' + extra.critique : '') +
+          (extra.priorSummary ? '\n\n## Your previous summary\n' + extra.priorSummary : '') +
+          (state.dirName ? '\n\nWorking directory: ' + state.dirName : '') }];
         const log = [];
-        const workerAbort = new AbortController();
-        if (parentSignal) parentSignal.addEventListener('abort', () => workerAbort.abort(), { once: true });
+        let iterations = 0, finishedNaturally = false, apiError = '', stallNudged = false, stalled = false, workerTokens = 0, overBudget = false, contextFull = false, trimmedTotal = 0, timedOut = false, swarmOver = false;
+        // Budget the conversation at ~65% of the loaded context so there is room for the reply and tool schemas.
+        const info = state.modelInfoMap?.get?.(w.model || state.model);
+        const ctxTokens = info?.loadedContextLength || info?.contextLength || 0;
+        const ctxBudget = Math.floor((ctxTokens || 32000) * 0.65);
+        const recent = [];
+        setWorkerUI(w, 'running', { label: attempt > 1 ? `Retry ${attempt - 1}…` : 'Running…', iter: '' });
+        updateParentStatus(`Swarm: ${w.name}`, 'run');
 
-        // ── Worker agent loop ──
-        while (iterations < maxIter) {
-          if (workerAbort.signal.aborted) break;
+        const rounds = async () => { while (true) {
+          if (swarmCtl.signal.aborted || checkBudget()) break;
+          // The verifier may use the reserved share of the contract; ordinary workers stop at the working share.
+          const dl = w.kind === 'verifier' ? hardDeadline : workerDeadline, pool = w.kind === 'verifier' ? contract.token_budget : tokenPool;
+          if (dl && Date.now() > dl) { timedOut = true; emit('deadline', { worker: w.name }); break; }
+          if (pool && swarmTokens >= pool) { swarmOver = true; emit('swarm_budget', { worker: w.name }); break; }
+          const decision = wb.decide(iterations); maxIter = wb.limit;
+          if (decision === 'extended') emit('extended', { worker: w.name, limit: maxIter });
+          if (decision === 'limit') break;
+          if (decision === 'stalled') { stalled = true; emit('stalled', { worker: w.name }); break; }
+          if (decision === 'extended') subMessages.push({ role: 'user', content: `[SYSTEM] You are still making progress, so your round budget was extended to ${maxIter}. Start converging on your result.` });
+          else if (decision === 'warn') subMessages.push({ role: 'user', content: '[SYSTEM] You have one round left. If you have enough, stop calling tools and give your final summary now.' });
+          if (w.tokenBudget && workerTokens >= w.tokenBudget) { overBudget = true; break; }
+          const fit = SwarmCore.trimToolOutputs(subMessages, { budgetTokens: ctxBudget, reserveTokens: estimateTokens(sysPrompt) + 1500, estimate: estimateTokens });
+          trimmedTotal += fit.trimmed;
+          if (fit.over) { contextFull = true; break; }
           iterations++;
-          if (wIter) wIter.textContent = `${iterations}/${maxIter}r`;
-          const workerStats = createCompressionStats(); 
-
-          // Patch system prompt into sub-agent chat manually
-          const apiMsgs = [{ role: 'system', content: sysPrompt }, ...subMessages];
-          const workerAcc = { content: '', reasoning: '', toolCalls: [] };
-
+          setWorkerUI(w, 'running', { label: attempt > 1 ? `Retry ${attempt - 1}…` : 'Running…', iter: `${iterations}/${maxIter}r · ~${workerTokens}tok` });
+          const stEl = document.getElementById(`swarm-wstatus-${w.index}`);
+          let acc;
           try {
-            const res = await fetch(`${state.apiUrl}/v1/chat/completions`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: state.model,
-                messages: apiMsgs,
-                tools: filteredDefs,
-                stream: true,
-                temperature: 0.2,
-                max_tokens: Math.min(state.maxTokens, 8000)
-              }),
-              signal: workerAbort.signal
-            });
-            if (!res.ok) throw new Error(`API ${res.status}`);
-
-            // Parse SSE
-            const reader = res.body.getReader();
-            const dec = new TextDecoder();
-            let buf = '';
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              buf += dec.decode(value, { stream: true });
-              const lines = buf.split('\n'); buf = lines.pop();
-              for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed.startsWith('data:')) continue;
-                const data = trimmed.slice(5).trim();
-                if (data === '[DONE]') continue;
-                try {
-                  applySSEDelta(JSON.parse(data), workerAcc, {
-                    // Surface reasoning in the worker status so a worker stuck
-                    // reasoning doesn't just look frozen at "Running…".
-                    onReasoning: (full) => {
-                      if (!wStatus) return;
-                      const chars = full.length;
-                      const short = chars > 1000 ? (chars / 1000).toFixed(1) + 'k' : chars;
-                      wStatus.textContent = `Reasoning… (${short}c)`;
-                    },
-                  });
-                } catch { /* skip bad chunks */ }
-              }
-            }
+            acc = await workerStream([{ role: 'system', content: sysPrompt }, ...subMessages], defs, swarmCtl.signal,
+              full => { if (stEl) stEl.textContent = `Reasoning… (${full.length > 1000 ? (full.length / 1000).toFixed(1) + 'k' : full.length}c)`; }, w.model);
+            workerTokens += acc.outTok || 0; swarmTokens += acc.outTok || 0; updateMeta();
           } catch (e) {
             if (e.name === 'AbortError') break;
-            log.push({ tool: 'API', args: '', output: e.message, success: false });
-            swarmError = true; break;
+            apiError = HarnessRuntime.connectionErrorHint(e, state.backend);
+            log.push({ tool: 'API', args: '', output: apiError, success: false });
+            break;
           }
-
-          const content = workerAcc.content;
-          const toolCalls = workerAcc.toolCalls.filter(Boolean);
-          toolCalls.forEach((tc, i) => { if (!tc.id) tc.id = `tc_${Date.now()}_${i}`; });
-          const assistantMsg = { role: 'assistant', content: content || null };
+          const toolCalls = acc.toolCalls.filter(Boolean);
+          toolCalls.forEach((tc, i) => { if (!tc.id) tc.id = `tc_${Date.now()}_${w.index}_${i}`; });
+          const assistantMsg = { role: 'assistant', content: acc.content || null };
           if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
           subMessages.push(assistantMsg);
+          if (!toolCalls.length) { finishedNaturally = true; break; }
 
-          if (!toolCalls.length) break; // Worker is done
+          // Stall detection: the same call three times in a row is a loop, not progress.
+          const sig = toolCalls.map(tc => tc.function.name + ':' + tc.function.arguments).join('|');
+          recent.push(sig); if (recent.length > 5) recent.shift();
+          const repeats = recent.filter(s => s === sig).length;
 
-          // Execute tools
+          const stats = createCompressionStats();
+          let roundOk = false;
           for (const tc of toolCalls) {
             const name = tc.function.name;
-            let outText = '';
-
-            if (name === 'swarm_memory_write') {
-              try {
-                const a = JSON.parse(tc.function.arguments);
-                memory.write(a.key, a.value, wDef.name);
-                outText = `Written: ${a.key} = ${String(a.value).slice(0, 80)}`;
-                log.push({ tool: 'swarm_memory_write', args: a.key, output: outText, success: true });
-                refreshMemoryUI(); scrollBottom();
-              } catch (e) {
-                outText = 'Error: ' + e.message;
-                log.push({ tool: 'swarm_memory_write', args: '', output: outText, success: false });
+            let outText = '', success = true;
+            let a = null;
+            try { a = JSON.parse(tc.function.arguments || '{}'); } catch { a = null; }
+            try {
+              if (name.startsWith('swarm_')) {
+                if (!a) throw new Error('arguments must be valid JSON');
+                if (name === 'swarm_memory_write') { memory.write(a.key, a.value, w.name, { status: a.status, evidence: a.evidence }); outText = `Written: ${a.key} (${String(a.value).length} chars, ${a.status === 'verified' ? 'verified' : 'hypothesis'})`; refreshMemoryUI(); }
+                else if (name === 'swarm_memory_read') { outText = a.key ? (memory.read(a.key) ?? `No such key. Keys: ${memory.keys().join(', ') || '(none)'}`) : 'Keys: ' + (memory.keys().join(', ') || '(none)'); }
+                else if (name === 'swarm_message') { memory.postMessage(w.name, a.to, a.content); outText = `Message posted to ${a.to}`; refreshBusUI(); }
+                else if (name === 'swarm_check_messages') {
+                  const inbox = memory.inbox(w.name, inboxCursor); inboxCursor = inbox.next;
+                  outText = inbox.messages.length ? inbox.messages.map(m => `From ${m.from}: ${m.content}`).join('\n') : 'No new messages.';
+                } else throw new Error('Unknown swarm tool');
+                log.push({ tool: name, args: a?.key || a?.to || '', output: outText.slice(0, 200), success: true });
+              } else {
+                // Ownership is enforced centrally so a worker cannot write outside its lane.
+                const guarded = SwarmCore.WRITE_TOOLS.has(name) && w.owns.length && a
+                  ? [a.path, a.source, a.destination].filter(Boolean).find(p => !SwarmCore.pathAllowed(p, w.owns)) : null;
+                if (guarded) { success = false; outText = `Error: "${guarded}" is outside your ownership (${w.owns.join(', ')}). Ask its owner via swarm_message.`; }
+                else {
+                  const res = await withWorkspace(wsRec, wsCache, () => executeTool(name, tc.function.arguments, swarmCtl.signal, null));
+                  const norm = HarnessRuntime.normalizeResult(res, name);
+                  outText = redactSecrets(norm.output);
+                  success = norm.status === 'ok' && !res._pendingApproval;
+                  if (res._pendingApproval) outText += '\n(Not applied: this edit needs user approval, which workers cannot request. Describe the change in your summary.)';
+                  outText = compressToolOutput(name, outText, stats);
+                }
+                log.push({ tool: name, args: (tc.function.arguments || '').slice(0, 100), output: outText.slice(0, 200), success });
               }
-            } else if (name === 'swarm_message') {
-              try {
-                const a = JSON.parse(tc.function.arguments);
-                memory.postMessage(wDef.name, a.to, a.content);
-                outText = `Message posted to ${a.to}`;
-                log.push({ tool: 'swarm_message', args: a.to, output: outText, success: true });
-                refreshBusUI(); scrollBottom();
-              } catch (e) {
-                outText = 'Error: ' + e.message;
-                log.push({ tool: 'swarm_message', args: '', output: outText, success: false });
-              }
-            } else {
-              try {
-                const res = await executeTool(name, tc.function.arguments, workerAbort.signal, null);
-                outText = redactSecrets((typeof res === 'string') ? res : (res?.output || ''));
-                outText = compressToolOutput(name, outText, workerStats);
-                log.push({ tool: name, args: (tc.function.arguments || '').slice(0, 100), output: outText.slice(0, 200), success: !outText.includes('Error:') && !outText.includes('ERROR') });
-              } catch (e) {
-                outText = 'Error: ' + e.message;
-                log.push({ tool: name, args: '', output: outText, success: false });
-              }
+            } catch (e) {
+              if (e.name === 'AbortError') { outText = 'Cancelled.'; success = false; }
+              else { outText = 'Error: ' + e.message; success = false; }
+              log.push({ tool: name, args: '', output: outText.slice(0, 200), success: false });
             }
-
+            if (success) roundOk = true;
             subMessages.push({ role: 'tool', tool_call_id: tc.id, content: outText });
           }
+          wb.record(toolCalls.map(tc => tc.function.name + ':' + tc.function.arguments), roundOk);
 
-          // Update worker UI progress
-          if (wBody) {
-            const logHtml = log.slice(-8).map(e =>
-              `<div class="swarm-worker-log-entry">
-                <span class="swarm-worker-log-tool">${esc(e.tool)}</span>
-                <span class="${e.success ? 'swarm-worker-log-ok' : 'swarm-worker-log-err'}">${e.success ? '✓' : '✗'}</span>
-                <span class="swarm-worker-log-out" title="${esc(e.output)}">${esc(e.output)}</span>
-              </div>`
-            ).join('');
-            wBody.innerHTML = `<div class="swarm-worker-log">${logHtml}</div>`;
+          // Deliver anything other workers posted since the last round.
+          const inbox = memory.inbox(w.name, inboxCursor); inboxCursor = inbox.next;
+          if (inbox.messages.length) subMessages.push({ role: 'user', content: '[Messages from other workers]\n' + inbox.messages.map(m => `- From **${m.from}**: ${m.content}`).join('\n') });
+          if (repeats >= 3 && !stallNudged) { stallNudged = true; subMessages.push({ role: 'user', content: '[SYSTEM] You repeated the same tool call 3 times with no progress. Change approach, or stop and explain what is blocking you.' }); }
+          else if (repeats >= 5) { stalled = true; break; }
+          setWorkerUI(w, 'running', { iter: `${iterations}/${maxIter}r · ~${workerTokens}tok`, html: `<div class="swarm-worker-log">${logHtml(log, 8)}</div>` });
+        } };
+        await rounds();
+
+        // Per-worker completion check: a worker is not done until its own command passes. Failures go back to the worker.
+        let checkInfo = null;
+        while (finishedNaturally && w.check_command && w.kind !== 'critic' && !swarmCtl.signal.aborted) {
+          setWorkerUI(w, 'running', { label: 'Checking…' });
+          let passed = false, out = '';
+          try {
+            const res = await withWorkspace(wsRec, wsCache, () => executeTool('run_tests', JSON.stringify({ command: w.check_command }), swarmCtl.signal, null));
+            const norm = HarnessRuntime.normalizeResult(res, 'run_tests');
+            passed = norm.status === 'ok' && (norm.exitCode == null || norm.exitCode === 0); out = redactSecrets(norm.output);
+          } catch (e) { if (e.name === 'AbortError') break; out = 'The check could not run: ' + e.message; }
+          checkInfo = { command: w.check_command, passed, attempts: (checkInfo?.attempts || 0) + (passed ? 0 : 1), output: out.slice(-1500) };
+          emit('check', { worker: w.name, passed, attempt: checkInfo.attempts });
+          log.push({ tool: 'check', args: w.check_command.slice(0, 100), output: (passed ? 'passed' : 'FAILED: ' + out).slice(0, 200), success: passed });
+          if (passed || checkInfo.attempts > w.check_retries) break;
+          finishedNaturally = false; wb.grant(3); maxIter = wb.limit; stalled = false;
+          subMessages.push({ role: 'user', content: '[CHECK FAILED] Your completion check `' + w.check_command + '` failed (attempt ' + checkInfo.attempts + ' of ' + (w.check_retries + 1) + '). Output:\n' + out.slice(-2000) + '\n\nFix the cause, re-run what you need to confirm, then finish with a new summary.' });
+          await rounds();
+        }
+
+        // Out of rounds: one tool-free turn so the work is reported instead of silently dropped.
+        let completedAtCap = false;
+        if (!finishedNaturally && !apiError && !swarmCtl.signal.aborted && (iterations >= maxIter || stalled || overBudget || contextFull || timedOut || swarmOver)) {
+          try {
+            subMessages.push({ role: 'user', content: '[SYSTEM] You must stop now: ' + (timedOut ? 'the deadline was reached' : swarmOver ? 'the swarm token budget was reached' : contextFull ? 'out of context space' : overBudget ? 'out of token budget' : stalled ? 'you are repeating work without new results' : 'out of rounds') + '. Without calling any tools, give your final summary, including anything unfinished. End with exactly one line: "STATUS: COMPLETE" or "STATUS: INCOMPLETE - <reason>".' });
+            const wrap = await workerStream([{ role: 'system', content: sysPrompt }, ...subMessages], null, swarmCtl.signal, null, w.model);
+            subMessages.push({ role: 'assistant', content: wrap.content || null });
+            completedAtCap = /STATUS:\s*COMPLETE\b/i.test(wrap.content || '');
+          } catch { /* fall through with what we have */ }
+        }
+        const lastAssistant = [...subMessages].reverse().find(m => m.role === 'assistant' && m.content);
+        const summary = lastAssistant?.content || '';
+        let status = SwarmCore.workerStatusFromLoop({ aborted: swarmCtl.signal.aborted, apiError, summary,
+          finishedNaturally: finishedNaturally || completedAtCap });
+        // A worker that never got to act cannot have completed its task, whatever its wrap-up message claims.
+        if (contextFull && iterations === 0 && status === 'done') status = 'incomplete';
+        if (checkInfo && !checkInfo.passed && status === 'done') status = 'incomplete';
+        if (stalled && status === 'done') status = 'incomplete';
+        const reason = apiError ? apiError : stalled ? 'Stalled: repeated the same tool call' : (checkInfo && !checkInfo.passed) ? `Completion check still failing after ${checkInfo.attempts} attempt(s): ${w.check_command}` : status === 'incomplete' ? (timedOut ? 'Deadline reached before finishing' : swarmOver ? 'Swarm token budget reached before finishing' : contextFull ? 'Context window filled up even after trimming old tool output' : overBudget ? `Hit the worker token budget (${w.tokenBudget}) before finishing` : iterations >= maxIter ? `Hit the ${maxIter}-round limit before finishing` : 'Stopped without a summary') : '';
+        return { name: w.name, role: w.role, model: w.model || state.model, kind: w.kind, check: checkInfo, tokens: workerTokens, trimmedOutputs: trimmedTotal, status, summary: summary || (reason ? `(no summary) ${reason}` : '(no summary produced)'), reason, log, iterations,
+          error: status === 'error' || status === 'incomplete', retryable: status === 'error' && !!apiError && !/^API 4\d\d/.test(apiError) };
+      }
+
+      function paintWorker(w, status) {
+          const r = results[w.name];
+          setWorkerUI(w, status, { label: SWARM_STATUS_LABEL[status] + (r?.verdict ? ' · ' + r.verdict.toUpperCase() : '') + (r?.revisions ? ' · rev ' + r.revisions : ''), iter: r ? `${r.iterations}r · ${r.log.length} calls · ~${r.tokens || 0}tok` : '',
+            html: r ? `<div class="swarm-worker-summary">${renderMd(r.summary)}</div>${r.reason && status !== 'done' ? `<div class="swarm-worker-summary" style="color:var(--red)">${esc(r.reason)}</div>` : ''}<div class="swarm-worker-log">${logHtml(r.log) || '<div style="padding:4px;color:var(--tx-4)">No tool calls</div>'}</div>` : '',
+            open: status !== 'done' });          const body = document.getElementById(`swarm-wbody-${w.index}`);
+          body?.querySelectorAll('pre code').forEach(b => { if (!b.dataset.hljs) { hljs.highlightElement(b); b.dataset.hljs = '1'; } });
+      }
+
+      // Sends a worker back with specific evidence, merges the result again, and keeps the artifact record consistent.
+      async function reviseWorker(target, critique, revisionNo) {
+        const prior = results[target.name] || {};
+        emit('revision', { worker: target.name, revision: revisionNo });
+        const rev = await runWorker(target, 1, { critique, revision: revisionNo, priorSummary: String(prior.summary || '').slice(0, 1200) });
+        rev.revisions = (prior.revisions || 0) + 1; rev.tokens = (rev.tokens || 0) + (prior.tokens || 0);
+        rev.log = (prior.log || []).concat(rev.log); rev.iterations = (prior.iterations || 0) + rev.iterations;
+        results[target.name] = rev;
+        if (rev.status === 'done' && iso?.tasks.has(target.name)) {
+          try { const m = await queueAbsorb(iso.integration.id, iso.tasks.get(target.name).id); if (!m.ok) { iso.conflicts.push({ worker: target.name, files: m.files || [] }); rev.status = 'incomplete'; rev.error = true; rev.reason = 'Merge conflict after revision in: ' + (m.files || []).join(', '); } }
+          catch (e) { rev.status = 'incomplete'; rev.error = true; rev.reason = 'Could not merge the revision: ' + e.message; }
+        }
+        emit('worker_finished', { worker: target.name, status: rev.status, revision: revisionNo, tokens: rev.tokens });
+        paintWorker(target, rev.status);
+        return rev;
+      }
+
+      // A critic reviews its author's work and may send it back for a bounded number of revisions.
+      async function getDiffFor(target) {
+        const rec = iso?.tasks.get(target.name);
+        if (!rec) return '';
+        try { return String((await featureRequest('tasks/diff', { taskId: rec.id }, swarmCtl.signal)).diff || '').slice(0, 12000); } catch { return ''; }
+      }
+      async function runCritic(w, attempt) {
+        const target = byName.get(w.reviews);
+        let round = 0, last;
+        while (true) {
+          round++;
+          last = await runWorker(w, attempt, { diff: await getDiffFor(target), authorSummary: String(results[target.name]?.summary || '').slice(0, 1500) });
+          last.rounds = round;
+          if (last.status !== 'done') return last;
+          const v = SwarmCore.parseVerdict(last.summary);
+          last.verdict = v.verdict; last.issues = v.issues;
+          emit('critic_verdict', { critic: w.name, target: target.name, verdict: v.verdict, round });
+          if (v.verdict === 'approve') return last;
+          if (v.verdict === 'unknown') { last.status = 'incomplete'; last.error = true; last.reason = 'The critic ended without a VERDICT line, so its review cannot be trusted.'; return last; }
+          if (round > w.max_revisions) {
+            last.status = 'incomplete'; last.error = true; last.reason = `Critic still requests changes after ${w.max_revisions} revision(s): ${v.issues.slice(0, 300)}`;
+            if (iso) iso.kept.add(target.name);
+            return last;
+          }
+          // Send the author back with the critic's evidence.
+          const rev = await reviseWorker(target, v.issues, round);
+          if (rev.status !== 'done') { last.status = 'incomplete'; last.error = true; last.reason = `The revision of ${target.name} did not complete: ${rev.reason || rev.status}`; if (iso) iso.kept.add(target.name); return last; }
+        }
+      }
+
+      // ── Schedule the graph ──
+      const sched = await SwarmCore.runSchedule(workers, async (w, attempt) => {
+        emit('worker_started', { worker: w.name, attempt });
+        const r = w.kind === 'critic' ? await runCritic(w, attempt) : await runWorker(w, attempt);
+        results[w.name] = r;
+        emit('worker_finished', { worker: w.name, status: r.status, reason: r.reason || '', tokens: r.tokens || 0, attempt });
+        if (iso && r.status === 'done' && iso.tasks.has(w.name)) {
+          try {
+            const m = await queueAbsorb(iso.integration.id, iso.tasks.get(w.name).id);
+            if (!m.ok) { iso.conflicts.push({ worker: w.name, files: m.files || [] }); emit('merge_conflict', { worker: w.name, files: m.files || [] }); r.status = 'incomplete'; r.reason = 'Merge conflict with already-merged workers in: ' + (m.files || []).join(', '); r.error = true; r.retryable = false; }
+          } catch (e) { r.status = 'incomplete'; r.reason = 'Could not merge this worker\'s changes: ' + e.message; r.error = true; r.retryable = false; }
+        }
+        if (iso && r.status !== 'done' && iso.tasks.get(w.name)) iso.kept.add(w.name);
+        return r;
+      }, {
+        concurrency, initial, signal: swarmCtl.signal, shouldStop: stopLaunching,
+        onStatus: (w, status, all) => {
+          if (status === 'running') { updateParentStatus(`Swarm: ${Object.values(all).filter(s => s === 'done').length}/${workers.length} done`, 'run'); return; }
+          const r = results[w.name];
+          if (status === 'pending') { setWorkerUI(w, 'pending', { label: 'Retrying…' }); return; }
+          paintWorker(w, status);
+          refreshMemoryUI(); refreshBusUI(); scrollBottom();
+          saveCheckpoint(all, false);
+        }
+      });
+      const statuses = sched.statuses;
+      for (const w of workers) if (statuses[w.name] === 'blocked' || statuses[w.name] === 'skipped') {
+        const why = statuses[w.name] === 'blocked' ? 'Not run: an upstream worker failed (' + w.depends_on.filter(d => ['error', 'incomplete', 'blocked', 'skipped'].includes(statuses[d])).join(', ') + ')' : (budgetHit ? 'Not run: session token budget reached' : stopLaunching() ? 'Not run: the contract\'s working deadline or token budget was reached' : 'Not run: swarm was cancelled');
+        results[w.name] = results[w.name] || { name: w.name, role: w.role, status: statuses[w.name], summary: why, reason: why, log: [], iterations: 0, error: false };
+        results[w.name].status = statuses[w.name];
+        setWorkerUI(w, statuses[w.name], { label: SWARM_STATUS_LABEL[statuses[w.name]], html: `<div class="swarm-worker-summary">${esc(why)}</div>`, iter: '', open: true });
+      }
+      if (budgetHit) notes.push('Stopped: session output-token budget reached.');
+
+      // ── Verification: executable evidence first, then an independent verifier judging the acceptance criteria ──
+      let verification = null, acceptance = null, repairs = 0;
+      const verifyCmd = (options.verifyCommand || '').trim();
+      const allDone = () => Object.values(statuses).every(s => s === 'done');
+      const canVerify = () => withinContract() && allDone();
+      const doVerifyCommand = async () => {
+        updateParentStatus('Verifying…', 'run');
+        let v;
+        try {
+          const res = await withWorkspace(iso?.integration, iso?.caches.get('__integration'), () => executeTool('run_tests', JSON.stringify({ command: verifyCmd }), swarmCtl.signal, null));
+          const norm = HarnessRuntime.normalizeResult(res, 'run_tests');
+          v = { command: verifyCmd, verified: norm.status === 'ok' && (norm.exitCode == null || norm.exitCode === 0), output: norm.output.slice(0, 1500) };
+        } catch (e) { v = { command: verifyCmd, verified: false, output: 'Verification could not run: ' + e.message }; }
+        emit('verify_command', { passed: v.verified });
+        return v;
+      };
+      // The verifier gets its own context: the goal, the criteria and the project itself, never the workers' narratives.
+      const runVerifier = async () => {
+        updateParentStatus('Independent verification…', 'run');
+        const taskText = 'Verify the project against these acceptance criteria:\n' + contract.criteria.map(c => `${c.id}: ${c.text}`).join('\n') +
+          (verification ? `\n\nA scripted check (${verification.command}) ${verification.verified ? 'PASSED' : 'FAILED'}:\n${verification.output}\n(This is one piece of evidence, not a verdict. Check the criteria yourself.)` : '') +
+          '\n\nReply with one line per criterion, exactly: "AC1: PASS - <evidence>", "AC2: FAIL - <evidence> (owner: <worker name>)" or "AC3: UNVERIFIABLE - <why>".';
+        const vw = { name: 'verifier', role: 'Independent verifier', task: taskText, kind: 'verifier', index: -1, depends_on: [], owns: [], tokenBudget: 0, model: contract.verifier_model, max_iterations: 10, check_command: '', check_retries: 0, retries: 0, on_failure: 'block', max_revisions: 0, reviews: '' };
+        const r = await runWorker(vw, 1, {});
+        const parsed = SwarmCore.parseCriteriaVerdicts(r.summary, contract.criteria);
+        const known = new Set(workers.filter(x => x.kind !== 'critic').map(x => x.name));
+        parsed.criteria.forEach(c => { if (c.owner && !known.has(c.owner)) c.owner = ''; });
+        emit('acceptance', { passed: parsed.criteria.filter(c => c.status === 'pass').length, total: parsed.criteria.length });
+        return { ...parsed, tokens: r.tokens || 0, raw: String(r.summary || '').slice(0, 3000), reason: r.reason || '' };
+      };
+      // Targeted repair: only the owning workers are sent back, with the verifier's evidence; accepted work is left alone.
+      const repairFailures = async acc => {
+        const failing = acc.criteria.filter(c => c.status === 'fail' || c.status === 'missing');
+        const core = workers.filter(x => x.kind !== 'critic'), groups = new Map(), unassigned = [];
+        for (const c of failing) { const owner = c.owner || (core.length === 1 ? core[0].name : ''); if (!owner) { unassigned.push(c.id); continue; } if (!groups.has(owner)) groups.set(owner, []); groups.get(owner).push(c); }
+        let fixed = 0;
+        for (const [owner, list] of [...groups].slice(0, 3)) {
+          if (!withinContract()) break;
+          const critique = 'An independent verifier checked the finished project and found these acceptance criteria NOT met:\n' + list.map(c => `- ${c.id} ${c.text}\n  Evidence: ${c.evidence}`).join('\n');
+          emit('repair', { worker: owner, criteria: list.map(c => c.id) });
+          const rev = await reviseWorker(byName.get(owner), critique, repairs + fixed + 1);
+          if (rev.status === 'done') fixed++; else { statuses[owner] = rev.status === 'error' ? 'error' : 'incomplete'; if (iso) iso.kept.add(owner); }
+        }
+        return { fixed, unassigned };
+      };
+      if (canVerify()) {
+        if (verifyCmd) verification = await doVerifyCommand();
+        if (contract.criteria.length) {
+          for (let round = 0; ; round++) {
+            acceptance = await runVerifier();
+            if (acceptance.allPass || round >= contract.repair_rounds || !canVerify()) break;
+            const rep = await repairFailures(acceptance);
+            if (rep.unassigned.length) notes.push('Could not route failing criteria (' + rep.unassigned.join(', ') + ') to a worker: set an owner on the criterion.');
+            if (!rep.fixed) break;
+            repairs += rep.fixed;
+            if (verifyCmd && canVerify()) verification = await doVerifyCommand();
           }
         }
-
-        totalIterations += iterations;
-        const lastAssistant = [...subMessages].reverse().find(m => m.role === 'assistant');
-        const summary = lastAssistant?.content || '(no summary produced)';
-        const workerError = swarmError;
-
-        workerResults.push({ name: wDef.name, role: wDef.role, summary, log, iterations, error: workerError });
-
-        // Update worker UI to done/error
-        if (wEl) wEl.className = 'swarm-worker ' + (workerError ? 'error' : 'done');
-        if (wStatus) { wStatus.className = 'swarm-worker-status ' + (workerError ? 'error' : 'done'); wStatus.textContent = workerError ? 'Error' : 'Done'; }
-        if (wIter) wIter.textContent = `${iterations}r · ${log.length} calls`;
-        if (wBody) {
-          const logHtml = log.map(e =>
-            `<div class="swarm-worker-log-entry">
-              <span class="swarm-worker-log-tool">${esc(e.tool)}</span>
-              <span class="${e.success ? 'swarm-worker-log-ok' : 'swarm-worker-log-err'}">${e.success ? '✓' : '✗'}</span>
-              <span class="swarm-worker-log-out" title="${esc(e.output)}">${esc(e.output)}</span>
-            </div>`
-          ).join('');
-          wBody.innerHTML = `
-            <div class="swarm-worker-summary">${renderMd(summary)}</div>
-            <div class="swarm-worker-log">${logHtml || '<div style="padding:4px;color:var(--tx-4)">No tool calls</div>'}</div>`;
-          wBody.classList.add('open');
-          wBody.querySelectorAll('pre code').forEach(b => { if (!b.dataset.hljs) { hljs.highlightElement(b); b.dataset.hljs = '1'; } });
+      } else if (verifyCmd || contract.criteria.length) notes.push('Verification was skipped: not every worker finished, or the contract\'s deadline or token budget was reached.');
+      let isolation = null;
+      if (iso) {
+        const allDone = Object.values(statuses).every(s => s === 'done') && !iso.conflicts.length;
+        isolation = { root: iso.root, integrationTaskId: iso.integration.id, branch: iso.integration.branch, changedFiles: [], conflicts: iso.conflicts, keptWorktrees: [] };
+        try { isolation.changedFiles = (await featureRequest('tasks/diff', { taskId: iso.integration.id })).changedFiles || []; }
+        catch (e) { notes.push('Could not summarise the combined changes: ' + e.message); }
+        const discard = id => featureRequest('tasks/discard', { taskId: id, confirm: true }).catch(() => {});
+        if (allDone) {
+          for (const rec of iso.tasks.values()) await discard(rec.id);
+          if (!isolation.changedFiles.length) { await discard(iso.integration.id); notes.push('Isolated swarm made no file changes.'); isolation.integrationTaskId = null; }
+          else notes.push(`All changes (${isolation.changedFiles.length} files) are on branch ${iso.integration.branch}, NOT in your working tree. Open Harness → Isolation to review and merge.`);
+        } else {
+          isolation.keptWorktrees = [...iso.tasks].filter(([n]) => statuses[n] !== 'done' || iso.kept.has(n) || iso.conflicts.some(c => c.worker === n)).map(([n, t]) => ({ worker: n, taskId: t.id, branch: t.branch }));
+          notes.push(`Isolated worktrees were kept for inspection (integration branch ${iso.integration.branch}). Review or discard them in Harness → Isolation.`);
         }
-
-        // Auto-open first done worker so user sees progress
-        if (wi === 0 && wBody) wBody.classList.add('open');
-        scrollBottom();
-        refreshMemoryUI();
-
-        // Reset per-worker error flag so subsequent workers start clean
-        swarmError = false;
-        if (workerError) break; // stop the swarm if a worker fatally errored
       }
+      // "Verified" needs every configured gate to pass: the scripted check and every acceptance criterion.
+      const hasGate = !!verifyCmd || contract.criteria.length > 0;
+      const gatePassed = (!verifyCmd || !!verification?.verified) && (!contract.criteria.length || !!acceptance?.allPass);
+      const outcome = SwarmCore.swarmOutcome(statuses, hasGate ? { verified: gatePassed } : null);
+      emit('outcome', { outcome, repairs });
+      const acceptanceText = acceptance ? 'Acceptance criteria (independent verifier):\n' + acceptance.criteria.map(c => `- ${c.id} ${c.status.toUpperCase()}: ${c.text} — ${c.evidence}`).join('\n') + '\n\n' : '';
 
       // ── Manager synthesis ──
       updateParentStatus('Manager synthesising…', 'run');
-      const synthPrompt = [
-        { role: 'system', content: `You are the manager of a multi-agent swarm. Your job is to synthesise the workers\' outputs into a final, cohesive summary for the user. Be concise. Highlight what was built/done, any important decisions in shared memory, and next steps if relevant.` },
-        { role: 'user', content:
-          `## Swarm Goal\n${goal}\n\n` +
-          `## Shared Memory (final state)\n${memory.toContextString()}\n\n` +
-          `## Worker Summaries\n` +
-          workerResults.map((w, i) => `### ${i+1}. ${w.name} — ${w.role}\n${w.summary}`).join('\n\n') +
-          `\n\nWrite the final synthesis.`
-        }
-      ];
-
-      let managerSummary = '(Synthesis unavailable)';
-      try {
-        const synthRes = await fetch(`${state.apiUrl}/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: state.model, messages: synthPrompt, stream: false, temperature: 0.3, max_tokens: 2000 }),
-          signal: parentSignal || undefined
-        });
-        if (synthRes.ok) {
-          const data = await synthRes.json();
-          managerSummary = data.choices?.[0]?.message?.content || managerSummary;
-        }
-      } catch { /* fall through */ }
+      const ordered = workers.map(w => results[w.name]);
+      const fallback = ordered.map(r => `**${r.name}** (${r.status}): ${String(r.summary).slice(0, 400)}`).join('\n\n');
+      let managerSummary = fallback;
+      if (!swarmCtl.signal.aborted) {
+        try {
+          const synthRes = await fetch(`${state.apiUrl}/v1/chat/completions`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: parentSignal || undefined,
+            body: JSON.stringify({ model: state.model, stream: false, temperature: 0.3, max_tokens: 2000, messages: [
+              { role: 'system', content: 'You are the manager of a multi-agent swarm. Synthesise the workers\' outputs into a final, cohesive summary for the user. Be concise and honest: lead with the overall outcome, name every worker that did not finish and why, report verification evidence if present, and list concrete next steps. Never claim work was done that a worker reports as incomplete, blocked or skipped.' },
+              { role: 'user', content: `## Swarm Goal\n${goal}\n\n## Outcome\n${outcome}${verification ? `\nVerification (${verification.command}): ${verification.verified ? 'PASSED' : 'FAILED'}\n${verification.output}` : ''}\n${notes.length ? '\nNotes: ' + notes.join(' ') + '\n' : ''}\n${acceptanceText}## Shared Memory (final state)\n${memory.toContextString()}\n\n## Worker Results\n` +
+                ordered.map((r, i) => `### ${i + 1}. ${r.name} — ${r.role} [${r.status}]\n${r.summary}`).join('\n\n') + '\n\nWrite the final synthesis.' }] }) });
+          if (synthRes.ok) { const data = await synthRes.json(); managerSummary = data.choices?.[0]?.message?.content || fallback; }
+        } catch { /* deterministic fallback above */ }
+      }
 
       const duration = performance.now() - startTime;
-      const anyWorkerError = workerResults.some(w => w.error);
-
-      // Update live panel to final state
-      const liveStatus = document.getElementById('swarm-live-status');
-      const liveMeta = document.getElementById('swarm-live-meta');
-      if (liveStatus) { liveStatus.className = 'swarm-status ' + (anyWorkerError ? 'error' : 'done'); liveStatus.textContent = anyWorkerError ? 'Error' : 'Done'; }
-      if (liveMeta) liveMeta.textContent = `${workerDefs.length} workers · ${totalIterations} rounds · ${(duration/1000).toFixed(1)}s`;
-
-      // Append manager summary to swarm panel
+      const totalIterations = ordered.reduce((n, r) => n + (r.iterations || 0), 0);
+      const failed = outcome === 'blocked';
+      const metrics = SwarmCore.runMetrics({ outcome, durationMs: duration, tokens: swarmTokens, statuses, attempts: sched.attempts, results, repairs, acceptance,
+        config: { critic: workers.some(w => w.kind === 'critic'), check: workers.some(w => w.check_command), isolated: !!iso, concurrency, criteria: contract.criteria.length > 0, workers: workers.length } });
+      const resultData = { goal, contract, acceptance, metrics, events: events.toJSON(), memoryDetail: memory.entries(), workers, workerResults: ordered, managerSummary, memory: memory.readAll(), messageBus: memory.bus, totalIterations, duration,
+        error: failed, outcome, statuses, verification, notes, isolation, attempts: sched.attempts };
+      const liveStatus = document.getElementById('swarm-live-status'), liveMeta = document.getElementById('swarm-live-meta');
+      if (liveStatus) { liveStatus.className = 'swarm-status ' + (failed ? 'error' : 'done'); liveStatus.textContent = { verified: 'Verified', needs_review: 'Needs review', blocked: 'Blocked' }[outcome]; }
+      if (liveMeta) liveMeta.textContent = `${workers.length} workers · ${totalIterations} rounds · ~${swarmTokens} tok · ${(duration / 1000).toFixed(1)}s`;
       const swarmBody = document.getElementById('swarm-live-body');
       if (swarmBody) {
         const synthEl = document.createElement('div');
         synthEl.className = 'swarm-manager-summary';
-        synthEl.innerHTML = `<div class="swarm-manager-label"><i class="fas fa-crown"></i> Manager Synthesis</div>${renderMd(managerSummary)}`;
+        synthEl.innerHTML = `<div class="swarm-manager-label"><i class="fas fa-crown"></i> Manager Synthesis</div>${acceptance ? '<div class="swarm-worker-summary">' + acceptance.criteria.map(c => `${c.status === 'pass' ? '✓' : c.status === 'fail' || c.status === 'missing' ? '✗' : '?'} <strong>${esc(c.id)}</strong> ${esc(c.text)} — ${esc(c.evidence)}`).join('<br>') + '</div>' : ''}${notes.length ? `<p style="font-size:10px;color:var(--tx-3)">${esc(notes.join(' '))}</p>` : ''}${renderMd(managerSummary)}`;
         swarmBody.appendChild(synthEl);
         synthEl.querySelectorAll('pre code').forEach(b => { if (!b.dataset.hljs) { hljs.highlightElement(b); b.dataset.hljs = '1'; } });
         addCopyBtns(synthEl);
+        synthEl.appendChild(makeSwarmTraceButton(resultData));
       }
-      refreshMemoryUI();
-      scrollBottom();
+      refreshMemoryUI(); scrollBottom();
+      updateParentStatus(failed ? 'Blocked' : 'Done', failed ? 'err' : 'ok');
+      // Unless every worker finished, keep the checkpoint so re-running the same call resumes instead of redoing work.
+      await saveCheckpoint(statuses, Object.values(statuses).every(s => s === 'done'));
 
-      updateParentStatus('Done', 'ok');
-
-      return { goal, workers: workerDefs, workerResults, managerSummary, memory: memory.readAll(), messageBus: memory.bus, totalIterations, duration, error: anyWorkerError };
+      if (!swarmCtl.signal.aborted) await persistSwarmRun(goal, metrics);
+      return resultData;
     }
 
     /** Render a completed swarm data object into a panel (for message replay). */
@@ -16864,7 +17638,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
 
       const workersHtml = (data.workerResults || []).map((w, i) => {
         const bg = colors[i % colors.length];
-        const wStatusCls = w.error ? 'error' : 'done';
+        const wStatusCls = w.status || (w.error ? 'error' : 'done');
         const logHtml = (w.log || []).map(e =>
           `<div class="swarm-worker-log-entry"><span class="swarm-worker-log-tool">${esc(e.tool)}</span><span class="${e.success ? 'swarm-worker-log-ok' : 'swarm-worker-log-err'}">${e.success ? '✓' : '✗'}</span><span class="swarm-worker-log-out" title="${esc(e.output)}">${esc(e.output)}</span></div>`
         ).join('');
@@ -16873,8 +17647,8 @@ Use git_diff to review changes before committing. git_diff without arguments sho
             <div class="swarm-worker-avatar" style="background:${bg}">${esc(w.name.slice(0,2).toUpperCase())}</div>
             <span class="swarm-worker-name">${esc(w.name)}</span>
             <span class="swarm-worker-role">${esc(w.role)}</span>
-            <span class="swarm-worker-status ${wStatusCls}">${wStatusCls === 'error' ? 'Error' : 'Done'}</span>
-            <span class="swarm-worker-iter">${w.iterations}r · ${(w.log||[]).length} calls</span>
+            <span class="swarm-worker-status ${wStatusCls}">${SWARM_STATUS_LABEL[wStatusCls] || wStatusCls}</span>
+            <span class="swarm-worker-iter">${w.iterations}r · ${(w.log||[]).length} calls${w.tokens ? ' · ~' + w.tokens + 'tok' : ''}</span>
           </div>
           <div class="swarm-worker-body">
             <div class="swarm-worker-summary">${renderMd(w.summary || '')}</div>
@@ -16888,7 +17662,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
           <i class="fas fa-network-wired swarm-icon"></i>
           <span class="swarm-label">Swarm</span>
           <span class="swarm-goal" title="${esc(data.goal || '')}">${esc(goalDisplay)}</span>
-          <span class="swarm-status ${statusCls}">${data.error ? 'Error' : 'Done'}</span>
+          <span class="swarm-status ${statusCls}">${data.outcome === 'verified' ? 'Verified' : data.outcome === 'needs_review' ? 'Needs review' : data.error ? 'Blocked' : 'Done'}</span>
           <span class="swarm-meta">${(data.workerResults||[]).length} workers · ${data.totalIterations} rounds${dur ? ' · ' + dur : ''}</span>
         </div>
         <div class="swarm-body" style="display:none">
@@ -16904,6 +17678,7 @@ Use git_diff to review changes before committing. git_diff without arguments sho
         </div>`;
 
       (container || $msg()).appendChild(el);
+      el.querySelector('.swarm-manager-summary')?.appendChild(makeSwarmTraceButton(data));
       scrollBottom();
       el.querySelectorAll('pre code').forEach(b => { if (!b.dataset.hljs) { hljs.highlightElement(b); b.dataset.hljs = '1'; } });
       addCopyBtns(el);

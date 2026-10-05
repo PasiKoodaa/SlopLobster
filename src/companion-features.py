@@ -251,6 +251,33 @@ def _evaluation_result(body):
     return {'changedFiles':changed,'unintendedWrites':unintended,'assertions':assertions,
             'passed':bool(assertions) and all(a['passed'] for a in assertions) and not unintended}
 
+def _commit_task(record, message):
+    path=record['path']
+    _git(path,'add','-A','--','.',':!.sloplobster')
+    if _git(path,'diff','--cached','--name-only'):
+        _git(path,'commit','-m',str(message)[:300])
+    return _git(path,'rev-parse','HEAD')
+
+def _absorb_task(body):
+    # Merge one task's branch into another so dependent work builds on upstream changes without touching the original workspace.
+    with _task_lock:
+        target=managed_task(body.get('taskId')); source=managed_task(body.get('fromTaskId'))
+        if target['id']==source['id']: raise ValueError('A task cannot absorb itself')
+        if target['kind']!='worktree' or source['kind']!='worktree': raise ValueError('Only Git worktree tasks can be combined')
+        if target['root']!=source['root']: raise ValueError('Tasks belong to different projects')
+        if target['status']!='active' or source['status']!='active': raise ValueError('Both tasks must be active')
+        for record in (target,source):
+            if _git(record['path'],'symbolic-ref','--short','HEAD')!=record['branch']: raise ValueError('Task branch changed; restore its generated branch first')
+        _commit_task(source,'SlopLobster: '+source['title'])
+        _commit_task(target,'SlopLobster: '+target['title'])
+        result=subprocess.run(['git','-C',target['path'],'merge','--no-ff','--no-edit',source['branch']],
+                              capture_output=True,encoding='utf-8',errors='replace',timeout=60)
+        if result.returncode:
+            files=[n for n in _git(target['path'],'diff','--name-only','--diff-filter=U','-z').split('\0') if n]
+            _git(target['path'],'merge','--abort',check=False)
+            return {'ok':False,'status':'conflict','files':files,'output':(result.stdout+'\n'+result.stderr).strip()}
+        return {'ok':True,'head':_git(target['path'],'rev-parse','HEAD'),'output':result.stdout.strip()}
+
 def feature_api(path, body):
     if path=='/features/tasks/create': return _create_worktree(body)
     if path=='/features/tasks/list':
@@ -263,6 +290,7 @@ def feature_api(path, body):
         record=managed_task(body.get('taskId'))
         diff=_task_diff(record)
         return {'diff':diff,'changedFiles':_task_changed_files(record),'reviewHash':_task_review_hash(record,diff)}
+    if path=='/features/tasks/absorb': return _absorb_task(body)
     if path=='/features/tasks/merge': return _merge_task(body)
     if path=='/features/tasks/discard': return _discard_task(body)
     if path=='/features/evaluations/create': return _evaluation_create(body)

@@ -32,7 +32,7 @@ elif sys.argv[1] == "inspect":
         for lo, hi in ranges:
             for index in range(lo - 1, min(hi, len(lines))): print(str(index+1) + ": " + lines[index])
 elif sys.argv[1] == "check":
-    commands = [["node", "scripts/build.mjs"], ["node", "scripts/verify-html.mjs"], ["node", "scripts/build.mjs", "--check"], ["node", "--test", "tests/harness.test.cjs", "tests/features.test.cjs", "tests/conversations.test.cjs"], [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py", "-v"]]
+    commands = [["node", "scripts/build.mjs"], ["node", "scripts/verify-html.mjs"], ["node", "scripts/build.mjs", "--check"], ["node", "--test", "tests/harness.test.cjs", "tests/features.test.cjs", "tests/conversations.test.cjs", "tests/swarm.test.cjs", "tests/swarm-run.test.cjs", "tests/subagent.test.cjs"], [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py", "-v"]]
     for command in commands:
         result = subprocess.run(command, cwd=ROOT)
         if result.returncode: sys.exit(result.returncode)

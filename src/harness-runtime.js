@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const readTools = new Set(['read_file', 'read_file_lines', 'read_file_summary', 'view_image',
-    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'web_search', 'fetch_url']);
+    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'web_search', 'fetch_url', 'swarm_history']);
   function isReadOnly(name) { return readTools.has(name); }
   const coordinators = new Set(['spawn_sub_agent', 'spawn_swarm', 'deep_research', 'ask_user', 'think']);
   let readers = 0, writer = false;
@@ -36,10 +36,14 @@
       } else {
         const start = i;
         while (i < calls.length && isReadOnly(calls[i].function.name)) i++;
-        const settled = await Promise.allSettled(calls.slice(start, i).map((call, j) => execute(call, start + j)));
-        const failure = settled.find(r => r.status === 'rejected');
-        if (failure) throw failure.reason; // all reads have finished before releasing the barrier
-        results.push(...settled.map(r => r.value));
+        const group = calls.slice(start, i);
+        const settled = await Promise.allSettled(group.map((call, j) => execute(call, start + j)));
+        // Cancellation propagates, but only after every read has finished.
+        const aborted = settled.find(r => r.status === 'rejected' && r.reason?.name === 'AbortError');
+        if (aborted) throw aborted.reason;
+        // Any other failure becomes that call's own error result so sibling results are never lost.
+        results.push(...settled.map((r, j) => r.status === 'fulfilled' ? r.value
+          : { tc: group[j], status: 'error', error: 'tool_failed', retryable: false, output: 'Error: ' + (r.reason?.message || r.reason) }));
       }
     }
     return results;
@@ -80,11 +84,14 @@
     return null;
   }
 
-  function normalizeResult(result) {
+  function normalizeResult(result, toolName) {
     if (!result || typeof result !== 'object') return { status: 'error', output: 'Error: tool returned an invalid result', error: 'invalid_result', retryable: false };
     const output = String(result.output ?? '');
     // Legacy handlers remain supported while structured handlers provide explicit status.
-    const failed = result.status ? result.status !== 'ok' : result.isError || result.error || (result.exitCode != null && result.exitCode !== 0) || /^(?:ERROR\b|Error:|\[(?:Error|.* Error)\])/im.test(output);
+    // The text heuristic only applies to legacy handlers. Read tools return file/page content, which may
+    // legitimately contain the word "Error:", so only explicit signals can fail them.
+    const heuristic = !(toolName && isReadOnly(toolName)) && /^(?:ERROR\b|Error:|\[(?:Error|.* Error)\])/im.test(output);
+    const failed = result.status ? result.status !== 'ok' : result.isError || result.error || (result.exitCode != null && result.exitCode !== 0) || heuristic;
     return { ...result, output, status: result.status || (failed ? 'error' : 'ok'),
       error: result.error || (failed ? 'tool_failed' : null), retryable: result.retryable ?? false };
   }
@@ -92,10 +99,14 @@
   function captureTaskState(state) {
     const previous = state.taskState || {};
     const directives = [...(previous.directives || [])];
+    const clip = text => text.length > 4000 ? text.slice(0, 4000) + ' …[truncated]' : text;
     for (const m of state.messages || []) {
       if (m._harnessContext || m.role !== 'user' || typeof m.content !== 'string' || /^\[(?:SYSTEM|ORIGINAL TASK|Previous conversation|HARNESS TASK STATE)/i.test(m.content) || /^A detailed progress file was saved/.test(m.content)) continue;
-      if (!directives.includes(m.content)) directives.push(m.content);
+      const text = clip(m.content);
+      if (!directives.includes(text)) directives.push(text);
     }
+    // Keep the first instruction (the original task framing) and the most recent ones.
+    while (directives.length > 40) directives.splice(1, 1);
     return { objective: state.originalTask || previous.objective || '', directives,
       plan: state.currentPlan || null, checklist: state.planItems || [], invariants: state.invariants || [],
       beliefs: state.beliefs || [], pendingSteering: (state.pendingSteerMessages || []).map(m => m.text) };

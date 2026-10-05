@@ -14,7 +14,7 @@ const escaped = companion.replace(/\\/g, '\\\\').replace(/`/g, '\\`').replace(/\
 html = html.replace(companionPattern, () => 'const COMPANION_SCRIPT = `' + escaped + '`;');
 const runtimePath = new URL('../src/harness-runtime.js', import.meta.url);
 if (fs.existsSync(runtimePath)) {
-  const runtime = ['harness-runtime.js','companion-client.js','companion-pairing.js','features-core.js','features-ui.js'].map(name => fs.readFileSync(new URL('../src/' + name, import.meta.url), 'utf8')).join('\n');
+  const runtime = ['harness-runtime.js','companion-client.js','companion-pairing.js','features-core.js','swarm-core.js','features-ui.js'].map(name => fs.readFileSync(new URL('../src/' + name, import.meta.url), 'utf8')).join('\n');
   const block = '<!-- BEGIN GENERATED HARNESS RUNTIME -->\n<script>\n' + runtime + '\n</script>\n<!-- END GENERATED HARNESS RUNTIME -->';
   const pattern = /<!-- BEGIN GENERATED HARNESS RUNTIME -->[\s\S]*?<!-- END GENERATED HARNESS RUNTIME -->/;
   if (pattern.test(html)) html = html.replace(pattern, () => block);

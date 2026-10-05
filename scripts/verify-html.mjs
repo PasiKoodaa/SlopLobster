@@ -7,6 +7,7 @@ new vm.Script(html.slice(mainStart, mainEnd), { filename: 'SlopLobster.html' });
 const generated = html.match(/<!-- BEGIN GENERATED HARNESS RUNTIME -->\s*<script>([\s\S]*?)<\/script>/);
 if (!generated) throw new Error('Harness runtime missing');
 new vm.Script(generated[1], { filename: 'harness-runtime' });
+if (!/root\.SwarmCore\s*=/.test(generated[1])) throw new Error('Swarm core missing from generated runtime');
 const embedded = vm.runInNewContext(html.match(/const COMPANION_SCRIPT = (`(?:\\.|[^`\\])*`);/)[0] + '\nCOMPANION_SCRIPT');
 if (embedded !== fs.readFileSync(new URL('../SlopLobster-companion.py', import.meta.url), 'utf8').replace(/\r\n/g, '\n')) throw new Error('Companion distributions differ');
 console.log('HTML scripts parse; embedded companion matches canonical Python.');
