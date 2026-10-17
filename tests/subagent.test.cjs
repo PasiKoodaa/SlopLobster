@@ -1,7 +1,7 @@
 'use strict';
 // Drives the real runSubAgent (extracted from the built HTML) with a scripted model.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
-const html = fs.readFileSync(require.resolve('../SlopLobster.html'), 'utf8').replace(/\r\n/g, '\n');
+const html = fs.readFileSync(require.resolve('../src/app.js'), 'utf8').replace(/\r\n/g, '\n');
 const a = html.indexOf('async function runSubAgent('), b = html.indexOf('function showSubAgentPanel(');
 assert.ok(a > 0 && b > a, 'runSubAgent not found');
 const block = html.slice(a, b);

@@ -1,0 +1,265 @@
+{
+  "version": 1,
+  "kind": "deterministic_harness_faults",
+  "created": "2026-10-17T19:00:30.416Z",
+  "verified": true,
+  "verifiedRate": 1,
+  "elapsedMs": 303.5714,
+  "cases": [
+    {
+      "scenario": "delete removes IndexedDB and caches and stays deleted after reload",
+      "verified": true,
+      "elapsedMs": 5.3993
+    },
+    {
+      "scenario": "workspace deletion failure is visible and keeps the conversation",
+      "verified": true,
+      "elapsedMs": 2.5077
+    },
+    {
+      "scenario": "deleted workspace files and stale index entries cannot restore a conversation",
+      "verified": true,
+      "elapsedMs": 3.3792
+    },
+    {
+      "scenario": "a queued database save completes before permanent deletion",
+      "verified": true,
+      "elapsedMs": 2.2922
+    },
+    {
+      "scenario": "fake model batch: edits and approvals finish before dependent tests",
+      "verified": true,
+      "elapsedMs": 39.381
+    },
+    {
+      "scenario": "shared lock prevents simultaneous writes from different workers",
+      "verified": true,
+      "elapsedMs": 61.2429
+    },
+    {
+      "scenario": "nested agent orchestration does not hold a write lock",
+      "verified": true,
+      "elapsedMs": 0.2903
+    },
+    {
+      "scenario": "schema validation checks nested types, enums, ranges and empty replacement text",
+      "verified": true,
+      "elapsedMs": 0.7039
+    },
+    {
+      "scenario": "structured status wins over ERROR text in a successful log",
+      "verified": true,
+      "elapsedMs": 0.3675
+    },
+    {
+      "scenario": "successful compaction retains objective, steering, checklist and invariants",
+      "verified": true,
+      "elapsedMs": 0.5766
+    },
+    {
+      "scenario": "failed or empty compaction does not mutate the checkpoint",
+      "verified": true,
+      "elapsedMs": 0.2942
+    },
+    {
+      "scenario": "client uses seconds, resumes output by cursor, and never relaunches after transport loss",
+      "verified": true,
+      "elapsedMs": 21.7815
+    },
+    {
+      "scenario": "actual approval handlers reject stale empty files and newly created paths",
+      "verified": true,
+      "elapsedMs": 4.7427
+    },
+    {
+      "scenario": "LM Studio browser connection errors explain CORS and separate tokens",
+      "verified": true,
+      "elapsedMs": 0.2968
+    },
+    {
+      "scenario": "SSE preserves UTF-8 across every byte boundary and accepts CRLF and trailing terminal events",
+      "verified": true,
+      "elapsedMs": 29.503
+    },
+    {
+      "scenario": "DONE completes without waiting for an indefinitely open socket",
+      "verified": true,
+      "elapsedMs": 0.8667
+    },
+    {
+      "scenario": "malformed events, event limits and server error events fail explicitly",
+      "verified": true,
+      "elapsedMs": 1.6962
+    },
+    {
+      "scenario": "valid-looking mutation arguments at premature EOF never escape the model transport",
+      "verified": true,
+      "elapsedMs": 4.6087
+    },
+    {
+      "scenario": "cancellation and inactivity discard partial calls and cancel the reader",
+      "verified": true,
+      "elapsedMs": 21.6595
+    },
+    {
+      "scenario": "run accounting survives compaction and reload, excludes paused time, and permits raised limits",
+      "verified": true,
+      "elapsedMs": 0.833
+    },
+    {
+      "scenario": "concurrent requests reserve a shared budget and charge exact usage once",
+      "verified": true,
+      "elapsedMs": 4.3477
+    },
+    {
+      "scenario": "tool-free passes and failed HTTP calls release reservations without free successful generations",
+      "verified": true,
+      "elapsedMs": 4.057
+    },
+    {
+      "scenario": "context allowance accounts for schemas and images without tokenizing base64 as source text",
+      "verified": true,
+      "elapsedMs": 1.5248
+    },
+    {
+      "scenario": "even valid JSON tool calls are withheld when generation hits the output limit",
+      "verified": true,
+      "elapsedMs": 1.9181
+    },
+    {
+      "scenario": "resumed output budgets include tokens spent before the reload",
+      "verified": true,
+      "elapsedMs": 2.6364
+    },
+    {
+      "scenario": "reload during generation conservatively charges its persisted reservation",
+      "verified": true,
+      "elapsedMs": 0.2181
+    },
+    {
+      "scenario": "reconciliation collects sibling results but retains and blocks unknown command outcomes",
+      "verified": true,
+      "elapsedMs": 1.8468
+    },
+    {
+      "scenario": "the live-model benchmark fixtures satisfy the evaluation contract",
+      "verified": true,
+      "elapsedMs": 1.8267
+    },
+    {
+      "scenario": "real agent loop stops at the total limit despite repeated compaction and cannot reset it on reload",
+      "verified": true,
+      "elapsedMs": 5.5445
+    },
+    {
+      "scenario": "real agent loop cleans up and preserves the budget when command recovery fails",
+      "verified": true,
+      "elapsedMs": 1.1245
+    },
+    {
+      "scenario": "an explicit retry after completed work receives a new allowance",
+      "verified": true,
+      "elapsedMs": 1.6123
+    },
+    {
+      "scenario": "verification uses explicit exit status; missing exit codes and timeouts cannot pass",
+      "verified": true,
+      "elapsedMs": 1.7262
+    },
+    {
+      "scenario": "baseline comparison distinguishes old failures, changed identities and resolved failures",
+      "verified": true,
+      "elapsedMs": 1.3527
+    },
+    {
+      "scenario": "partial failure identities and changed commands never receive a confident comparison",
+      "verified": true,
+      "elapsedMs": 0.3581
+    },
+    {
+      "scenario": "common test identities survive Node, unittest, Jest and Go formatting",
+      "verified": true,
+      "elapsedMs": 0.6403
+    },
+    {
+      "scenario": "a baseline pass is evidence of the initial state, never post-edit verification",
+      "verified": true,
+      "elapsedMs": 1.5763
+    },
+    {
+      "scenario": "baseline is captured once, survives resume, and never auto-repairs pre-existing failures",
+      "verified": true,
+      "elapsedMs": 7.8478
+    },
+    {
+      "scenario": "automatic repair is reserved for new failures and respects its persisted retry limit",
+      "verified": true,
+      "elapsedMs": 2.4657
+    },
+    {
+      "scenario": "failed checks without an untouched baseline are reported without blame or auto-repair",
+      "verified": true,
+      "elapsedMs": 1.8927
+    },
+    {
+      "scenario": "a changed workspace or command invalidates the old baseline instead of recapturing after edits",
+      "verified": true,
+      "elapsedMs": 1.8629
+    },
+    {
+      "scenario": "a captured baseline interrupted by reload is not rerun or invented",
+      "verified": true,
+      "elapsedMs": 1.6028
+    },
+    {
+      "scenario": "review-only tool settings prevent automatic test execution",
+      "verified": true,
+      "elapsedMs": 1.3976
+    },
+    {
+      "scenario": "same-name folders and companion working-directory changes invalidate a baseline",
+      "verified": true,
+      "elapsedMs": 1.2118
+    },
+    {
+      "scenario": "the real tool wrapper waits for journal commit before calling its handler",
+      "verified": true,
+      "elapsedMs": 3.8634
+    },
+    {
+      "scenario": "approval completion waits for a durable decision before allowing a mutation",
+      "verified": true,
+      "elapsedMs": 3.9985
+    },
+    {
+      "scenario": "journal events commit in order, sanitize before storage and reconstruct unfinished operations",
+      "verified": true,
+      "elapsedMs": 1.1952
+    },
+    {
+      "scenario": "journal payloads are bounded while operation correlation survives truncation",
+      "verified": true,
+      "elapsedMs": 1.0922
+    },
+    {
+      "scenario": "storage failure prevents a journaled side effect; later appends can report recovery",
+      "verified": true,
+      "elapsedMs": 0.2286
+    },
+    {
+      "scenario": "actual model transport journals completion and failure without executing a model reply",
+      "verified": true,
+      "elapsedMs": 26.7342
+    },
+    {
+      "scenario": "command dispatch waits for its journal record and uses the same stable ID in the outcome",
+      "verified": true,
+      "elapsedMs": 2.1548
+    },
+    {
+      "scenario": "offline replay reports sequence damage and runs without an inference backend",
+      "verified": true,
+      "elapsedMs": 70.7818
+    }
+  ]
+}

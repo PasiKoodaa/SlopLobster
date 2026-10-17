@@ -1,7 +1,7 @@
 'use strict';
 // Drives the real runSwarm (extracted from the built HTML) against stubbed model, tools, DOM and storage.
 const test = require('node:test'), assert = require('node:assert/strict'), fs = require('node:fs'), vm = require('node:vm');
-const html = fs.readFileSync(require.resolve('../SlopLobster.html'), 'utf8').replace(/\r\n/g, '\n');
+const html = fs.readFileSync(require.resolve('../src/app.js'), 'utf8').replace(/\r\n/g, '\n');
 const a = html.indexOf('MULTI-AGENT SWARM'), start = html.lastIndexOf('/* ═', a), end = html.indexOf('/** Render a completed swarm data object');
 assert.ok(a > 0 && end > a, 'swarm block markers not found');
 const block = html.slice(start, end);
@@ -11,7 +11,8 @@ function harness(opts = {}) {
   const sse = chunks => new Response(new ReadableStream({ start(c) { for (const o of chunks) c.enqueue(new TextEncoder().encode('data: ' + JSON.stringify(o) + '\n\n')); c.enqueue(new TextEncoder().encode('data: [DONE]\n\n')); c.close(); } }));
   const env = { db: new Map(), tools: [], models: [], req: [], tasks: new Map(), seen: [], conflictOn: opts.conflictOn || null, n: 0 };
   Object.defineProperty(env, 'saved', { get: () => env.db.get('swarm:c1') ?? null });
-  const ctx = { console, setTimeout, AbortController, TextDecoder, TextEncoder, Response, ReadableStream, performance, DOMException,
+  const ctx = { console, setTimeout, clearTimeout, AbortController, AbortSignal, TextDecoder, TextEncoder, Response, ReadableStream, performance, DOMException,
+    HarnessRunState: require('../src/run-state.js'), HarnessModelStream: require('../src/model-stream.js'),
     SwarmCore: require('../src/swarm-core.js'), HarnessRuntime: require('../src/harness-runtime.js'),
     document: { getElementById: () => null, createElement: () => el() }, $msg: () => el(), scrollBottom() {}, esc: s => String(s ?? ''), renderMd: String, hljs: { highlightElement() {} }, addCopyBtns() {},
     state: { modelInfoMap: new Map(opts.ctx ? [['main', { loadedContextLength: opts.ctx }]] : []), apiUrl: 'http://x', model: 'main', maxTokens: 4000, tokenBudget: 0, activeConvId: 'c1', dirName: 'p', dirHandle: 'REAL', fileCache: new Map([['real', 1]]), requireEditApproval: true, compConnected: opts.noCompanion ? false : true, compInfo: {}, projectMemoryText: '', invariants: [] },
@@ -46,7 +47,9 @@ function harness(opts = {}) {
       return sse([{ choices: [{ delta: { content: said ?? ('finished ' + who + (body.tools ? '' : ' STATUS: COMPLETE')) } }] }]);
     } };
   if (opts.clock) ctx.Date = class extends Date { static now() { return opts.clock.t; } };
-  vm.createContext(ctx); vm.runInContext(block + '\nglobalThis.__run = runSwarm; globalThis.__trace = buildSwarmTrace; globalThis.__history = swarmHistory;', ctx);
+  vm.createContext(ctx);
+  vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
+  vm.runInContext(block + '\nglobalThis.__run = runSwarm; globalThis.__trace = buildSwarmTrace; globalThis.__history = swarmHistory;', ctx);
   return { run: ctx.__run, trace: ctx.__trace, history: ctx.__history, env, ctx };
 }
 const W = (name, e = {}) => ({ name, role: 'r', task: 't', ...e });
@@ -207,7 +210,7 @@ test('check_command: failure is fed back and the worker gets extra rounds to fix
   const r = await h.run('k1', [W('dev', { check_command: 'npm test' })], 5, undefined, null, {});
   const w = r.workerResults[0];
   assert.equal(w.status, 'done'); assert.equal(w.check.passed, true); assert.equal(w.check.attempts, 1);
-  const lastCall = h.env.calls.at(-1); assert.ok(lastCall.messages.some(m => m.role === 'user' && /\[CHECK FAILED\]/.test(m.content) && /FAIL: 1 test/.test(m.content)));
+  const lastCall = h.env.calls.filter(c => c.who === 'dev').at(-1); assert.ok(lastCall.messages.some(m => m.role === 'user' && /\[CHECK FAILED\]/.test(m.content) && /FAIL: 1 test/.test(m.content)));
 });
 test('check_command that keeps failing leaves the worker incomplete with the evidence', async () => {
   const h = harness({ call: (who, saw) => saw ? null : { name: 'read_file', arguments: '{"path":"a"}' } });

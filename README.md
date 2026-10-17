@@ -54,7 +54,8 @@ SlopLobster gives you a Claude Code / Cursor-like agent experience powered by an
 - **Edit approval mode** — requires Accept/Reject before applying changes by default (can be turned off for fully autonomous edits)
 - **Write verification** — reads files back after writing to confirm integrity
 - **Syntax checking** — auto-runs `py_compile` / `node -c` after edits
-- **Auto-verify loop** — runs your test command after edits and auto-fixes on failure (configurable retries)
+- **Baseline-aware verification** — records your configured check before the first model turn, checks again after changes, and compares test failure identities. New failures trigger bounded repair attempts. Existing failures stay visible without automatic unrelated repairs; missing or ambiguous results stay unclassified.
+- **Durable run journal** — saves ordered model requests, tool calls, approval decisions, command outcomes, verification comparisons, compactions and checkpoints in IndexedDB. Review the timeline and export JSON from **Harness → Journal**. Offline replay reconstructs the recorded timeline without calling a model or executing tools.
 
 ### Shell & Git
 - **Full shell access** via the companion server — any OS command works
@@ -475,17 +476,33 @@ Compaction persists a task checkpoint containing the objective, user instruction
 
 ### Development and regression checks
 
-Canonical sources are `SlopLobster-companion.py` and the modules in `src/`. The generated backend block comes from `src/companion-features.py`; feature logic and UI come from `src/features-core.js` and `src/features-ui.js`. Run `node scripts/build.mjs` after changing them to update their embedded copies in the single-file HTML. Other UI code remains in `SlopLobster.html`; users of the distributed HTML do not need Node or a build step.
+Edit the canonical sources, then run `node scripts/build.mjs`. The distributable `SlopLobster.html` is generated entirely from `src/ui.html`, `src/app.js`, and the runtime modules in `src/`. Model requests live in `src/model-client.js`, strict SSE parsing in `src/model-stream.js`, orchestration in `src/agent-loop.js`, and durable run accounting in `src/run-state.js`. The companion remains canonical outside its generated features block, which comes from `src/companion-features.py` and `src/companion-services.py`. Do not edit generated HTML directly. The old `scripts/swarm-core.js` path forwards to the canonical `src/swarm-core.js` implementation. Users of the distribution do not need Node or a build step.
 
 ```text
-node scripts/build.mjs --check
-node scripts/verify-html.mjs
-node --test tests/harness.test.cjs tests/features.test.cjs
-node tests/browser-smoke.mjs
-python -m unittest discover -s tests -p "test*.py" -v
+node scripts/build.mjs
+node scripts/check.mjs
+node scripts/check.mjs --browser
+node scripts/evaluate-harness.mjs --output harness-evaluation.json
+node scripts/replay-journal.mjs exported-journal.json
 ```
 
-The tests use scripted tool batches and local temporary workspaces. They need no model download, LM Studio connection, or third-party dependencies, and cover ordering, worker conflicts, compaction failure, nested schema validation, reconnects, cancellation, idempotency, bounded output, and companion access policy.
+The checks require Node 24 and Python 3.10 or later. Set `PYTHON` to select an interpreter. `--skip-python` runs just build and JavaScript checks; `--browser` additionally runs the Windows Chrome/Edge smoke test. CI runs build freshness and the complete JavaScript/Python suites on Windows and Linux, and browser smoke checks on Windows. The tests use scripted model responses and temporary workspaces, with no model download or LM Studio connection.
+
+`evaluate-harness.mjs` exports per-scenario pass/fail results, verified rate and elapsed time for deterministic faults: compaction and reload at the run limit, interrupted streams containing valid-looking mutations, malformed or split SSE events, stalled models, cancellation, command reconciliation, stale approvals and conversation persistence. These are harness reliability measurements; they do not measure live-model quality or inference throughput. To compare local models, paste `tests/fixtures/coding-benchmark.json` into Harness → Evaluations. Its four coding fixtures exercise narrow edits, coordinated changes, instruction scope and filenames with spaces. The existing evaluation report measures verified completion, unintended writes, tokens and time. No model benchmark runs automatically.
+
+Main-agent iteration counts, generated output tokens and active elapsed time are saved with the task. Compaction, Pause/Resume and reload preserve the allowance. A new submitted user task starts a new allowance; resuming an exhausted task requires raising its limit. Settings → General adds an optional active-time limit and a model inactivity timeout. Explicitly paused time is excluded. A reload during generation conservatively charges its saved output reservation and the uncertain elapsed time until recovery; raise the allowance after inspecting the task if necessary. Output allowances are reserved before requests, shared by concurrent workers, and capped by remaining context. Summaries, specialist passes and partial interrupted responses also consume output budget; token counts are labelled estimates when the model server omits usage. Queue token limits apply to each task across resumes and also respect the session cap.
+
+The **Minimal / Low-Context** profile enables concise built-in instructions and a core coding toolset, including test execution. Specialist tools are loaded through `get_tool_schema`; disabled tools remain unavailable. Visible `think` calls can be disabled independently of the model's native reasoning. Custom system prompts are preserved. The context popup shows estimated schema and retrieved-context costs alongside instructions and conversation history. Interrupted or malformed model responses pause the task without executing partial calls; retry requires an explicit resume.
+
+### Baselines and run journals
+
+Set **Settings → Tools → Auto-verify command** to enable baseline comparison. Before the first model turn, the harness runs that command in the active workspace (including an isolated worktree when selected). The baseline, scope and repair count survive compaction and resume. A changed command or workspace, interrupted baseline, unavailable companion or disabled `run_tests` tool prevents a confident comparison; the harness does not manufacture a new baseline after edits have begun. Dangerous command patterns retain their confirmation requirement.
+
+Checks use explicit execution status and exit codes. An exception, timeout or unknown exit code cannot pass. For identifiable test output, the comparison distinguishes newly reported, still reported and no-longer-reported failure identities; equal failure counts alone are insufficient. A passing baseline followed by a failed check also triggers regression investigation. Existing failures and unclassified failures are reported without automatic repair instructions. Comparisons describe observed results, not proof that an edit caused a failure. Baseline success alone never counts as post-edit verification. Review both records in **Harness → Evidence**; full acceptance criteria still require their own evidence.
+
+Run journaling is enabled by default and can be disabled under **Settings → General → Record run journal**. It uses dedicated IndexedDB stores, independent of the optional Evidence feature. Events commit before model requests, tool dispatch and accepted edits; failures to save pause new actions. A crash can leave a started operation without a completion event. **Harness → Journal** flags those operations for inspection and allows exporting the full event sequence. Command recovery still uses the existing stable command IDs; the journal never authorizes replaying an action. Deleting a conversation deletes its journals and events too.
+
+Journal payloads contain redacted, bounded excerpts, request metadata and outcomes. They omit native reasoning and image data; full prompts are not recorded. Each detail is capped at roughly 24,000 characters, so an export is a diagnostic trace rather than a complete byte-for-byte recording. `node scripts/replay-journal.mjs exported-journal.json` reconstructs its timeline, unfinished operations and verification results offline. It performs no inference, shell commands or file edits. Keep the exported JSON when reporting a harness bug. If an older SlopLobster tab blocks the database upgrade, close it and reload this version.
 
 ## Harness features (1.6.0)
 

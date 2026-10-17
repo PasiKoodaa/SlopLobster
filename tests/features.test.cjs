@@ -121,7 +121,7 @@ test('queue parks questions, respects budgets, and resumes without rerunning ind
   context.switchConv=async id=>{context.state.activeConvId=id;context.state.messages=[];};
   context.agentLoop=async()=>{
     const f=context.harnessFeatureState, task=f.queueTask;
-    runs.push({id:task.id,iters:context.state.maxIters,budget:context.state.tokenBudget,answer:context.state.messages.at(-1)?.content});
+    runs.push({id:task.id,iters:context.state.maxIters,budget:context.state.tokenBudget,runBudget:context.state.runTokenLimit,answer:context.state.messages.at(-1)?.content});
     assert.equal(await vm.runInContext('beforeHarnessRun()',context),true);
     context.state.running=true;
     if(task.id==='question'&&!task.answered) {
@@ -134,7 +134,7 @@ test('queue parks questions, respects budgets, and resumes without rerunning ind
   vm.runInContext("harnessFeatureState.prefs.queue=true; state.maxIters=99;state.tokenBudget=900;state.allowAskUser=false; harnessFeatureState.data.queue=[HarnessFeatures.newQueueTask('Ask',{id:'question',maxIters:3,tokenBudget:500}),HarnessFeatures.newQueueTask('Dependent',{id:'dependent'}),HarnessFeatures.newQueueTask('Independent',{id:'independent',independent:true})];harnessFeatureState.workspace='no-workspace';",context);
   await vm.runInContext('startHarnessQueue()',context);
   assert.deepEqual(runs.map(r=>r.id),['question','independent']);
-  assert.equal(runs[0].iters,3); assert.equal(runs[0].budget,600);
+  assert.equal(runs[0].iters,3); assert.equal(runs[0].budget,900); assert.equal(runs[0].runBudget,500);
   assert.equal(context.state.maxIters,99); assert.equal(context.state.tokenBudget,900);
   assert.equal(context.state.allowAskUser,false);
   const queue=context.harnessFeatureState.data.queue;

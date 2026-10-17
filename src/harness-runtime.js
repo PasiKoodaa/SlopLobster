@@ -108,6 +108,8 @@
     // Keep the first instruction (the original task framing) and the most recent ones.
     while (directives.length > 40) directives.splice(1, 1);
     return { objective: state.originalTask || previous.objective || '', directives,
+      run: state.runController?.snapshot() || previous.run || null,
+      verification: state.verificationState || previous.verification || null,
       plan: state.currentPlan || null, checklist: state.planItems || [], invariants: state.invariants || [],
       beliefs: state.beliefs || [], pendingSteering: (state.pendingSteerMessages || []).map(m => m.text) };
   }
@@ -134,7 +136,17 @@
     return message;
   }
 
-  const api = { isReadOnly, runToolBatch, withToolLock, validateSchema, normalizeResult, captureTaskState, compactMessages, compactTransaction, connectionErrorHint };
+  function estimateRequestTokens(messages, tools, estimate = text => Math.ceil(text.length / 3.8)) {
+    const history = (messages || []).reduce((total, message) => {
+      const content = Array.isArray(message.content)
+        ? message.content.reduce((n, part) => n + (part.type === 'image_url' ? 1024 : estimate(String(part.text || ''))), 0)
+        : estimate(String(message.content || ''));
+      return total + content + estimate(JSON.stringify(message.tool_calls || [])) + 4;
+    }, 0);
+    return history + estimate(JSON.stringify(tools || []));
+  }
+
+  const api = { isReadOnly, runToolBatch, withToolLock, validateSchema, normalizeResult, captureTaskState, compactMessages, compactTransaction, connectionErrorHint, estimateRequestTokens };
   root.HarnessRuntime = api;
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(globalThis);

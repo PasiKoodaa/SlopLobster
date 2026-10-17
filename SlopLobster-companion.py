@@ -278,38 +278,22 @@ def _translate_for_cmd(cmd):
     return cmd
 
 def _detect_python_cmd():
-    for cmd in ['python3', 'python']:
-        if shutil.which(cmd):
-            ver = ''
-            try:
-                r = subprocess.run([cmd, '--version'], capture_output=True, text=True, timeout=5)
-                if r.returncode == 0:
-                    ver = ' (' + r.stdout.strip().split('\n')[0] + ')'
-            except Exception:
-                pass
-            return cmd + ver
-    return sys.executable + ' (sys.executable fallback)'
+    # The running interpreter is known to work. Windows App Execution Aliases
+    # can block in CreateProcess itself, before subprocess's timeout starts.
+    import shlex
+    executable = sys.executable
+    if WINDOWS_BASH:
+        return shlex.quote(executable.replace('\\', '/'))
+    if platform.system() == 'Windows':
+        return subprocess.list2cmdline([executable])
+    return shlex.quote(executable)
 
 PYTHON_CMD = _detect_python_cmd()
 
 def _detect_python_env():
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; print(sys.prefix); print(sys.executable); "
-             "import importlib.util; "
-             "conda=importlib.util.find_spec('conda'); print('conda' if conda else 'none'); "
-             "ve=hasattr(sys,'real_prefix') or (hasattr(sys,'base_prefix') and sys.base_prefix!=sys.prefix); print('venv' if ve else 'none')"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5
-        )
-        if result.returncode == 0:
-            lines = result.stdout.strip().split("\n")
-            return {"prefix": lines[0] if len(lines) > 0 else "",
-                    "executable": lines[1] if len(lines) > 1 else "",
-                    "type": lines[2] if len(lines) > 2 else "none",
-                    "is_venv": lines[3] == "venv" if len(lines) > 3 else False}
-    except Exception: pass
-    return {"prefix": "", "executable": sys.executable, "type": "none", "is_venv": False}
+    is_venv = hasattr(sys, 'real_prefix') or sys.prefix != getattr(sys, 'base_prefix', sys.prefix)
+    kind = 'conda' if os.path.isdir(os.path.join(sys.prefix, 'conda-meta')) else 'none'
+    return {"prefix": sys.prefix, "executable": sys.executable, "type": kind, "is_venv": is_venv}
 
 
 def _detect_node():

@@ -9,21 +9,26 @@
       maxIters:Math.max(1,Math.min(200,Number(options.maxIters)||32)), tokenBudget:Math.max(256,Math.min(100000,Number(options.tokenBudget)||8000)),
       status:'pending', created:Date.now()};
   }
+  // A failed task blocks later dependent tasks unless the user marks it skipped; independent tasks always proceed.
   function nextQueueTask(tasks) {
     for (let i=0;i<tasks.length;i++) {
       const task=tasks[i];
       if (task.status!=='pending') continue;
-      if (task.independent || tasks.slice(0,i).every(t => t.status==='done' || t.status==='discarded')) return task;
+      if (task.independent || tasks.slice(0,i).every(t => ['done','discarded','skipped'].includes(t.status))) return task;
     }
     return null;
   }
+  function blockedQueueTasks(tasks) {
+    return tasks.filter((task,i) => task.status==='pending' && !task.independent && tasks.slice(0,i).some(t => ['failed','error','blocked'].includes(t.status)));
+  }
   function evidenceSummary(events) {
-    const writes=new Set(), checks=[], issues=[], screenshots=[];
+    const writes=new Set(), checks=[], baselines=[], issues=[], screenshots=[];
     let lastWrite=-1;
     events.forEach((event,index) => {
       if (event.kind==='change' && event.status==='ok') { writes.add(event.path); lastWrite=index; }
       if (event.kind==='mutation' && event.status!=='pending') lastWrite=index;
       if (event.kind==='check') checks.push({...event,index});
+      if (event.kind==='baseline') baselines.push(event);
       if (event.status==='blocked' || event.status==='unknown') issues.push(event);
       if (event.kind==='screenshot') screenshots.push(event);
     });
@@ -31,20 +36,24 @@
     checks.forEach(check => latest.set(check.command||check.tool,check));
     const verification=[...latest.values()];
     const verified=verification.length>0 && verification.every(c => c.status==='ok' && c.exitCode===0 && c.index>lastWrite);
-    return {files:[...writes], checks:verification, issues, screenshots, verified, outcome:issues.length?'blocked':verified?'verified':'needs_review'};
+    return {files:[...writes], checks:verification, baselines, issues, screenshots, verified, outcome:issues.length?'blocked':verified?'verified':'needs_review'};
   }
-  function searchKnowledge(records, query, workspace, limit=5) {
+  // embeddingScores: optional {recordId: cosine}. Blends semantic similarity with keyword matches when available.
+  function searchKnowledge(records, query, workspace, limit=5, embeddingScores=null) {
     const words=[...new Set(String(query).toLowerCase().match(/[a-z0-9_]{2,}/g)||[])];
     return records.filter(r => r.workspace===workspace).map(record => {
       const text=(record.title+' '+record.text).toLowerCase();
-      const score=words.reduce((sum,w) => sum+(text.includes(w)?1:0),0)+(record.verified?0.2:0);
+      const cosine=embeddingScores?.[record.id];
+      const semantic=Number.isFinite(cosine) && cosine>=0.35 ? cosine*Math.max(2,words.length/2) : 0;
+      const score=words.reduce((sum,w) => sum+(text.includes(w)?1:0),0)+semantic+(record.verified?0.2:0);
       return {...record, score};
     }).filter(r => r.score>0.2).sort((a,b)=>b.score-a.score || b.created-a.created).slice(0,limit);
   }
   function recipeCandidates(files) {
     const candidates=[];
-    if (files['package.json']) {
-      const p=JSON.parse(files['package.json']);
+    let p=null;
+    if (files['package.json']) { try { p=JSON.parse(files['package.json']); } catch { p=null; } }
+    if (p && typeof p==='object') {
       const runner=Object.hasOwn(files,'pnpm-lock.yaml')?'pnpm':Object.hasOwn(files,'yarn.lock')?'yarn':Object.hasOwn(files,'bun.lock')?'bun':'npm';
       const recipe={name:p.name||'Node project', setup:runner+' install', build:'', lint:'', test:'', preview:''};
       for (const name of ['build','lint','test']) if (p.scripts?.[name]) recipe[name]=runner+' run '+name;
@@ -65,7 +74,7 @@
     }
     return spec;
   }
-  const api={defaults,preferences,newQueueTask,nextQueueTask,evidenceSummary,searchKnowledge,recipeCandidates,validateBenchmark};
+  const api={defaults,preferences,newQueueTask,nextQueueTask,blockedQueueTasks,evidenceSummary,searchKnowledge,recipeCandidates,validateBenchmark};
   root.HarnessFeatures=api;
   if (typeof module!=='undefined' && module.exports) module.exports=api;
 })(globalThis);

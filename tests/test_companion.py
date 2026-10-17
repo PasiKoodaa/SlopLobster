@@ -144,4 +144,20 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(result['exitCode'], 0)
 
 
+class EnvironmentTests(unittest.TestCase):
+    def test_python_probe_uses_running_interpreter_without_launching_aliases(self):
+        from unittest import mock
+        with mock.patch.object(c.subprocess, 'run', side_effect=AssertionError('must not launch a probe')):
+            command = c._detect_python_cmd()
+            expected = c.sys.executable.replace('\\', '/') if c.WINDOWS_BASH else c.sys.executable
+            self.assertIn(expected, command.strip("'\""))
+
+    def test_python_environment_is_read_without_a_subprocess(self):
+        from unittest import mock
+        with mock.patch.object(c.subprocess, 'run', side_effect=AssertionError('must not launch a probe')):
+            environment = c._detect_python_env()
+            self.assertEqual(environment['executable'], c.sys.executable)
+            self.assertEqual(environment['prefix'], c.sys.prefix)
+
+
 if __name__ == '__main__': unittest.main()
