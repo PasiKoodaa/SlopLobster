@@ -28,6 +28,7 @@ function verificationMessage(text) {
   updateContextMeter();
 }
 function noteVerificationMutation(name, result) {
+  if (HarnessVerification.requiresRecheck(name, result)) state.workspaceRevision = (state.workspaceRevision || 0) + 1;
   if (state.verificationState && HarnessVerification.requiresRecheck(name, result)) {
     state.verificationState.mutations++;
     saveCurrentConv();
@@ -44,7 +45,8 @@ async function executeVerificationCommand(command, signal) {
     const result = await execViaCompanion(actual, Math.max(state.cmdTimeout || 60, 120), signal,
       text => rpTermAppend(text), true);
     rpTermEnd(result.output || '');
-    return { ...result, command: actual };
+    const outcome={...result,command:actual};
+    return typeof archiveToolOutput==='function' ? await archiveToolOutput('run_tests',outcome,result.commandId || 'verification:'+crypto.randomUUID()) : outcome;
   } catch (error) {
     rpTermEnd(error.message);
     if (signal?.aborted || error.name === 'AbortError') throw error;
@@ -65,7 +67,7 @@ async function ensureVerificationBaseline() {
   if (v.scope !== scope || v.command !== command) {
     // A changed environment is not an untouched baseline for the already edited task.
     v.baseline = { command, status: 'unavailable', output: 'Verification command or workspace changed during this task.' };
-    v.command = command; v.scope = scope;
+    v.command = command; v.scope = scope; v.latest = null;
   }
   if (v.capturing && !v.baseline) v.baseline = { command, status: 'unavailable', output: 'Baseline capture was interrupted. Its command outcome must be reconciled before resuming.' };
   if (!v.baseline) {
@@ -77,11 +79,12 @@ async function ensureVerificationBaseline() {
       appendMsg('system', 'Recording verification baseline: ' + command);
       const result = await executeVerificationCommand(command, state.abortCtrl?.signal);
       v.baseline = HarnessVerification.snapshot(result.command || command, { ...result, output: redactSecrets(String(result.output || '')) });
+      v.baseline.artifactId=result._artifactId;
       v.capturing = false;
     }
     await recordRunEvent('verification.baseline', { command, scope, baseline: v.baseline });
     recordHarnessTool('run_tests', { command }, { status: v.baseline.status === 'passed' ? 'ok' : 'error',
-      exitCode: v.baseline.exitCode, output: v.baseline.output, _verification: { phase: 'baseline', snapshot: v.baseline } }, 'baseline:' + runId);
+      exitCode: v.baseline.exitCode, output: v.baseline.output, _artifactId:v.baseline.artifactId, _verification: { phase: 'baseline', snapshot: v.baseline } }, 'baseline:' + runId);
     saveCurrentConv(); await saveActiveAgentState();
   }
   if (!state.messages.some(m => m._verificationContext && m._baselineRunId === runId)) {
@@ -96,11 +99,16 @@ async function verifyAfterChanges() {
   const v = await ensureVerificationBaseline();
   if (!v || !state.running || !state.compConnected || state.disabledTools?.has('run_tests')) return null;
   const command = String(state.autoVerifyCommand).trim();
+  const before = await captureWorkspaceStamp();
   const result = await executeVerificationCommand(command, state.abortCtrl?.signal);
   if (!state.running) return null;
   const current = HarnessVerification.snapshot(result.command || command, { ...result, output: redactSecrets(String(result.output || '')) });
-  const comparison = HarnessVerification.compare(v.baseline, current);
-  v.latest = { snapshot: current, comparison };
+  let comparison = HarnessVerification.compare(v.baseline, current);
+  const after = await captureWorkspaceStamp();
+  const stale = HarnessCore.canonical(before) !== HarnessCore.canonical(after);
+  if (stale) { current.status = 'inconclusive'; current.output += '\nWorkspace changed while verification was running; the result is stale.'; }
+  if (stale) comparison = HarnessVerification.compare(v.baseline, current);
+  v.latest = { snapshot: current, comparison, revision:v.mutations, workspaceStamp:after, stale, artifactId:result._artifactId };
   await recordRunEvent('verification.result', { command, scope: v.scope, snapshot: current, comparison });
   recordHarnessTool('run_tests', { command }, { ...result, status: current.status === 'passed' ? 'ok' : current.status === 'failed' ? 'error' : current.status, output: current.output,
     _verification: { phase: 'after_changes', snapshot: current, comparison } }, 'verification:' + crypto.randomUUID());

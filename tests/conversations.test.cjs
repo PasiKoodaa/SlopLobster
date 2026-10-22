@@ -11,7 +11,7 @@ function setup(root=null){
   dbDelete:async(_,id)=>{records.delete(id);return true;},hfBusy:()=>false,showToast:(text,kind)=>notices.push({text,kind}),
   renderConvList:()=>{},restoreHarnessConversation:async()=>{},switchToChat:()=>{},replayMessages:()=>{},updateContextMeter:()=>{},scheduleRealTokenSync:()=>{},
   switchConv:async id=>{context.state.activeConvId=id;},doNewConversation:async()=>{context.state.activeConvId='new';context.state.conversations.push({id:'new',messages:[]});}};
- vm.createContext(context);
+ vm.createContext(require('./runtime-modules.cjs')(context));
  vm.runInContext(between("    const STORAGE_KEY =", "    function saveCurrentConv()")+
   between("    async function deleteConv(","    function filterConversations")+
   between("    const CONV_DIR =", "    /** Get storage status"),context);

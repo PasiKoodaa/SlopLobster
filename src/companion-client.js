@@ -45,6 +45,7 @@ function commandDelay(signal, ms = 250) {
 
 async function followCommandJob(job, signal, onLine) {
   const key = 'command:' + job.commandId;
+  if(job.result) return job.result;
   let polls = 0;
   try {
     while (true) {
@@ -56,12 +57,14 @@ async function followCommandJob(job, signal, onLine) {
       job.cursor = data.cursor;
       job.output = redactSecrets(job.output || '');
       if (data.status !== 'running' && data.status !== 'cancelling') {
-        await dbDelete('agent_states', key);
         let output = job.output;
         if (data.truncated) output += '\n[Output truncated at companion limit]';
         if (data.exitCode !== 0) output += '\n[exit code: ' + data.exitCode + ']';
-        return { output, status: data.status, exitCode: data.exitCode, truncated: data.truncated,
+        const result = { output, status: data.status, exitCode: data.exitCode, truncated: data.truncated,
           commandId: job.commandId, error: data.status === 'ok' ? null : data.status, retryable: false };
+        Object.assign(job,{status:'completed',result});
+        if(!(await dbSet('agent_states',{...job,id:key}))) throw new Error('Completed command could not be checkpointed; its result must be recovered.');
+        return result;
       }
       await dbSet('agent_states', { ...job, id: key });
       // Fast at first for short commands, then back off so long builds do not hammer the companion.
@@ -74,13 +77,14 @@ async function followCommandJob(job, signal, onLine) {
   }
 }
 
-async function executeCompanionJob(command, timeout, externalSignal, onLine, toolCallId, cwd) {
+async function executeCompanionJob(command, timeout, externalSignal, onLine, toolCallId, cwd, argv) {
   const commandId = crypto.randomUUID();
   const job = { id: 'command:' + commandId, commandId, convId: state.activeConvId, toolCallId,
-    companionUrl: state.compUrl, command: redactSecrets(command), cursor: 0, output: '', timestamp: Date.now() };
+    operationId:state.messages?.flatMap(m=>m.tool_calls || []).findLast(tc=>tc.id===toolCallId)?._operationId,
+    companionUrl: state.compUrl, cwd, command: redactSecrets(command), cursor: 0, output: '', timestamp: Date.now() };
   if (typeof recordRunEvent === 'function') await recordRunEvent('command.started', { operationId: commandId, toolCallId, command, timeout, cwd });
   // Save the ID before launching so a lost start response can be reconciled after reload.
-  await dbSet('agent_states', job);
+  if(!(await dbSet('agent_states', job))) throw new Error('Command could not be checkpointed; it was not launched.');
   const signals = [AbortSignal.timeout(timeout * 1000 + 15000)];
   if (externalSignal) signals.push(externalSignal);
   if (state.running && state.abortCtrl?.signal) signals.push(state.abortCtrl.signal);
@@ -90,7 +94,7 @@ async function executeCompanionJob(command, timeout, externalSignal, onLine, too
   let started = false;
   try {
     if (signal.aborted) throw signal.reason;
-    await commandRequest('/commands/start', { id: commandId, command, timeout, cwd, taskId: typeof featureTask==='function'?featureTask()?.id:undefined }, signal);
+    await commandRequest('/commands/start', { id: commandId, command, timeout, cwd, ...(argv?{argv}:{}), taskId: typeof featureTask==='function'?featureTask()?.id:undefined }, signal);
     started = true;
     const result = await followCommandJob(job, signal, onLine);
     if (typeof recordRunEvent === 'function') await recordRunEvent('command.completed', { operationId: commandId, status: result.status, exitCode: result.exitCode, output: result.output });
@@ -110,17 +114,21 @@ async function executeCompanionJob(command, timeout, externalSignal, onLine, too
   } finally { signal.removeEventListener('abort', cancel); }
 }
 
-async function reconcileCommandJobs() {
-  const jobs = (await dbGetAll('agent_states')).filter(job => job.commandId && job.convId === state.activeConvId);
+async function collectCompletedCommandJobs() { return reconcileCommandJobs(true); }
+async function reconcileCommandJobs(completedOnly=false) {
+  const jobs = (await dbGetAll('agent_states')).filter(job => job.commandId && job.convId === state.activeConvId && (!completedOnly || job.result));
   const unresolved = [];
+  // Completed receipts are normal durable-result cleanup, not interrupted jobs.
+  // Report actual recovery once per batch instead of flooding the conversation.
+  const unfinished = jobs.filter(job => !job.result);
+  if (unfinished.length) appendMsg('system', 'Recovering ' + unfinished.length + ' unfinished command' + (unfinished.length === 1 ? '' : 's') + ' from saved state. Commands will not be repeated.');
   for (const job of jobs) {
     // Collect sibling outcomes before pausing. Unknown commands are never silently forgotten.
-    if (job.companionUrl !== state.compUrl) {
+    if (!job.result && job.companionUrl !== state.compUrl) {
       appendMsg('system', 'Skipped unfinished command ' + job.commandId + ': it belongs to another companion (' + job.companionUrl + '). Reconnect there to recover it.');
       unresolved.push(job.commandId + ': reconnect to its original companion');
       continue;
     }
-    appendMsg('system', 'Recovering command ' + job.commandId + '…');
     let result;
     try { result = await followCommandJob(job, state.abortCtrl?.signal); }
     catch (error) {
@@ -132,9 +140,20 @@ async function reconcileCommandJobs() {
             value => resolve(value !== false), { yesLabel: 'Acknowledge outcome' }));
         if (acknowledged) {
           if (typeof recordRunEvent === 'function') await recordRunEvent('command.acknowledged', { operationId: job.commandId, status: 'unknown' });
-          await dbDelete('agent_states', 'command:' + job.commandId);
+          if(typeof noteVerificationMutation==='function') noteVerificationMutation('execute_command',{status:'unknown'});
+          if(typeof resolveHarnessEvidence==='function') resolveHarnessEvidence(job.toolCallId,{status:'resolved',output:'User acknowledged the unknown command outcome; inspect the current workspace.'});
+          const index=state.messages.findLastIndex(m=>m.tool_calls?.some(tc=>job.operationId?tc._operationId===job.operationId:tc.id===job.toolCallId));
+          if(index>=0) {
+            let insert=index+1,previous;
+            while(insert<state.messages.length && state.messages[insert].role==='tool') {if(state.messages[insert].tool_call_id===job.toolCallId) previous=state.messages[insert];insert++;}
+            const content='Command outcome is unknown. The user acknowledged it; it was not replayed. Inspect current files before continuing.';
+            if(previous) previous.content=content;
+            else state.messages.splice(insert,0,{role:'tool',tool_call_id:job.toolCallId,content,_commandId:job.commandId,_status:'resolved'});
+          }
           state.messages.push({ role: 'user', content: '[Command recovery] The user acknowledged the unknown outcome of command ' + job.commandId + '. Do not repeat it; inspect current workspace state before acting.' });
-          saveCurrentConv();
+          if(typeof persistCommandConversation==='function') await persistCommandConversation(job,{status:'unknown',acknowledged:true});
+          else await saveCurrentConv();
+          if(await dbDelete('agent_states',job.id || 'command:'+job.commandId)===false) throw new Error('Command acknowledgment could not be saved.');
           continue;
         }
       } else appendMsg('system', 'Could not recover command ' + job.commandId + ': ' + error.message);
@@ -142,13 +161,21 @@ async function reconcileCommandJobs() {
       continue;
     }
     const content = result.output || 'Command completed with exit code ' + result.exitCode;
+    const callIndex=state.messages.findLastIndex(m=>m.tool_calls?.some(tc=>job.operationId?tc._operationId===job.operationId:tc.id===job.toolCallId));
+    let previous,insert=callIndex+1;
+    if(callIndex>=0) while(insert<state.messages.length && state.messages[insert].role==='tool') {
+      if(state.messages[insert].tool_call_id===job.toolCallId) previous=state.messages[insert]; insert++;
+    }
+    const recovering=!completedOnly || !previous && !!job.toolCallId;
+    if(recovering && typeof noteVerificationMutation==='function') noteVerificationMutation('execute_command',result);
+    if(recovering && typeof resolveHarnessEvidence==='function') resolveHarnessEvidence(job.toolCallId,result,job.operationId);
     if (typeof recordRunEvent === 'function') await recordRunEvent('command.completed', { operationId: job.commandId, recovered: true, status: result.status, exitCode: result.exitCode, output: content });
-    const previous = job.toolCallId && state.messages.find(m => m.role === 'tool' && m.tool_call_id === job.toolCallId);
-    const pending = job.toolCallId && state.messages.some(m => m.tool_calls?.some(tc => tc.id === job.toolCallId));
-    if (previous) previous.content = content;
-    else if (pending) state.messages.push({ role: 'tool', tool_call_id: job.toolCallId, content });
-    else state.messages.push({ role: 'user', content: '[Recovered command result]\n' + content });
-    saveCurrentConv();
+    if(previous) {if(recovering) previous.content=content;previous._commandId=job.commandId;previous._status=result.status;}
+    else if(callIndex>=0) state.messages.splice(insert,0,{role:'tool',tool_call_id:job.toolCallId,content,_commandId:job.commandId,_status:result.status});
+    else if(!completedOnly) state.messages.push({role:'user',content:'[Recovered command result]\n'+content,_commandId:job.commandId});
+    if(typeof persistCommandConversation==='function') await persistCommandConversation(job,result);
+    else await saveCurrentConv();
+    if(await dbDelete('agent_states',job.id || 'command:'+job.commandId)===false) throw new Error('Command result saved, but recovery receipt could not be acknowledged.');
   }
   if (unresolved.length) throw new Error('Unresolved command outcomes: ' + unresolved.join('; '));
 }

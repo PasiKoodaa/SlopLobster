@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SlopLobster</title>
-  <script src="vendor/tailwind.min.js"></script>
+  <link rel="stylesheet" href="vendor/tailwind.min.css">
   <link rel="stylesheet" href="vendor/fonts.css">
   <link rel="stylesheet" href="vendor/github-dark-dimmed.min.css">
   <script src="vendor/highlight.min.js"></script>
@@ -14,9 +14,6 @@
   <script src="vendor/purify.min.js"></script>
   <script src="vendor/pdf.min.js"></script>
   <link rel="stylesheet" href="vendor/all.min.css">
-  <script>
-    tailwind.config = { theme: { extend: { fontFamily: { mono: ['JetBrains Mono', 'monospace'], sans: ['Space Grotesk', 'sans-serif'] } } } }
-  </script>
   <style>
     :root {
       --bg-0: #08080a;
@@ -5826,7 +5823,7 @@
                   <button class="rp-file-act" id="rp-preview-reload"
                     title="Reload"><i class="fas fa-rotate"></i></button>
                   <button class="rp-file-act" id="rp-preview-open"
-                    title="Open in browser"><i class="fas fa-external-link"></i></button>
+                    title="Open in browser with normal storage and login support"><i class="fas fa-external-link"></i></button>
                   <button class="rp-file-act" id="rp-preview-stop"
                     title="Stop server"><i class="fas fa-stop"></i></button>
                 </div>
@@ -5849,7 +5846,9 @@
               <div id="rp-preview-iframe-wrap"
                 style="flex:1;overflow:hidden;background:white;border-radius:0 0 6px 6px">
                 <iframe id="rp-preview-iframe"
-                  sandbox="allow-scripts allow-modals allow-forms allow-popups allow-same-origin allow-downloads"
+                  title="Isolated development preview"
+                  sandbox="allow-scripts allow-modals allow-forms allow-popups allow-downloads"
+                  referrerpolicy="no-referrer"
                   style="width:100%;height:100%;border:none"></iframe>
               </div>
             </div>
@@ -5949,18 +5948,26 @@
             <select id="s-backend-type" style="background:var(--bg-2);border:1px solid var(--border);color:var(--tx-0);padding:4px 8px;border-radius:5px;font-size:12px;font-family:'JetBrains Mono',monospace;width:100%" onchange="onBackendTypeChange(this.value)">
               <option value="lmstudio">LM Studio</option>
               <option value="llamacpp">llama.cpp (server)</option>
+              <option value="vllm">vLLM</option>
+              <option value="localai">LocalAI</option>
+              <option value="jan">Jan</option>
+              <option value="gpt4all">GPT4All</option>
+              <option value="textgen">text-generation-webui</option>
+              <option value="openai-compatible">Other OpenAI-compatible local server</option>
             </select>
-            <div class="hint" id="s-backend-hint">LM Studio: full model load/unload support. Default port 1234.</div>
+            <div class="hint" id="s-backend-hint">LM Studio native model loading and metadata. Enable CORS in its server settings.</div>
           </div>
-          <div class="field" id="s-llamacpp-vision-field" style="display:none">
+          <div class="field" id="s-local-vision-field" style="display:none">
             <label>Vision / Multimodal</label>
             <div style="display:flex;align-items:center;gap:8px">
-              <input type="checkbox" id="s-llamacpp-vision" style="accent-color:var(--accent)" onchange="state.llamacppVision=this.checked;updateVisionUI();persistSettings()">
-              <span style="font-size:11px;color:var(--tx-2)">mmproj loaded (vision capable)</span>
+              <input type="checkbox" id="s-local-vision" style="accent-color:var(--accent)" onchange="state.localVision=this.checked;updateVisionUI();persistSettings()">
+              <span style="font-size:11px;color:var(--tx-2)">Selected model accepts images</span>
             </div>
-            <div class="hint">Check this if you started llama.cpp with <code style="background:var(--bg-3);padding:1px 4px;border-radius:3px">--mmproj</code>. Auto-detected via /props when connecting.</div>
+            <div class="hint" id="s-local-vision-hint">Check this if the selected model accepts image input. llama.cpp vision is also probed when connecting.</div>
           </div>
-          <div class="field"><label id="s-api-url-label">API URL</label><input id="s-api-url" value="http://localhost:1234"><div class="hint">For LM Studio, turn on Enable CORS in its server settings. The companion session token is separate from the model API.</div></div>
+          <div class="field"><label id="s-api-url-label">API URL</label><input id="s-api-url" value="http://localhost:1234" onchange="restoreModelApiKey(this.value)"><div class="hint" id="s-api-url-hint">For LM Studio, turn on Enable CORS in its server settings.</div></div>
+          <div class="field"><label>Model API key</label><input id="s-api-key" type="password" autocomplete="off"><div class="hint" id="s-api-key-hint">Optional for local servers with authentication. Stored for this browser tab only.</div></div>
+          <div class="field"><button class="sb-btn" id="s-capability-probe" onclick="probeBackendCapabilities()">Check model capabilities</button><div class="hint" id="s-capability-result">Tests streaming and one harmless tool call on the selected model using up to 128 output tokens. No tool is executed.</div></div>
           <div class="field"><label>Companion Server URL</label><input id="s-comp-url" value="http://127.0.0.1:8765"></div>
           <div class="field"><label>Companion session token</label><input id="s-comp-token" type="password" autocomplete="off"><div class="hint">Paste the token printed when the companion starts. Stored for this browser tab only.</div></div>
           <div class="field"><label>Command Timeout (s)</label><input type="number" id="s-cmd-timeout" value="60" min="5" max="600"></div>
@@ -6065,7 +6072,7 @@
             <div class="hint">Auto-repairs malformed JSON and prompts models to self-correct on schema mismatches.</div>
           </div>
           <div class="field"><label>Max Tokens</label><input type="number" id="s-max-tokens" value="60000" min="256" max="131072"></div>
-          <div style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
+          <div id="model-load-settings" style="border-top:1px solid var(--border);padding-top:12px;margin-top:4px">
             <div style="font-size:11px;font-weight:700;color:var(--tx-0);margin-bottom:10px;display:flex;align-items:center;gap:6px">
               <i class="fas fa-microchip" style="color:var(--accent);font-size:12px"></i>
               Model Load Settings (LM Studio)
@@ -6236,6 +6243,7 @@
               <button class="sb-btn" onclick="deleteSysProfile()">Delete</button>
             </div>
             <textarea id="s-sys-prompt" rows="8"></textarea>
+            <div class="hint">Reference links are loaded on demand. {{REFERENCE_SECTION}} adds brief guidance; the old {{REFERENCE_SITES}} token is migrated automatically. Unsupported placeholders pause the request so you can correct the prompt.</div>
           </div>
         </div>
 

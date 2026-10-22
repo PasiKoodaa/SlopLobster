@@ -21,7 +21,7 @@
   function blockedQueueTasks(tasks) {
     return tasks.filter((task,i) => task.status==='pending' && !task.independent && tasks.slice(0,i).some(t => ['failed','error','blocked'].includes(t.status)));
   }
-  function evidenceSummary(events) {
+  function evidenceSummary(events, currentRevision) {
     const writes=new Set(), checks=[], baselines=[], issues=[], screenshots=[];
     let lastWrite=-1;
     events.forEach((event,index) => {
@@ -35,7 +35,8 @@
     const latest=new Map();
     checks.forEach(check => latest.set(check.command||check.tool,check));
     const verification=[...latest.values()];
-    const verified=verification.length>0 && verification.every(c => c.status==='ok' && c.exitCode===0 && c.index>lastWrite);
+    const verified=verification.length>0 && verification.every(c => c.status==='ok' && !c.stale && c.exitCode===0 && c.index>lastWrite &&
+      (currentRevision === undefined || c.workspaceRevision === currentRevision));
     return {files:[...writes], checks:verification, baselines, issues, screenshots, verified, outcome:issues.length?'blocked':verified?'verified':'needs_review'};
   }
   // embeddingScores: optional {recordId: cosine}. Blends semantic similarity with keyword matches when available.

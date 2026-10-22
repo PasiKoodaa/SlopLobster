@@ -15,7 +15,7 @@ function client(fetch, saved) {
     setTimeout, clearTimeout, console, state: { apiUrl: 'http://fixture', maxTokens: 500, tokenBudget: 0, runController: Runs.create(saved) },
     _sessionTotalOut: 0, _updateSessionTok(n) { ctx._sessionTotalOut += n; },
     estimateTokens: s => Math.ceil(s.length / 3.8), fetch };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
   return ctx;
 }
 test('SSE preserves UTF-8 across every byte boundary and accepts CRLF and trailing terminal events', async () => {
@@ -87,7 +87,7 @@ test('context allowance accounts for schemas and images without tokenizing base6
   let requests = 0;
   const ctx = client(async () => { requests++; return response(['data: [DONE]\n\n']); });
   ctx.state.ctxWindow = 280;
-  await assert.rejects(ctx.requestModel({ messages: [{ role: 'user', content: 'x'.repeat(200) }], max_tokens: 500 }), { name: 'BudgetError' });
+  await assert.rejects(ctx.requestModel({ messages: [{ role: 'user', content: 'x'.repeat(200) }], max_tokens: 500 }), { code: 'context_overflow' });
   assert.equal(requests, 0);
 });
 test('even valid JSON tool calls are withheld when generation hits the output limit', async () => {
@@ -117,12 +117,12 @@ test('reconciliation collects sibling results but retains and blocks unknown com
     ['done', { commandId: 'done', convId: 'c', companionUrl: 'http://fixture', command: 'check' }]]);
   const ctx = { state: { activeConvId: 'c', compUrl: 'http://fixture', messages: [] }, appendMsg() {}, saveCurrentConv() {},
     dbGetAll: async () => [...jobs.values()], dbDelete: async (_, id) => jobs.delete(id.replace('command:', '')) };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/companion-client.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/companion-client.js'), 'utf8'), ctx);
   const recovered = [];
   ctx.followCommandJob = async job => {
     recovered.push(job.commandId);
     if (job.commandId === 'lost') throw Object.assign(new Error('not found'), { status: 404 });
-    jobs.delete('done'); return { output: 'verified sibling', exitCode: 0 };
+    return { output: 'verified sibling', exitCode: 0 };
   };
   await assert.rejects(ctx.reconcileCommandJobs(), /Unresolved command outcomes/);
   assert.deepEqual(recovered, ['lost', 'done']); assert.equal(jobs.has('lost'), true);
@@ -151,7 +151,7 @@ function loop(saved) {
     showCompletionSummary() {}, afterHarnessRun: async () => {}, saveCheckpoint() {}, renderSteerQueue() {},
     notifyUser() {}, finalizeLiveThinkBlock() {}, updatePauseBtn() {}, appendPauseMsg() {},
   };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/agent-loop.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/agent-loop.js'), 'utf8'), ctx);
   return { ctx, events };
 }
 test('real agent loop stops at the total limit despite repeated compaction and cannot reset it on reload', async () => {

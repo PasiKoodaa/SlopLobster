@@ -114,8 +114,9 @@
     const newFiles = new Set(); // tracks files created this session (yellow in tree)
     const allModified = new Set(); // accumulates across the session
     const state = {
-      apiUrl: 'http://localhost:1234', compUrl: 'http://127.0.0.1:8765',
-      backendType: 'lmstudio', // 'lmstudio' | 'llamacpp'
+      apiUrl: 'http://localhost:1234', apiKey: '', compUrl: 'http://127.0.0.1:8765',
+      backendType: 'lmstudio',
+      backendCapabilities: {}, progressRevision: 0, workspaceRevision: 0, mutationPaths: [], artifactRefs: [], completion: null,
       isGitRepo: false,
       modelInfoMap: new Map(), // modelId -> {vision, contextLength, displayName, trainedForToolUse, architecture, paramsString}
       model: null, connected: false, compConnected: false, compInfo: null, compFailStreak: 0,
@@ -237,7 +238,7 @@
       fileCache: new Map(),
       fileBackups: new Map(),
       visionCapable: false,
-      llamacppVision: false, // manually set or probed for llama.cpp
+      localVision: false, // manually set for OpenAI-compatible servers or probed for llama.cpp
       pendingImages: [],   // [{dataUrl, name, size}]
       originalTask: null,
       projectType: null, projectMeta: null,
@@ -251,9 +252,42 @@
       mcpConfigHistory: []     // recent configs used: [{ ts, config }], most recent first
     };
 
+    const BACKEND_PRESETS = Object.freeze({
+      lmstudio: { label: 'LM Studio', defaultUrl: 'http://localhost:1234', hint: 'LM Studio native model loading and metadata. Enable CORS in its server settings.' },
+      llamacpp: { label: 'llama.cpp server', defaultUrl: 'http://localhost:8080', hint: 'OpenAI-compatible /v1 API. Choose the model when starting llama-server.' },
+      vllm: { label: 'vLLM', defaultUrl: 'http://localhost:8000', hint: 'OpenAI-compatible local server. Default port 8000.' },
+      localai: { label: 'LocalAI', defaultUrl: 'http://localhost:8080', hint: 'OpenAI-compatible local server. Default port 8080.' },
+      jan: { label: 'Jan', defaultUrl: 'http://127.0.0.1:1337', hint: 'Jan Local API Server. Default port 1337; Jan requires an API key.' },
+      gpt4all: { label: 'GPT4All', defaultUrl: 'http://127.0.0.1:4891', hint: 'Enable GPT4All’s Local API Server. Default port 4891.' },
+      textgen: { label: 'text-generation-webui', defaultUrl: 'http://127.0.0.1:5000', hint: 'Start its OpenAI-compatible API extension. Default API port 5000.' },
+      'openai-compatible': { label: 'Other OpenAI-compatible local server', defaultUrl: 'http://localhost:8000', hint: 'Enter the local server base URL. It must provide /v1/models and streaming /v1/chat/completions with tool calling.' },
+    });
+
+    function backendLabel(type = state.backendType) {
+      return BACKEND_PRESETS[type]?.label || BACKEND_PRESETS['openai-compatible'].label;
+    }
+
+    function modelApiUrl(path) {
+      return HarnessBackend.url(state.apiUrl,path);
+    }
+
+    function modelApiHeaders(extra = {}) {
+      return HarnessBackend.headers(state.apiKey,extra);
+    }
+
+    function modelApiKeyStorageKey(url = state.apiUrl) {
+      return 'SlopLobster_apiKey:' + String(url || '').replace(/\/+$/, '');
+    }
+
+    function restoreModelApiKey(url) {
+      state.apiKey = sessionStorage.getItem(modelApiKeyStorageKey(url)) || '';
+      const field = document.getElementById('s-api-key');
+      if (field) field.value = state.apiKey;
+    }
+
     /* ═══════════════ INDEXEDDB PERSISTENCE ENGINE ═══════════════ */
     const DB_NAME = 'SlopLobster_DB';
-    const DB_VERSION = 2;
+    const DB_VERSION = 3;
     let _dbInstance = null;
     let _dbOpening = null;
 
@@ -277,6 +311,10 @@
           }
           if (!db.objectStoreNames.contains('settings')) {
             db.createObjectStore('settings', { keyPath: 'key' });
+          }
+          if (!db.objectStoreNames.contains('tool_artifacts')) {
+            const artifacts = db.createObjectStore('tool_artifacts', { keyPath: 'id' });
+            artifacts.createIndex('convId', 'convId');
           }
           if (!db.objectStoreNames.contains('run_journals')) {
             const runs = db.createObjectStore('run_journals', { keyPath: 'id' });
@@ -380,10 +418,12 @@
         planStepIndex: state.planStepIndex,
         run: state.runController?.snapshot(),
         verification: state.verificationState || null,
+        progressRevision: state.progressRevision || 0, workspaceRevision: state.workspaceRevision || 0, mutationPaths: state.mutationPaths || [],
+        artifactRefs: state.artifactRefs || [], completion: state.completion || null, modelRecoveries: state.modelRecoveries || {},
         sessionOutput: _sessionTotalOut,
         timestamp: Date.now()
       };
-      await dbSet('agent_states', snapshot);
+      if (!(await dbSet('agent_states', snapshot))) throw new Error('Run checkpoint could not be saved. The task must pause before another action.');
       const checkpoint = { run: snapshot.run, verification: snapshot.verification, planStepIndex: snapshot.planStepIndex };
       // Timestamp-only saves do not need another identical checkpoint event.
       const stableSignature = JSON.stringify({ ...checkpoint, run: snapshot.run && { ...snapshot.run, savedAt: 0, elapsedMs: 0 } });
@@ -483,36 +523,6 @@ DO NOT read entire files unless the file is small (<100 lines) or you genuinely 
 
 ═══ WEB SEARCH ═══
 
-Use the search tool when your local knowledge is insufficient or a library's version has outpaced your training data.
-
-1. The "LLM-First" Strategy
-- Before deep-diving into HTML documentation, always check if the site supports AI-native protocols.
-- Step 1: Search for the library/tool documentation.
-- Step 2: Check for [domain]/llms.txt or [domain]/llms-full.txt. These are markdown-optimized versions of the docs that reduce token waste and hallucination.
-- Step 3: Use fetch_url on the .txt version first. Only fallback to standard HTML if these are missing.
-
-2. Search Query Patterns
-- Don't just search for names; search for intent.
-- Library Updates: [library name] changelog 2025 2026
-- Fixing Errors: "[error message]" site:stackoverflow.com OR site:github.com
-- Comparison: [library A] vs [library B] 2026 reddit (Good for finding "real world" sentiment on bugs).
-- Implementation: [feature] [framework] example llms.txt
-
-3. Reference Site Filtering
-- When searching, you can focus on your reference sites (listed below) by appending site:[url] to your queries.
-- Example: useActionState site:react.dev
-
-4. Handling "Slop" & Noise
-- Avoid SEO Spam: If a result looks like a generic "Top 10" listicle with AI-generated text, skip it.
-- Date Check: Technology moves fast. Documentation or tutorials older than 18 months should be treated as "Legacy" unless no other info exists.
-- The GitHub Source: If official docs are vague, search for the source code on GitHub. Reading the README.md or the tests/ folder is often faster than parsing broken documentation.
-
-5. Verification Loop
-After finding a solution online:
-- Cross-reference: Check if the solution is compatible with the current project's package.json or requirements.txt.
-- Verify: Don't just copy. Search for the specific function names in your reference sites to ensure the API signature hasn't changed.
-
-
 {{REFERENCE_SECTION}}
 
 ═══ GIT OPERATIONS ═══
@@ -593,19 +603,27 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 {{INVARIANTS_SECTION}}{{EXPERIMENTAL_SECTION}}`;
 
     /* ═══════════════ PATH SANITIZATION ═══════════════ */
-    function sanitizePath(raw) {
-      if (!raw || typeof raw !== 'string') throw new Error('Path must be a non-empty string');
-      let c = raw.replace(/\0/g, ''); try { c = decodeURIComponent(c); } catch { }
-      c = c.replace(/\\/g, '/').replace(/^[\s/]+|[\s/]+$/g, '');
-      if (!c) throw new Error('Path resolves to empty');
+    function sanitizePath(raw, { allowRoot = false } = {}) {
+      if (typeof raw !== 'string') throw new Error('Path must be a string relative to the selected workspace');
+      let c = raw; try { c = decodeURIComponent(c); } catch { }
+      if (/[\x00-\x1f]/.test(c)) throw new Error('Invalid path: control characters are not allowed');
+      c = c.replace(/\\/g, '/').trim();
+      if (/^[a-z]:/i.test(c) || c.startsWith('//') || (c.startsWith('/') && c !== '/') || /^[a-z][a-z\d+.-]*:\/\//i.test(c)) {
+        throw new Error('Use a path relative to the selected workspace, such as "src/app.js". Absolute paths and URLs are not supported by file tools.');
+      }
+      const windows = /win/i.test(globalThis.navigator?.userAgentData?.platform || globalThis.navigator?.platform || '') ||
+        (state.dirHandle?._managedTaskId && /windows/i.test(state.compInfo?.platform || ''));
       const segs = c.split('/').filter(Boolean), out = [];
       for (const s of segs) {
         if (s === '.') continue;
         if (s === '..' || /^\.\.[/\\]/.test(s) || /[/\\]\.\.$/.test(s)) throw new Error(`Path traversal blocked: ".." segment detected`);
         if (/^\.{3,}$/.test(s)) throw new Error(`Path traversal blocked: "${s}" segment`);
+        if (windows && (/[<>:"|?*]/.test(s) || /[. ]$/.test(s) || /^(?:con|prn|aux|nul|com[1-9\u00b9\u00b2\u00b3]|lpt[1-9\u00b9\u00b2\u00b3])(?:\.|$)/i.test(s))) {
+          throw new Error('Invalid Windows file or directory name: ' + JSON.stringify(s) + '. Use a workspace-relative path with valid entry names.');
+        }
         out.push(s);
       }
-      if (!out.length) throw new Error('Path resolves to empty');
+      if (!out.length && !allowRoot) throw new Error('A file or subdirectory path is required; this path refers to the workspace root');
       return out;
     }
 
@@ -670,83 +688,43 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     ];
 
 
-    let _cachedReferenceSection = '';
     function buildReferenceSection() {
-      if (_cachedReferenceSection) return _cachedReferenceSection;
-      let text = '═══ REFERENCE SITES ═══\n\n';
-      text += 'For accurate, up-to-date information, go directly to these sources instead of relying only on web_search.\n';
-      text += 'For "fetch: yes" sites, use fetch_url to read the specific doc page. For "search" sites, append the query to the URL.\n\n';
-      for (const cat of REFERENCE_SITES) {
-        text += `**${cat.category}**\n`;
-        for (const s of cat.sites) {
-          const tags = [];
-          if (s.fetch) tags.push('fetch=yes');
-          if (s.search) tags.push('search=yes');
-          const tagStr = tags.length ? ` [${tags.join(', ')}]` : '';
-          text += `- ${s.name}: ${s.url}${tagStr}\n  → ${s.use}\n`;
-        }
-        text += '\n';
+      let text = 'Consult official documentation when needed, using versions relevant to this project.';
+      if (!state.disabledTools?.has('get_reference_sites')) {
+        text += ' Use get_reference_sites(query) for a few relevant links; load its schema with get_tool_schema if needed.';
       }
-      text += `**Strategy:**\n`;
-      text += `- "How do I use X?" → fetch_url the relevant doc page directly (faster, more accurate than search)\n`;
-      text += `- "What package does Y?" → web_search first, then fetch_url the top result or the registry page\n`;
-      text += `- "Why is my code failing?" → web_search the exact error message (quote it), check Stack Overflow\n`;
-      text += `- "What\'s the best practice for Z?" → web_search for comparisons, then fetch_url authoritative sources\n`;
-      text += `- When fetching docs, use mode="text" for clean readable output. If text mode misses content, try mode="raw" for the specific section.\n`;
-      text += `**WHEN TO AUTOMATICALLY SEARCH (do this WITHOUT being asked):**\n`;
-      text += `- You get an error you don't immediately recognize → web_search the EXACT error message in quotes FIRST, before guessing at a fix\n`;
-      text += `- You're about to use an API/function you're not 100% certain about → fetch_url the relevant doc page to verify syntax and behavior BEFORE writing the code\n`;
-      text += `- You need to check if a CSS/JS feature works in a browser → fetch_url caniuse.com for that feature\n`;
-      text += `- You're installing a package and unsure which one or what version → web_search "best [language] package for [task] 2024" or fetch_url the registry page\n`;
-      text += `- A test fails with unexpected output → read the test output carefully, then web_search the specific assertion/error if the cause isn't obvious\n`;
-      text += `- You're writing code for a framework you haven't confirmed the version of → fetch_url the framework docs to check if your approach matches the current version\n`;
-      text += `- You get a deprecation warning → fetch_url the docs to find the current replacement\n\n`;
-      text += `**WHEN NOT TO SEARCH (don't waste time):**\n`;
-      text += `- Simple syntax errors you can see from the error message (missing bracket, typo)\n`;
-      text += `- Logic errors where you can trace the issue by reading the code\n`;
-      text += `- Problems you've already solved earlier in this conversation\n`;
-      text += `- Anything where you can just read the relevant file and see the issue\n\n`;
-      text += `**PATTERN — Error → Search → Fix → Verify:**\n`;
-      text += `1. Read the error output carefully — is it obvious? If yes, fix directly.\n`;
-      text += `2. If not obvious, web_search the exact error (quote it). Read top 1-2 results.\n`;
-      text += `3. If the search results point to a doc page, fetch_url that page for the full context.\n`;
-      text += `4. Apply the fix based on what you learned.\n`;
-      text += `5. Re-run to verify. If it still fails, search again with the NEW error.\n`;
-      text += `Do NOT just try random fixes in a loop. Research first, then act.\n`;
-      _cachedReferenceSection = text;
       return text;
     }
 
-    /* ═════════════════ TOKEN TRACKING ═══════════════ */
-
-    const _tokenizeCache = new Map();
-
-    async function exactTokenCount(text) {
-      if (!text || !state.connected) return -1;
-      const key = `${text.length}:${text.slice(0, 100)}:${text.slice(-100)}`;
-      if (_tokenizeCache.has(key)) return _tokenizeCache.get(key);
-      try {
-        const res = await fetch(`${state.apiUrl}/v1/tokenize`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text }),
-          signal: AbortSignal.timeout(3000)
-        });
-        if (!res.ok) return -1;
-        const data = await res.json();
-        const count = data.count;
-        _tokenizeCache.set(key, count);
-        if (_tokenizeCache.size > 200) {
-          const first = _tokenizeCache.keys().next().value;
-          if (first !== undefined) _tokenizeCache.delete(first);
-        }
-        return count;
-      } catch {
-        return -1;
-      }
+    function findReferenceSites(query, limit = 4) {
+      const aliases = { js:'javascript', ts:'typescript', postgres:'postgresql', nodejs:'node', docs:'documentation' };
+      const words = text => (String(text).toLowerCase().match(/[a-z0-9]+/g) || []).map(word => aliases[word] || word);
+      const stop = new Set(['a','an','the','and','or','for','of','to','in','on','with','how','what','which','is','are','do','i','use','using','official','reference','site','sites','documentation','find','please','latest','version','best','practice','practices']);
+      const terms = [...new Set(words(query).filter(word => !stop.has(word)))];
+      if (!terms.length) return [];
+      const hints = {
+        'MDN Web Docs': ['javascript','html','css','dom','browser'],
+        'npm': ['javascript','node','packages'],
+        'PyPI': ['python','packages'],
+        'Can I Use': ['browser','compatibility','css','html'],
+      };
+      const ranked = REFERENCE_SITES.flatMap(category => category.sites.map(site => {
+        const names = new Set([...words(site.name), ...(hints[site.name] || [])]);
+        const details = new Set(words(site.use));
+        const direct = terms.filter(word => names.has(word)).length;
+        const score = direct * 5 + terms.filter(word => details.has(word)).length;
+        return { site, direct, score };
+      }));
+      // Prefer named technologies over incidental words in another site's blurb.
+      const directMatches = ranked.some(item => item.direct > 0);
+      const count = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(6, Math.floor(Number(limit)))) : 4;
+      return ranked.filter(item => directMatches ? item.direct > 0 : item.score > 0)
+        .sort((a,b) => b.score - a.score).slice(0, count)
+        .map(({site}) => ({name:site.name, url:site.url, use:site.use}));
     }
 
 
+    /* ═════════════════ TOKEN TRACKING ═══════════════ */
 
     const tokenTracker = {
       lastPromptTokens: -1,
@@ -799,8 +777,9 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     const _tokenCountCache = new Map();
 
     /**
-     * Get exact token count from LM Studio (/v1/tokenize) or llama.cpp (/tokenize),
-     * caching results in memory and falling back to estimation.
+     * Get exact token count from llama.cpp (/tokenize), caching results in
+     * memory and falling back to estimation. LM Studio has no REST tokenize
+     * endpoint, so its counts come from response usage or the local estimate.
      */
     async function countRealTokens(text) {
       if (!text || typeof text !== 'string') return 0;
@@ -811,7 +790,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       if (state.connected && state.apiUrl) {
         try {
           if (state.backendType === 'llamacpp') {
-            const res = await fetch(`${state.apiUrl}/tokenize`, {
+            const res = await fetch(modelApiUrl('/tokenize'), {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ content: text })
@@ -822,22 +801,6 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                 _tokenCountCache.set(hash, data.tokens.length);
                 if (_tokenCountCache.size > 300) _tokenCountCache.delete(_tokenCountCache.keys().next().value);
                 return data.tokens.length;
-              }
-            }
-          } else {
-            // LM Studio /v1/tokenize
-            const res = await fetch(`${state.apiUrl}/v1/tokenize`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ model: state.model, input: text })
-            });
-            if (res.ok) {
-              const data = await res.json();
-              const count = Array.isArray(data.tokens) ? data.tokens.length : (typeof data.count === 'number' ? data.count : (data.tokens ? Object.keys(data.tokens).length : null));
-              if (count !== null) {
-                _tokenCountCache.set(hash, count);
-                if (_tokenCountCache.size > 300) _tokenCountCache.delete(_tokenCountCache.keys().next().value);
-                return count;
               }
             }
           }
@@ -887,6 +850,11 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     let _syncRealTokensDebounce = null;
     function scheduleRealTokenSync() {
       clearTimeout(_syncRealTokensDebounce);
+      if (state.backendType !== 'llamacpp') {
+        state._realConvTokens = 0;
+        updateContextMeter();
+        return;
+      }
       _syncRealTokensDebounce = setTimeout(async () => {
         if (!state.connected || !state.messages.length) return;
         let total = 0;
@@ -909,7 +877,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       const fresh = getFreshTokenEstimate();
       if (fresh !== null) return Math.min(100, (fresh / state.ctxWindow) * 100);
       if (!state._sysPromptLength) state._sysPromptLength = estimateTokens(DEFAULT_SYS);
-      const convTok = state._realConvTokens > 0 ? state._realConvTokens : estimateConvTokens();
+      const realSyncTokens = state.backendType === 'llamacpp' ? state._realConvTokens : 0;
+      const convTok = realSyncTokens > 0 ? realSyncTokens : estimateConvTokens();
       return Math.min(100, ((convTok + state._sysPromptLength) / state.ctxWindow) * 100);
     }
 
@@ -919,10 +888,11 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       if (!state._sysPromptLength) state._sysPromptLength = estimateTokens(DEFAULT_SYS);
       const fresh = getFreshTokenEstimate();
       const isExact = fresh !== null;
-      const isRealSync = !isExact && state._realConvTokens > 0;
+      const realSyncTokens = state.backendType === 'llamacpp' ? state._realConvTokens : 0;
+      const isRealSync = !isExact && realSyncTokens > 0;
       const tok = isExact
         ? fresh
-        : (state._realConvTokens > 0 ? state._realConvTokens : estimateConvTokens()) + state._sysPromptLength;
+        : (realSyncTokens > 0 ? realSyncTokens : estimateConvTokens()) + state._sysPromptLength;
       const pct = Math.min(100, (tok / state.ctxWindow) * 100);
       const fillCls = pct > 80 ? 'high' : pct > 50 ? 'mid' : 'low';
       fill.style.width = pct + '%';
@@ -940,7 +910,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       }
       const stats = getCompressionStats();
       const meter = fill.closest('.ctx-meter');
-      const precisionLabel = !isExact ? (isRealSync ? '(exact from /tokenize API)' : '(estimated)')
+      const precisionLabel = !isExact ? (isRealSync ? '(exact from llama.cpp /tokenize)' : '(estimated)')
         : hasEstimatedDelta ? '(last exact reading + estimate of what\'s been added since)' : '(exact from response)';
       if (meter && stats && stats.saved > 100) {
         meter.title = `Context: ${formatTok(tok)} tokens ${precisionLabel} (${pct.toFixed(0)}% of ${formatTok(state.ctxWindow)})\nCompression saved: ~${formatTok(Math.round(stats.saved / 3.8))} tokens (${stats.pct}% reduction in tool outputs)`;
@@ -1001,7 +971,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     function detectVision(modelId) {
       if (!modelId) return false;
       /* ── llama.cpp: use probed or manually set flag ── */
-      if (state.backendType === 'llamacpp') return state.llamacppVision;
+      if (state.backendType !== 'lmstudio') return state.localVision;
       /* ── LM Studio: check native API metadata ── */
       const info = state.modelInfoMap.get(modelId);
       if (info !== undefined) return info.vision;
@@ -1015,7 +985,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       // Try /props first (older builds), then /v1/props (newer)
       for (const path of ['/props', '/v1/props']) {
         try {
-          const res = await fetch(state.apiUrl + path, { signal: AbortSignal.timeout(3000) });
+          const res = await fetch(modelApiUrl(path), { headers: modelApiHeaders(), signal: AbortSignal.timeout(3000) });
           if (!res.ok) continue;
           const data = await res.json();
           // llama.cpp sets "vision" or includes "clip" / "mmproj" keys when a projection is loaded
@@ -1028,7 +998,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             (Array.isArray(data.models) && data.models.some(m => m.type === 'clip' || m.type === 'mmproj'))
           );
           // Only upgrade to true from probe — never force false and override the user's manual toggle
-          if (hasVision) { state.llamacppVision = true; updateVisionUI(); }
+          if (hasVision) { state.localVision = true; updateVisionUI(); }
           return;
         } catch { /* endpoint may not exist */ }
       }
@@ -1450,6 +1420,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     /* ═══════════════ TOOL DEFINITIONS ═══════════════ */
     function getToolDefs(full = false) {
       const tools = [
+        { type:'function', function:{ name:'read_artifact', description:'Retrieve a stored full tool output from this conversation, including after compaction. Use offsets for long outputs.', parameters:{type:'object',properties:{artifact_id:{type:'string'},offset:{type:'integer',minimum:0},limit:{type:'integer',minimum:1,maximum:20000}},required:['artifact_id']} } },
         { type: 'function', function: { name: 'think', description: 'Think through a problem step by step before acting. Visible to user.', parameters: { type: 'object', properties: { thought: { type: 'string', description: 'Your reasoning and plan' } }, required: ['thought'] } } },
         { type: 'function', function: {
           name: 'update_plan',
@@ -1577,7 +1548,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           tools.push({ type: 'function', function: { name: 'git_status', description: 'Show git working tree status.', parameters: { type: 'object', properties: {}, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_diff', description: 'Show git diff. Use staged=true for staged changes.', parameters: { type: 'object', properties: { staged: { type: 'boolean', description: 'Show staged changes only' }, file: { type: 'string', description: 'Specific file to diff' } }, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_log', description: 'Show recent git commit history.', parameters: { type: 'object', properties: { count: { type: 'number', description: 'Number of commits (default: 10)' } }, required: [] } } });
-          tools.push({ type: 'function', function: { name: 'git_add', description: 'Stage files for commit. Use "." to stage all changes.', parameters: { type: 'object', properties: { paths: { type: 'string', description: 'File paths to stage (space-separated, or "." for all)' } }, required: ['paths'] } } });
+          tools.push({ type: 'function', function: { name: 'git_add', description: 'Stage files for commit. Use "." to stage all changes.', parameters: { type: 'object', properties: { paths: { oneOf:[{type:'string'},{type:'array',items:{type:'string'},minItems:1}], description: 'One literal path, an array of paths, or "." for all' } }, required: ['paths'] } } });
           tools.push({ type: 'function', function: { name: 'git_commit', description: 'Commit staged changes with a descriptive message.', parameters: { type: 'object', properties: { message: { type: 'string', description: 'Commit message' }, premortem: { type: 'string', description: '(Experimental mode) One sentence: the most likely way this commit could be wrong, if it is. Shown to the user in the confirmation.' } }, required: ['message'] } } });
           tools.push({ type: 'function', function: { name: 'git_push', description: 'Push commits to a remote. Always confirms first (this affects a remote/shared repo).', parameters: { type: 'object', properties: { remote: { type: 'string', description: 'Remote name (default: origin)' }, branch: { type: 'string', description: 'Branch name (default: current branch)' }, force: { type: 'boolean', description: 'Use --force-with-lease (default: false). Use only if you are sure you want to overwrite remote history.' } }, required: [] } } });
           tools.push({ type: 'function', function: { name: 'git_checkout_branch', description: 'Switch to a branch, optionally creating it.', parameters: { type: 'object', properties: { branch: { type: 'string', description: 'Branch name' }, create: { type: 'boolean', description: 'Create the branch if it does not exist (git checkout -b)' } }, required: ['branch'] } } });
@@ -1623,6 +1594,22 @@ Don't force a checklist onto something you're not actually sure about yet — a 
               max_iterations: { type: 'number', description: 'Soft round budget (default 10, min 4, max 30). It is extended automatically while the sub-agent keeps making progress and it is stopped early if it spins; a final report is always written, so do not set it very low.' }
             },
             required: ['task']
+          }
+        }
+      });
+
+      tools.push({
+        type: 'function',
+        function: {
+          name: 'get_reference_sites',
+          description: 'Look up a few relevant documentation links in the local reference catalogue. Does not fetch pages. Use only when needed.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', minLength: 1, maxLength: 200, description: 'Technology or topic, such as React hooks or Python packaging' },
+              limit: { type: 'integer', minimum: 1, maximum: 6, description: 'Maximum links to return (default 4)' }
+            },
+            required: ['query']
           }
         }
       });
@@ -1729,7 +1716,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       filtered.push(...harnessFeatureToolDefs());
       if(featureTask()) filtered = filtered.filter(t => !state.mcpServerMap?.[t.function.name]);
       if (state.compactTools && !full) {
-        const core = new Set(['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep', 'edit_file', 'write_file', 'execute_command', 'run_tests', 'update_plan', 'ask_user', 'get_tool_schema']);
+        const core = new Set(['read_file', 'read_file_lines', 'read_artifact', 'list_directory', 'search_files', 'grep', 'edit_file', 'write_file', 'execute_command', 'run_tests', 'update_plan', 'ask_user', 'get_tool_schema']);
         const hidden = filtered.filter(t => !core.has(t.function.name) && !state.discoveredTools?.has(t.function.name));
         filtered = filtered.filter(t => core.has(t.function.name) || state.discoveredTools?.has(t.function.name));
         const discover = filtered.find(t => t.function.name === 'get_tool_schema');
@@ -1999,6 +1986,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       const activeEl = document.getElementById('rp-preview-active');
       const bar = document.getElementById('rp-preview-bar');
       const badge = document.getElementById('rp-preview-badge');
+
+      // Unload stopped or failed previews rather than leaving hidden scripts running.
+      // The sandbox deliberately omits allow-same-origin, even for about:blank.
+      if (iframe && (!state.devServer || status !== 'ready') && iframe.hasAttribute('src')) {
+        iframe.removeAttribute('src');
+      }
 
       if (!state.devServer) {
         emptyEl.style.display = '';
@@ -2813,7 +2806,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
 
     async function resolvePath(raw) {
-      requireWorkspace(); const segs = sanitizePath(raw); let h = state.dirHandle;
+      requireWorkspace(); const segs = sanitizePath(raw, { allowRoot: true }); let h = state.dirHandle;
+      if (!segs.length) return h;
       for (let i = 0; i < segs.length - 1; i++) { if (h.kind !== 'directory') throw new Error(`Cannot traverse into "${segs[i]}" — not a directory`); h = await h.getDirectoryHandle(segs[i]); }
       const last = segs[segs.length - 1];
       try {
@@ -2821,7 +2815,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         /* Some browsers return a handle for directories too — verify it's actually a file */
         if (fh.kind === 'file') return fh;
         return h.getDirectoryHandle(last);
-      } catch {
+      } catch (error) {
+        if (!['TypeMismatchError', 'NotFoundError'].includes(error.name)) throw error;
         return await h.getDirectoryHandle(last);
       }
     }
@@ -3498,7 +3493,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         return { output: '[PENDING APPROVAL] ' + results.join('\n') + editLeakWarning, diff, _pendingApproval: true, _pendingPath: rel, _pendingNewContent: content, _pendingIsNewFile: false, _pendingOriginalContent: originalContent };
       }
 
-      const w = await fh.createWritable(); await w.write(content); await w.close();
+      await commitWorkspaceWrite(rel,content,originalContent);
       state.fileCache.set(rel, content); modifiedFiles.add(rel);
 
       let verifyMsg = '';
@@ -3612,8 +3607,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         const diff = !isNew ? { path: rel, lines: generateDiffFromStrings(prevContent, content).lines, stats: generateDiffFromStrings(prevContent, content).stats, truncated: false } : null;
         return { output: (isNew ? '[PENDING APPROVAL] Create ' + rel : '[PENDING APPROVAL] Overwrite ' + rel) + leakWarning, diff, _pendingApproval: true, _pendingPath: rel, _pendingNewContent: content, _pendingIsNewFile: isNew, _originalContent: prevContent };
       }
-      const fh = await dir.getFileHandle(lastName, { create: true });
-      const w = await fh.createWritable(); await w.write(content); await w.close();
+      await commitWorkspaceWrite(rel,content,prevContent);
+      const fh = await dir.getFileHandle(lastName, { create: false });
       state.fileCache.set(rel, content); modifiedFiles.add(rel);
       if (prevContent === null) newFiles.add(rel); // brand-new file — highlight yellow
       let verifyMsg = '';
@@ -3627,25 +3622,17 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       if (isSkippedPath(rel)) return `File "${rel}" is filtered by workspace rules and cannot be deleted.`;
       let dir = state.dirHandle; for (let i = 0; i < segs.length - 1; i++)dir = await dir.getDirectoryHandle(segs[i]);
       const name = segs[segs.length - 1];
-      await dir.removeEntry(name, { recursive: !!recursive });
+      await (await workspaceServices()).remove(rel,recursive);
       state.fileCache.delete(rel); modifiedFiles.delete(rel); newFiles.delete(rel);
       return `Deleted: ${rel}`;
     }
     async function moveFileSafe(source, destination) {
       requireWorkspace();
       if (isSkippedPath(source) || isSkippedPath(destination)) return 'Source or destination is filtered by workspace rules.';
-      const srcSegs = sanitizePath(source), dstSegs = sanitizePath(destination);
-      let srcDir = state.dirHandle; for (let i = 0; i < srcSegs.length - 1; i++)srcDir = await srcDir.getDirectoryHandle(srcSegs[i]);
-      const srcName = srcSegs[srcSegs.length - 1];
-      const srcHandle = await srcDir.getFileHandle(srcName);
-      let dstDir = state.dirHandle; for (let i = 0; i < dstSegs.length - 1; i++)dstDir = await dstDir.getDirectoryHandle(dstSegs[i], { create: true });
-      const dstName = dstSegs[dstSegs.length - 1];
+      sanitizePath(source); sanitizePath(destination);
       if (source === destination) return 'Source and destination are the same';
-      const srcFile = await srcHandle.getFile(); const content = await srcFile.text();
-      const fh = await dstDir.getFileHandle(dstName, { create: true });
-      const w = await fh.createWritable(); await w.write(content); await w.close();
-      await srcDir.removeEntry(srcName, { recursive: false });
-      state.fileCache.delete(source); state.fileCache.set(destination, content);
+      await (await workspaceServices()).move(source,destination);
+      state.fileCache.delete(source); state.fileCache.delete(destination);
       if (modifiedFiles.has(source)) { modifiedFiles.delete(source); modifiedFiles.add(destination); }
       if (newFiles.has(source)) { newFiles.delete(source); newFiles.add(destination); }
       return `Moved: ${source} → ${destination}`;
@@ -3653,20 +3640,18 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
     async function listDirSafe(rel, recursive) {
       requireWorkspace();
-      let files = [];
-      /* ── Normalize path: "." and "./" mean root ── */
-      let normPath = (rel || '').replace(/^\.\/?$/, '');
-      if (normPath === '' || normPath === '/') normPath = '';
-
-      let dh;
-      if (normPath === '') {
-        dh = state.dirHandle;
-      } else {
-        const segs = sanitizePath(normPath);
-        dh = state.dirHandle;
-        for (const seg of segs) {
-          if (dh.kind !== 'directory') throw new Error('Cannot traverse into "' + seg + '" — parent is not a directory');
+      // Empty paths and dot aliases refer to the selected handle itself. Never
+      // pass a root alias (or an undefined final component) to a native handle API.
+      const segs = sanitizePath(rel ?? '', { allowRoot: true });
+      const root = state.dirHandle;
+      let dh = root;
+      for (const [index, seg] of segs.entries()) {
+        if (dh.kind !== 'directory') throw new Error('Cannot traverse into "' + seg + '" — parent is not a directory');
+        try {
           dh = await dh.getDirectoryHandle(seg);
+        } catch (error) {
+          console.error('[list_directory] Failed to open directory', { path: rel, component: seg, workspace: root.name }, error);
+          throw Object.assign(new Error('Could not open directory ' + JSON.stringify(segs.slice(0,index+1).join('/')) + ': ' + error.message), { code:'directory_access', cause:error });
         }
       }
 
@@ -3693,7 +3678,6 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             }
             }
             entries.push((kh.kind === 'directory' ? 'DIR ' : 'FILE ') + full + suffix);
-            files.push(full);
             if (recursive && kh.kind === 'directory') {
               try { await walk(kh, full, d + 1); } catch { entries.push('  ' + full + '/ [error reading]'); }
             }
@@ -3704,7 +3688,13 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         }
       }
 
-      await walk(dh, '', 0);
+      try {
+        await walk(dh, '', 0);
+      } catch (error) {
+        const location = segs.length ? JSON.stringify(segs.join('/')) : 'the selected workspace root ' + JSON.stringify(root.name || state.dirName || '(unnamed)');
+        console.error('[list_directory] Failed to enumerate directory', { path: rel, workspace: root.name, managedTask: root._managedTaskId || null }, error);
+        throw Object.assign(new Error('Could not list ' + location + ': ' + error.message + '\nReopen the workspace folder and retry. If it still fails, include this full message when reporting it.'), { code:'directory_access', cause:error });
+      }
 
       if (entries.length === 0 && skippedCount > 0) {
         return 'Directory is empty (all ' + skippedCount + ' entries are in the skip list: ' + [...SKIP].slice(0, 6).join(', ') + ', ...)';
@@ -3951,8 +3941,9 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     async function gitDiff(staged, file) { const s = staged ? '--cached' : ''; const f = file ? `-- "${file}"` : ''; return await execViaCompanion(`git diff ${s} ${f} 2>&1`); }
     async function gitLog(count) { return await execViaCompanion(`git log --oneline -${count || 10} 2>&1`); }
     async function gitAdd(paths) {
-      const escaped = paths.split(/\s+/).map(p => `'${p.replace(/'/g, "'\\''")}'`).join(' ');
-      return await execViaCompanion(`git add ${escaped} 2>&1`);
+      const list=Array.isArray(paths)?paths:[String(paths)];
+      if(!list.length || list.some(p=>typeof p!=='string' || !p)) throw new Error('Supply one path or an array of paths.');
+      return execArgvViaCompanion(['git','add','--',...list]);
     }
     async function gitCommit(message) {
       // Single-quote and escape any embedded single quotes
@@ -4028,7 +4019,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             case 'pwd': return { output: state.dirName || '(none)' };
             case 'ls': {
               const f = args.filter(a => !a.startsWith('-')), fl = args.filter(a => a.startsWith('-')).join('');
-              if (f[0]) sanitizePath(f[0]);
+              if (f[0]) sanitizePath(f[0], { allowRoot: true });
               return { output: await listDirSafe(f[0] || '', fl.includes('R') || fl.includes('r')) };
             }
             case 'cat': {
@@ -4074,7 +4065,16 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             }
             case 'touch': {
               if (!args.length) return { output: 'Usage: touch <file>' };
-              for (const p of args) await writeFileSafe(p, '');
+              for (const p of args) {
+                try { const existing=await resolvePath(p); if(existing) continue; }
+                catch(error) { if(error.name!=='NotFoundError') throw error; }
+                const preview=await writeFileSafe(p,'',!!state.requireEditApproval);
+                if(preview._pendingApproval) {
+                  const approved=await new Promise(resolve=>showActionConfirm('Create file',p,resolve,{signal:state.abortCtrl?.signal}));
+                  if(approved===false) return {status:'blocked',output:'File creation declined.'};
+                  await applyPendingWrite(preview);
+                }
+              }
               return { output: 'Created: ' + args.join(', ') };
             }
             case 'rm': return { output: 'rm is disabled in virtual shell for safety. Start companion for real shell access.' };
@@ -4084,13 +4084,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             }
             case 'delete_file': {
               if (!args[0]) return { output: 'Error: no path' };
-              return { output: await deleteFileSafe(args[0], args.includes('-r') || args.includes('--recursive')) };
+              if(state.disabledTools?.has('delete_file')) return {status:'blocked',output:'delete_file is disabled.'};
+              return toolHandlers.delete_file({path:args[0],recursive:args.includes('-r') || args.includes('--recursive')},state.abortCtrl?.signal);
             }
             case 'tree': {
               let md = 3;
               for (let i = 0; i < args.length; i++) { if (args[i] === '-L' && args[i + 1]) md = Math.min(parseInt(args[++i]) || 3, 8); }
               const tgt = args.find(a => !a.startsWith('-') && !/^\d+$/.test(a)) || '';
-              if (tgt) sanitizePath(tgt);
+              if (tgt) sanitizePath(tgt, { allowRoot: true });
               const dh = tgt ? await resolvePath(tgt) : state.dirHandle;
               if (dh.kind !== 'directory') return { output: '"' + tgt + '" is not a directory' };
               const lines = [];
@@ -4150,7 +4151,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       let timeout = Number(explicitTimeout || state.cmdTimeout);
       if (!explicitTimeout && /\b(?:pip3?|npm|pnpm|yarn|bun|cargo|gem|composer)\s+(?:install|add|build|require)\b/i.test(command)) timeout = Math.max(timeout, 300);
       timeout = Math.max(5, Math.min(600, timeout));
-      const result = await executeCompanionJob(command, timeout, externalSignal, onLine, toolCallId);
+      const cwd=await resolveCommandWorkspace(externalSignal);
+      const result = await executeCompanionJob(command, timeout, externalSignal, onLine, toolCallId, cwd);
       if (result.status === 'unknown' || (result.status === 'cancelled' && result.exitCode == null)) state.running = false;
       return structured ? result : result.output;
     }
@@ -4326,7 +4328,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       try {
         const res = await companionFetch(`${state.compUrl}/status`, { signal: AbortSignal.timeout(3000) });
         if (!res.ok) throw new Error(res.statusText); const data = await res.json();
-        if (data.version !== '1.6.0' || !data.command_lifecycle) throw new Error('Companion version mismatch. Download and start the companion bundled with this HTML.');
+        if (data.version !== '1.6.0' || !data.command_lifecycle || !data.argv_commands || !data.workspace_challenge) throw new Error('Companion version mismatch. Download and start the companion bundled with this HTML.');
         state.compConnected = true; state.compInfo = data; state.compFailStreak = 0;
         updateCompanionPairing('connected');
         dot.className = 'status-dot comp-on'; txt.textContent = 'Shell';
@@ -4471,10 +4473,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           debouncedEmbedUpdate(args.path);
           if (state.compConnected && (args.path || '').endsWith('.py')) {
             try {
-              const check = await execViaCompanion(
-                'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
-                15, signal
-              );
+              const check = await checkPythonFile(args.path, signal);
               if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
             } catch (_) { }
           }
@@ -4586,10 +4585,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           debouncedEmbedUpdate(args.path);
           if (state.compConnected && (args.path || '').endsWith('.py')) {
             try {
-              const check = await execViaCompanion(
-                'python3 -m py_compile "' + args.path + '" || python -m py_compile "' + args.path + '"',
-                15, signal
-              );
+              const check = await checkPythonFile(args.path, signal);
               if (typeof check === 'string' && check.trim()) result.output += '\n\n⚠️ SYNTAX CHECK WARNING:\n' + check.trim();
             } catch (_) { }
           }
@@ -4607,34 +4603,16 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         if (!args.pattern) return { output: 'Error: "pattern" is required for grep' };
         return await grepSafe(args.pattern, args.path || '', args.include || '', args.context_lines || 0);
       },
-      'delete_file': async (args, signal, panel, argsStr) => {
-        if (!args.path) return { output: 'Error: "path" is required for delete_file' };
-        if (!args._confirmDelete) {
-          return new Promise(resolve => {
-            const isRec = !!args.recursive;
-            const warn = isRec ? ' This will delete all contents.' : '';
-            const overlay = document.createElement('div');
-            overlay.className = 'modal-overlay open';
-            overlay.style.zIndex = '150';
-            const dialog = document.createElement('div');
-            dialog.className = 'modal';
-            dialog.style.width = '400px';
-            dialog.innerHTML = `<div class="modal-hdr"><h2 style="display:flex;align-items:center;gap:6px"><i class="fas fa-triangle-exclamation" style="color:var(--red)"></i> Delete File</h2><button class="modal-close" id="df-close"><i class="fas fa-xmark"></i></button></div><div class="modal-body" style="gap:10px"><p style="font-size:13px;color:var(--tx-1);line-height:1.5;margin:0">Delete <code style="font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-3);padding:1px 5px;border-radius:3px;word-break:break-all">${esc(args.path)}</code>?${warn}</p><p style="font-size:11px;color:var(--tx-3);margin:0;font-style:italic">This cannot be undone.</p><div style="display:flex;gap:8px;justify-content:flex-end"><button class="sb-btn" id="df-cancel" style="padding:7px 14px;font-size:12px">Cancel</button><button class="sb-btn" id="df-ok" style="padding:7px 14px;font-size:12px;background:var(--red);color:white;border-color:var(--red)">Delete</button></div></div>`;
-            overlay.appendChild(dialog);
-            document.body.appendChild(overlay);
-            const cleanup = () => overlay.remove();
-            dialog.querySelector('#df-close').onclick = cleanup;
-            dialog.querySelector('#df-cancel').onclick = cleanup;
-            overlay.addEventListener('click', e => { if (e.target === overlay) cleanup(); });
-            dialog.querySelector('#df-ok').onclick = () => {
-              cleanup();
-              resolve(executeTool('delete_file', JSON.stringify({ ...safeParseArgs(argsStr), _confirmDelete: true, recursive: args.recursive }), signal, panel));
-            };
-          });
-        }
-        const result = { output: await deleteFileSafe(args.path, args.recursive) };
-        debouncedFileTreeRefresh();
-        return result;
+      'delete_file': async (args, signal) => {
+        if (!args.path) return { status:'error', output:'Error: path is required for delete_file' };
+        const service=await workspaceServices(), before=await service.inspect(args.path);
+        if(service.observed.has(args.path) && service.observed.get(args.path)!==before) throw Object.assign(new Error('File changed since it was read; read it again before deletion.'),{code:'stale_file'});
+        service.observed.set(args.path,before);
+        const approved=await new Promise(resolve=>showActionConfirm('Delete file',args.path+(args.recursive?' and all its contents':''),resolve,{signal}));
+        if(signal?.aborted) throw signal.reason || new DOMException('Aborted','AbortError');
+        if(!approved) return {status:'blocked',output:'Deletion declined. No file was removed.'};
+        const result={status:'ok',output:await deleteFileSafe(args.path,args.recursive)};
+        debouncedFileTreeRefresh(); return result;
       },
       'move_file': async (args) => {
         if (!args.source) return { output: 'Error: "source" is required for move_file' };
@@ -4648,20 +4626,22 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         try { return await doSemanticSearch(args.query, args.top_k || 8); }
         catch (e) { return { output: 'Error: ' + e.message }; }
       },
-      'start_dev_server': async (args) => {
+      'start_dev_server': async (args, signal) => {
         if (!state.compConnected) return { output: 'start_dev_server requires the companion server.' };
         if (!args.command) return { output: 'Error: "command" is required. Example: start_dev_server({"command": "npm run dev", "port": 3000})' };
+        const command=await approveShellCommand(args.command,signal,'Confirm dev server command');
+        if(command===false || command===null) return {status:'blocked',output:'Dev server command declined.'};
         const port = featureTask()?.port || parseInt(args.port) || 3000;
         try {
           const res = await companionFetch(`${state.compUrl}/dev_start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ command: args.command, port, cwd: null, taskId: featureTask()?.id }),
+            body: JSON.stringify({ command, port, cwd: await resolveCommandWorkspace(signal), taskId: featureTask()?.id }),
             signal: AbortSignal.timeout(15000)
           });
           const data = await res.json();
           if (data.error) return { output: `[Dev Server Error] ${data.error}` };
-          state.devServer = { port, command: args.command, pollInterval: null, ready: false };
+          state.devServer = { port, command, pollInterval: null, ready: false };
           switchRpTab('preview');
           updateDevPreviewUI('starting');
           pollDevServer(port);
@@ -4671,42 +4651,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         }
       },
       'execute_command': async (args, signal, panel) => {
-        const cmd = String(args.command || '').trim();
-        if (!cmd) return { output: 'Error: "command" is required for execute_command' };
-        // Default is to always ask before running a real shell command. Commands
-        // matching isDangerous() need BOTH shellAutoApprove and the explicit
-        // shellAutoApproveDangerous override to skip confirmation; everything
-        // else just needs shellAutoApprove.
-        const cmdIsDangerous = isDangerous(cmd);
-        const needsConfirm = state.compConnected && (
-          cmdIsDangerous ? !(state.shellAutoApprove && state.shellAutoApproveDangerous) : !state.shellAutoApprove
-        );
-        if (needsConfirm) {
-          return new Promise(resolve => {
-            showShellConfirm(cmd, async modifiedCmd => {
-              if (modifiedCmd) {
-                rpTermStart(modifiedCmd);
-                let streamedOutput = '';
-                const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
-                const out = await execViaCompanion(modifiedCmd, args.timeout, signal, onLine, true, panel?.el?._toolCallId);
-                const finalOutput = out.output || streamedOutput;
-                rpTermEnd(finalOutput);
-                resolve({ ...out, output: finalOutput });
-              } else {
-                resolve({ output: 'Command cancelled by user.' });
-              }
-            }, cmdIsDangerous ? 'Dangerous' : 'Confirm command', signal);
-          });
-        }
-        if (state.compConnected) {
-          rpTermStart(cmd);
-          let streamedOutput = '';
-          const onLine = (text) => { streamedOutput += text; if (panel) streamToolResult(panel, text); rpTermAppend(text); };
-          const out = await execViaCompanion(cmd, args.timeout, signal, onLine, true, panel?.el?._toolCallId);
-          const finalOutput = out.output || streamedOutput;
-          rpTermEnd(finalOutput);
-          return { ...out, output: finalOutput };
-        } else { return await execVirtual(cmd); }
+        const cmd=String(args.command || '').trim();
+        if(!cmd) return {status:'error',output:'Error: command is required.'};
+        if(!state.compConnected) return execVirtual(cmd);
+        const approved=await approveShellCommand(cmd,signal);
+        if(approved===false || approved===null) return {status:'blocked',output:'Command cancelled by user.'};
+        rpTermStart(approved);
+        const result=await execViaCompanion(approved,args.timeout,signal,text=>{if(panel) streamToolResult(panel,text);rpTermAppend(text);},true,panel?.el?._toolCallId);
+        rpTermEnd(result.output || ''); return result;
       },
       'screenshot': async (args) => {
         if (!state.visionCapable) return { output: 'Screenshot requires a vision-capable model.' };
@@ -4772,8 +4724,10 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       },
       'run_tests': async (args, signal, panel) => {
         if (!state.compConnected) return { output: 'run_tests requires the companion server (needs a real shell to run test commands).' };
-        const cmd = (args.command && args.command.trim()) || state.autoVerifyCommand;
+        let cmd = (args.command && args.command.trim()) || state.autoVerifyCommand;
         if (!cmd) return { output: 'Error: no "command" given and no auto-verify command configured in settings.' };
+        cmd=await approveShellCommand(cmd,signal,'Confirm test command');
+        if(cmd===false || cmd===null) return {status:'blocked',output:'Test command declined.'};
         const timeoutSec = Math.max(5, Math.min(600, args.timeout || 120));
         const result = await execViaCompanion(cmd, timeoutSec, signal, null, true, panel?.el?._toolCallId);
         const raw = result.output;
@@ -4913,6 +4867,13 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       },
       'browser_close': async () => {
         return { output: await browserApi('/browser_close', {}) };
+      },
+      'get_reference_sites': async (args) => {
+        if (typeof args.query !== 'string' || !args.query.trim()) return {status:'error', output:'Error: provide a technology or topic in query.'};
+        const sites = findReferenceSites(args.query, args.limit ?? 4);
+        return {status:'ok', output:JSON.stringify({sites, note:sites.length
+          ? 'Curated links only; pages have not been fetched or verified. Check the project version before using documentation.'
+          : 'No relevant curated links found. Search for the official documentation for this topic.'})};
       },
       'get_tool_schema': async (args) => {
         const name = args.tool_name;
@@ -5152,12 +5113,16 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       return { valid: !error, error, schema };
     }
 
-    async function executeTool(name, argsStr, signal, panel) {
-      const operationId = crypto.randomUUID();
+    async function executeTool(name, argsStr, signal, panel, operationKey) {
+      const callId = panel?.el?._toolCallId;
+      const operationId = operationKey || (callId ? (state.runController?.snapshot().id || state.activeConvId)+':'+callId : crypto.randomUUID());
       await recordRunEvent('tool.started', { operationId, toolCallId: panel?.el?._toolCallId, tool: name, arguments: name === 'think' ? '[reasoning omitted]' : argsStr });
       try {
-        const result = await executeToolImpl(name, argsStr, signal, panel);
+        let result = await executeToolImpl(name, argsStr, signal, panel, operationId);
+        if (result._pendingApproval) result._operationId = operationId;
+        if (typeof archiveToolOutput === 'function') result = await archiveToolOutput(name,result,operationId);
         noteVerificationMutation(name, result);
+        if (typeof recordHarnessTool === 'function') recordHarnessTool(name,safeParseArgs(argsStr),result,callId,operationId);
         await recordRunEvent('tool.completed', { operationId, tool: name, status: result.status || HarnessRuntime.normalizeResult(result).status,
           exitCode: result.exitCode, output: result.output, pendingApproval: !!result._pendingApproval });
         return result;
@@ -5168,7 +5133,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       }
     }
 
-    async function executeToolImpl(name, argsStr, signal, panel) {
+    async function executeToolImpl(name, argsStr, signal, panel, operationId) {
       let args;
       const parseRes = repairAndParseJson(argsStr, name);
       if (!parseRes.success) {
@@ -5208,9 +5173,9 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           if (hasArtifacts(args)) return { status: 'error', error: 'model_artifacts', retryable: true,
             output: 'Error: model control tokens were detected in mutation arguments. No action was taken. Retry with clean arguments.' };
         }
-        const _isRootPath = args.path === '.' || args.path === './' || args.path === '/';
-        if (args.path != null && args.path !== '' && !_isRootPath) {
-          try { sanitizePath(args.path); } catch (e) { return { output: 'Security: ' + e.message }; }
+        if (args.path != null && args.path !== '') {
+          try { sanitizePath(args.path, { allowRoot: name === 'list_directory' || name === 'grep' }); }
+          catch (e) { return { status:'error', error:'invalid_path', output:'Error: ' + e.message }; }
         }
         if (args.source != null && args.source !== '') { try { sanitizePath(args.source); } catch (e) { return { output: 'Security: ' + e.message }; } }
         if (args.destination != null && args.destination !== '') { try { sanitizePath(args.destination); } catch (e) { return { output: 'Security: ' + e.message }; } }
@@ -5242,7 +5207,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       }
 
       try {
-        let handler = harnessFeatureHandler(name) || toolHandlers[name];
+        let handler = name === 'read_artifact' ? readHarnessArtifact : harnessFeatureHandler(name) || toolHandlers[name];
         if (!handler && state.mcpServerMap && state.mcpServerMap[name]) {
           const srvName = state.mcpServerMap[name];
           handler = async (mcpArgs) => {
@@ -5252,11 +5217,31 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         if (!handler) {
           return { output: 'Unknown tool: ' + name };
         }
-        const result = HarnessRuntime.normalizeResult(await HarnessRuntime.withToolLock(name, () => {
+        const result = HarnessRuntime.normalizeResult(await HarnessRuntime.withToolLock(name, async () => {
           if (signal?.aborted) throw signal.reason || new DOMException('Aborted', 'AbortError');
-          return handler(args, signal, panel, argsStr);
+          const fileMutation = ['edit_file','write_file','write_file_chunked','delete_file','move_file'].includes(name);
+          if (fileMutation) harnessMutationContext = {id:operationId || crypto.randomUUID(),toolCallId:panel?.el?._toolCallId};
+          const read = ['read_file','read_file_lines','read_file_summary'].includes(name) && args.path && state.dirHandle;
+          const service = read ? await workspaceServices() : null;
+          const before = service ? await service.inspect(args.path) : null;
+          const commandStamp = ['execute_command','run_tests'].includes(name) ? await captureWorkspaceStamp() : null;
+          try {
+            let output = name === 'read_artifact' ? await readHarnessArtifact(args) : await handler(args, signal, panel, argsStr);
+            if (service) {
+              const after = await service.inspect(args.path);
+              if (before !== after) return {status:'error',error:'stale_read',output:'Error: file changed during reading. Read it again.'};
+              service.observed.set(args.path,after);
+            }
+            if (commandStamp) {
+              const after=await captureWorkspaceStamp();
+              const changed=HarnessCore.canonical(commandStamp.paths)!==HarnessCore.canonical(after.paths);
+              if(changed) state.progressRevision=(state.progressRevision || 0)+1;
+              output={...output,_workspaceStamp:{scope:after.scope,paths:after.paths},_workspaceStale:changed};
+              if(changed && name==='run_tests') output={...output,status:'unknown',output:String(output.output || '')+'\nFiles changed during verification; run the check again before claiming it passed.'};
+            }
+            return output;
+          } finally { if (fileMutation) harnessMutationContext = null; }
         }), name);
-        recordHarnessTool(name, args, result, panel?.el?._toolCallId);
         if (_argLeakFields.length && result && typeof result.output === 'string') {
           result.output += '\n\n⚠️ Detected and removed leaked model control tokens from argument(s): ' + _argLeakFields.join(', ') + ' (the model kept generating past the intended value).';
         }
@@ -5269,7 +5254,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         // Re-throw it so the agentLoop catches it and stops properly.
         if (e.name === 'AbortError' || signal?.aborted) throw e;
 
-        return { output: 'Error: ' + e.message };
+        return { status:'error', error:e.code || 'tool_failed', retryable:e.code==='stale_file', output: 'Error: ' + e.message };
       }
     }
 /* ═══════════════ PROJECT DETECTION ═══════════════ */
@@ -5402,6 +5387,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       if (state.activeConvId !== convId || state.running) return;
       state.runController = null;
       state.verificationState = state.taskState?.verification || null;
+      state.workspaceRevision = state.taskState?.workspaceRevision || 0;
+      state.progressRevision = state.taskState?.progressRevision || 0;
+      state.modelRecoveries = state.taskState?.modelRecoveries || {};
+      state.mutationPaths = state.taskState?.mutationPaths || [];
+      state.artifactRefs = state.taskState?.artifacts || [];
+      state.completion = state.taskState?.completion || null;
       await agentLoop();
     }
 
@@ -5660,10 +5651,10 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
     async function fetchModelInfo() {
       state.modelInfoMap.clear();
-      // llama.cpp doesn't have /api/v0/models — only LM Studio does
+      // /api/v0/models is LM Studio-only; the other backends use /v1/models.
       if (state.backendType !== 'lmstudio') return;
       try {
-        const res = await fetch(`${state.apiUrl}/api/v0/models`, { signal: AbortSignal.timeout(5000) });
+        const res = await fetch(`${state.apiUrl}/api/v0/models`, { headers: modelApiHeaders(), signal: AbortSignal.timeout(5000) });
         if (!res.ok) return;
         const data = await res.json();
         const models = data.data || data.availableModels || data.downloadedModels || [];
@@ -5692,10 +5683,11 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     }
 
     async function testConnection(retry = 3) {
-          const backendLabel = state.backendType === 'llamacpp' ? 'llama.cpp' : 'LM Studio';
+          const label = backendLabel();
           try {
-            // ── Pre-flight: check /v1/models (supported by both LM Studio and llama.cpp) ──
-            const testRes = await fetch(`${state.apiUrl}/v1/models`, {
+            // All configured local backends expose the OpenAI-compatible model list.
+            const testRes = await fetch(modelApiUrl('/v1/models'), {
+              headers: modelApiHeaders(),
               signal: AbortSignal.timeout(3000)
             });
 
@@ -5709,7 +5701,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                 } else if (status === 503) {
                   hint = '\n→ LM Studio is busy or restarting. Wait a moment and try again.';
                 }
-              } else {
+              } else if (state.backendType === 'llamacpp') {
                 if (status === 500) hint = '\n→ llama.cpp server error — check your server console.';
                 else if (status === 503) hint = '\n→ llama.cpp server unavailable. Is it running?';
               }
@@ -5725,7 +5717,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                 hint = '\n' + err;
               }
 
-              showToast(`${backendLabel}: HTTP ${status}${hint}`, 'err');
+              showToast(`${label}: HTTP ${status}${hint}`, 'err');
               checkCompanion();
               return;
             }
@@ -5734,7 +5726,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
             await refreshModels(true);
             const sel = document.getElementById('model-sel');
             const count = sel.options.length;
-            if (!count) {
+            if (!count || !state.connected) {
               state.connected = false;
               document.getElementById('llm-dot').className = 'status-dot off';
               document.getElementById('llm-text').textContent = 'LLM';
@@ -5748,28 +5740,30 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
             if (state.backendType === 'lmstudio') {
               if (activeInstance?.identifier === state.model) {
-                showToast(`Connected — ${state.model.split('/').pop()}`, 'ok');
+              showToast(`Connected — ${state.model.split('/').pop()}`, 'ok');
               } else if (!activeInstance) {
                 showToast(`Connected (${count} models) — couldn't verify loaded model`, 'warn');
               } else {
                 showToast(`Loaded: ${activeInstance.identifier.split('/').pop()} — selector shows different model`, 'warn');
               }
-            } else {
+            } else if (state.backendType === 'llamacpp') {
               // llama.cpp: probe /props for vision, then show connected toast
               probeLlamaCppVision().then(() => {
-                const visionNote = state.llamacppVision ? ' · vision ✓' : '';
+                const visionNote = state.localVision ? ' · vision ✓' : '';
                 showToast(`Connected to llama.cpp (${count} model${count !== 1 ? 's' : ''})${visionNote}`, 'ok');
               });
+            } else {
+              showToast(`Connected to ${label} (${count} model${count !== 1 ? 's' : ''})`, 'ok');
             }
           } catch (e) {
             if (e.name === 'AbortError') return; // user cancelled
             if (retry > 0) {
               const wait = Math.min(1000 * Math.pow(2, 3 - retry), 8000);
-              showToast(`${backendLabel} unreachable (attempt ${4 - retry}). Retrying in ${(wait / 1000).toFixed(1)}s...`, 'warn');
+              showToast(`${label} unreachable (attempt ${4 - retry}). Retrying in ${(wait / 1000).toFixed(1)}s...`, 'warn');
               setTimeout(() => testConnection(retry - 1), wait);
               return;
             }
-            showToast(`${backendLabel}: ${HarnessRuntime.connectionErrorHint(e, state.backendType)}`, 'err');
+            showToast(`${label}: ${HarnessRuntime.connectionErrorHint(e, state.backendType)}`, 'err');
           }
           checkCompanion();
         }
@@ -5805,7 +5799,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
      * @param {{onContent?:(full:string)=>void, onReasoning?:(full:string)=>void, onToolCalls?:(arr)=>void, onUsage?:(usage)=>void}} [cb]
      */
     async function runSubAgent(task, allowedTools, maxIter, parentSignal, parentPanel) {
-      const defaultTools = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep'];
+      const defaultTools = ['read_file', 'read_file_lines', 'read_artifact', 'list_directory', 'search_files', 'grep'];
       const tools = allowedTools && allowedTools.length ? allowedTools : defaultTools;
       // The requested rounds are a soft budget: extended while the agent makes progress, stopped early if it spins.
       const budget = SwarmCore.createRoundBudget({ limit: Math.min(Math.max(Number(maxIter) || 10, 4), 30), hardCap: 40, stallLimit: 4 });
@@ -5913,7 +5907,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         const results = await HarnessRuntime.runToolBatch(validTcs, async tc => {
           const name = tc.function.name;
           try {
-            const result = await executeTool(name, tc.function.arguments, subAbort.signal, null);
+            const result = await executeTool(name, tc.function.arguments, subAbort.signal, null, tc._operationId);
             const outText = redactSecrets((typeof result === 'string') ? result : (result?.output || ''));
             log.push({
               tool: name,
@@ -5922,7 +5916,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
               success: result.status === 'ok'
             });
             if (result.status === 'ok') roundOk = true;
-            return { tc, output: outText };
+            return { tc, output: outText, artifactId:result._artifactId, progress:HarnessCore.progressRecord(name,tc.function.arguments,result,state.progressRevision || 0) };
           } catch (e) {
             log.push({
               tool: name,
@@ -5939,11 +5933,11 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           subMessages.push({
             role: 'tool',
             tool_call_id: r.tc.id,
-            content: compressToolOutput(r.tc.function.name, r.output, subStats)
+            content: compressToolOutput(r.tc.function.name, r.output, subStats)+(r.artifactId?'\n[Full output: '+r.artifactId+'; use read_artifact to retrieve it.]':''), _artifactId:r.artifactId
           });
         }
 
-        budget.record(validTcs.map(tc => tc.function.name + ':' + tc.function.arguments), roundOk);
+        budget.record(results.map(r => r.progress ? r.progress.sig+':'+r.progress.resultFingerprint+':'+r.progress.revision : r.tc.function.name+':'+r.tc.function.arguments+':'+r.output), roundOk);
 
         // ── Record rejected tool calls ──
         for (const tc of invalidTcs) {
@@ -6177,8 +6171,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       const defaultMax = Math.min(Math.max(maxWorkerIter || 10, 1), 25);
       const allToolDefs = getToolDefs(true);
       const coordinatorTools = new Set(['spawn_swarm', 'spawn_sub_agent', 'ask_user']);
-      const defaultWorkerToolNames = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep', 'edit_file', 'write_file', 'execute_command', 'think'];
-      const criticToolNames = ['read_file', 'read_file_lines', 'list_directory', 'search_files', 'grep', 'think', 'run_tests'];
+      const defaultWorkerToolNames = ['read_file', 'read_file_lines', 'read_artifact', 'list_directory', 'search_files', 'grep', 'edit_file', 'write_file', 'execute_command', 'think'];
+      const criticToolNames = ['read_file', 'read_file_lines', 'read_artifact', 'list_directory', 'search_files', 'grep', 'think', 'run_tests'];
       // Critics are read-only by construction: they can inspect and run checks but never modify files.
       const toolNamesFor = w => (w.kind === 'critic' || w.kind === 'verifier') ? criticToolNames : ((w.tools && w.tools.length) ? w.tools : defaultWorkerToolNames).filter(t => !coordinatorTools.has(t));
       const writeCapable = w => toolNamesFor(w).some(t => SwarmCore.WRITE_TOOLS.has(t) || t === 'execute_command');
@@ -6464,16 +6458,13 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           subMessages.push(assistantMsg);
           if (!toolCalls.length) { finishedNaturally = true; break; }
 
-          // Stall detection: the same call three times in a row is a loop, not progress.
-          const sig = toolCalls.map(tc => tc.function.name + ':' + tc.function.arguments).join('|');
-          recent.push(sig); if (recent.length > 5) recent.shift();
-          const repeats = recent.filter(s => s === sig).length;
+          const roundProgress=[];
 
           const stats = createCompressionStats();
           let roundOk = false;
           for (const tc of toolCalls) {
             const name = tc.function.name;
-            let outText = '', success = true;
+            let outText = '', success = true, artifactId=null, progress=null;
             let a = null;
             try { a = JSON.parse(tc.function.arguments || '{}'); } catch { a = null; }
             try {
@@ -6493,12 +6484,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
                   ? [a.path, a.source, a.destination].filter(Boolean).find(p => !SwarmCore.pathAllowed(p, w.owns)) : null;
                 if (guarded) { success = false; outText = `Error: "${guarded}" is outside your ownership (${w.owns.join(', ')}). Ask its owner via swarm_message.`; }
                 else {
-                  const res = await withWorkspace(wsRec, wsCache, () => executeTool(name, tc.function.arguments, swarmCtl.signal, null));
+                  const res = await withWorkspace(wsRec, wsCache, () => executeTool(name, tc.function.arguments, swarmCtl.signal, null, tc._operationId));
                   const norm = HarnessRuntime.normalizeResult(res, name);
                   outText = redactSecrets(norm.output);
                   success = norm.status === 'ok' && !res._pendingApproval;
                   if (res._pendingApproval) outText += '\n(Not applied: this edit needs user approval, which workers cannot request. Describe the change in your summary.)';
-                  outText = compressToolOutput(name, outText, stats);
+                  progress=HarnessCore.progressRecord(name,tc.function.arguments,norm,state.progressRevision || 0);
+                  artifactId=res._artifactId;
+                  outText = compressToolOutput(name, outText, stats)+(artifactId?'\n[Full output: '+artifactId+'; use read_artifact to retrieve it.]':'');
                 }
                 log.push({ tool: name, args: (tc.function.arguments || '').slice(0, 100), output: outText.slice(0, 200), success });
               }
@@ -6508,9 +6501,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
               log.push({ tool: name, args: '', output: outText.slice(0, 200), success: false });
             }
             if (success) roundOk = true;
-            subMessages.push({ role: 'tool', tool_call_id: tc.id, content: outText });
+            subMessages.push({ role: 'tool', tool_call_id: tc.id, content: outText, _artifactId:artifactId });
+            progress ||= HarnessCore.progressRecord(name,tc.function.arguments,{status:success?'ok':'error',output:outText},state.progressRevision || 0);
+            roundProgress.push(progress.sig+':'+progress.resultFingerprint+':'+progress.revision);
           }
-          wb.record(toolCalls.map(tc => tc.function.name + ':' + tc.function.arguments), roundOk);
+          const sig=roundProgress.join('|');
+          recent.push(sig); if(recent.length>5) recent.shift();
+          const repeats=recent.filter(s=>s===sig).length;
+          wb.record(roundProgress, roundOk);
 
           // Deliver anything other workers posted since the last round.
           const inbox = memory.inbox(w.name, inboxCursor); inboxCursor = inbox.next;
@@ -6878,15 +6876,15 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     let activeInstance = null; // { instance_id, identifier, ... }
 
     async function fetchActiveModel(retries = 2) {
-      // llama.cpp has no concept of active instance — skip the LM Studio-only endpoint
-      if (state.backendType === 'llamacpp') {
+      // Only LM Studio exposes active-instance metadata and load/unload APIs.
+      if (state.backendType !== 'lmstudio') {
         activeInstance = null;
         return null;
       }
       for (let attempt = 0; attempt <= retries; attempt++) {
         try {
           const timeout = attempt === 0 ? 5000 : 8000;
-          const res = await fetch(`${state.apiUrl}/api/v0/models`, { signal: AbortSignal.timeout(timeout) });
+          const res = await fetch(`${state.apiUrl}/api/v0/models`, { headers: modelApiHeaders(), signal: AbortSignal.timeout(timeout) });
           if (!res.ok) continue;
           const data = await res.json();
           const models = data.data || [];
@@ -6928,7 +6926,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         try { active = await fetchActiveModel(); } catch { activeInstance = null; }
 
         try {
-          const res = await fetch(`${state.apiUrl}/v1/models`, { signal: AbortSignal.timeout(5000) });
+          const res = await fetch(modelApiUrl('/v1/models'), { headers: modelApiHeaders(), signal: AbortSignal.timeout(5000) });
           if (!res.ok) throw new Error(res.statusText);
           const data = await res.json();
           await fetchModelInfo();
@@ -7056,15 +7054,15 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     function updateModelLoadBtn() {
       const btn = document.getElementById('model-load-btn');
       if (!btn) return;
-      // llama.cpp doesn't support model load/unload via API — hide the button
-      if (state.backendType === 'llamacpp') { btn.style.display = 'none'; return; }
+      // Model load/unload is only implemented for LM Studio.
+      if (state.backendType !== 'lmstudio') { btn.style.display = 'none'; return; }
       const needsLoad = activeInstance?.identifier !== state.model;
       btn.style.display = needsLoad ? '' : 'none';
     }
 
     async function requestModelLoad(modelId) {
-      if (state.backendType === 'llamacpp') {
-        showToast('llama.cpp: model load/unload is not supported via API. Restart the server with a different model.', 'warn');
+      if (state.backendType !== 'lmstudio') {
+        showToast(`${backendLabel()}: choose or load models in the server, then refresh the model list.`, 'warn');
         return;
       }
       const dot = document.getElementById('llm-dot');
@@ -7082,7 +7080,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         try {
           const unloadRes = await fetch(`${state.apiUrl}/api/v1/models/unload`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: modelApiHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ instance_id: activeInstance.instance_id }),
             signal: AbortSignal.timeout(15000)
           });
@@ -7128,7 +7126,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       try {
         const res = await fetch(`${state.apiUrl}/api/v1/models/load`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: modelApiHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify(loadBody),
           signal: AbortSignal.timeout(300000)
         });
@@ -7227,7 +7225,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         await refreshModels(true);
         showToast('Model list refreshed', 'ok');
       } catch (e) {
-        showToast('LM Studio unreachable: ' + e.message.slice(0, 60), 'err');
+        showToast(backendLabel() + ' unreachable: ' + e.message.slice(0, 60), 'err');
       } finally {
         btn.disabled = false;
         btn.querySelector('i').classList.remove('fa-spin');
@@ -7471,10 +7469,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     function _capOutputSize(text, toolName) {
       const max = _TOKEN_BUDGET.maxOutputChars;
       if (text.length <= max) return text;
-      const head = Math.floor(max * 0.6);
-      const tail = max - head;
-      const truncMsg = `\n\n[... TRUNCATED: output was ${text.length} chars, showing first ${head} + last ${tail}. Use read_file_lines or grep to read specific sections. ...]\n\n`;
-      return text.slice(0, head) + truncMsg + text.slice(-tail);
+      return HarnessCore.excerpt(text,max);
     }
 
     /** Creates an isolated stats object for tracking compression */
@@ -7688,8 +7683,16 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     async function progressCompact(progressSaved) {
       await recordRunEvent('compaction.started', { operationId: 'compact:' + state.runController?.snapshot().iterations, progressSaved });
       const previousMessages = state.messages;
+      for (const message of previousMessages) {
+        if (message.role === 'tool' && !message._artifactId && String(message.content || '').length > 2000) {
+          const archived = await archiveToolOutput('recovered_tool', {output:message.content,status:message._status || 'ok'}, message.tool_call_id || crypto.randomUUID());
+          if (archived._artifactError) throw new Error('Compaction paused because the full tool output could not be saved. The conversation is preserved.');
+          message._artifactId = archived._artifactId;
+        }
+      }
+      state.pendingOperations = (await pendingHarnessOperations()).map(r=>({id:r.id,status:r.status,kind:r.kind,commandId:r.commandId}));
       state.taskState = HarnessRuntime.captureTaskState(state);
-      await dbSet('agent_states', { id: 'task:' + state.activeConvId, taskState: state.taskState, messages: previousMessages, timestamp: Date.now() });
+      if (!(await dbSet('agent_states', { id: 'task:' + state.activeConvId, taskState: state.taskState, messages: previousMessages, timestamp: Date.now() }))) throw new Error('Compaction checkpoint could not be saved; full conversation preserved.');
       const compactModel = (state.memoryAgentModel && state.memoryAgentModel.trim()) || state.model;
       const usingOverrideModel = compactModel !== state.model;
       appendMsg('system', (progressSaved
@@ -7703,32 +7706,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         '4. Files modified, with a brief description of each change.\n' +
         '5. Other errors and their resolutions.\n' +
         (state.projectMemoryText ? '\nNote: the facts below are ALREADY saved to durable project memory and will be shown to the continuing instance separately — do not spend summary budget repeating them verbatim, only reference them if directly relevant to current state:\n' + state.projectMemoryText.slice(0, 1500) + '\n' : '') +
-        '\nBe concise — under 600 tokens total.';
-      const convText = state.messages.map(m => {
-        let text = '';
-        if (m._images?.length) {
-          text += `\n[${m._images.length} image(s) were attached and analyzed]\n`;
-        }
-        if (m.role === 'user') return text + '[User]: ' + (m.content || '');
-        if (m.role === 'assistant') {
-          let t = text + '[Agent]: ' + (m.content || '');
-          if (m.tool_calls) {
-            t += '\n[Tools Called]: ' + m.tool_calls.map(tc => {
-              const args = safeParseArgs(tc.function.arguments);
-              return tc.function.name + '(' + Object.entries(args).map(([k, v]) => k + '=' + String(v).slice(0, 60)).join(', ') + ')';
-            }).join(', ');
-          }
-          return t;
-        }
-        if (m.role === 'tool') return text + '[Tool Result]: ' + m.content.slice(0, 150) + '...';
-        return '';
-      }).filter(Boolean).join('\n');
+        '\nPreserve unresolved errors, artifact IDs and the next concrete action. Use 800-1500 tokens when needed; keep shorter tasks concise.';
+      const convText = HarnessCore.compactionInput(state.messages,state.taskState,{maxChars:Math.max(2000,Math.min(60000,Math.floor(state.ctxWindow * 2)))});
 
       try {
         if (!state.running) state.abortCtrl = new AbortController();
         const data = await requestModelJSON({ model: compactModel, messages: [
           { role: 'system', content: sysPrompt }, { role: 'user', content: convText }
-        ], temperature: 0.1, max_tokens: 2000 }, state.abortCtrl.signal);
+        ], temperature: 0.1, max_tokens: Math.max(256,Math.min(3000,Math.floor(state.ctxWindow * 0.15))) }, state.abortCtrl.signal);
         const summary = data.choices?.[0]?.message?.content;
         const nextMessages = HarnessRuntime.compactMessages(state.taskState, summary, progressSaved ? getProgressFile() : null);
         const before = estimateConvTokens();
@@ -8551,7 +8536,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
       // Verify file hasn't changed since dry-run
       const current = await (await fh.getFile()).text();
-      const expectedOld = pr._originalContent ?? '';
+      const expectedOld = pr._pendingOriginalContent ?? pr._originalContent ?? '';
       if (current !== expectedOld) {
         return {
           status: 'error', error: 'stale_preview', retryable: true,
@@ -8561,9 +8546,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         };
       }
 
-      const w = await fh.createWritable();
-      await w.write(pr._pendingNewContent);
-      await w.close();
+      await commitWorkspaceWrite(pr._pendingPath,pr._pendingNewContent,expectedOld,pr._operationId);
       state.fileCache.set(pr._pendingPath, pr._pendingNewContent);
       modifiedFiles.add(pr._pendingPath);
       if (pr._pendingIsNewFile) newFiles.add(pr._pendingPath);
@@ -8586,8 +8569,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       try { current = await (await (await dir.getFileHandle(segs[segs.length - 1])).getFile()).text(); }
       catch (e) { if (e.name !== 'NotFoundError') throw e; }
       if (current !== pr._originalContent) return { status: 'error', error: 'stale_preview', output: 'Error: file changed since preview; request a fresh diff before writing.' };
-      const fh = await dir.getFileHandle(segs[segs.length - 1], { create: true });
-      const w = await fh.createWritable(); await w.write(pr._pendingNewContent); await w.close();
+      await commitWorkspaceWrite(pr._pendingPath,pr._pendingNewContent,pr._originalContent,pr._operationId);
+      const fh = await dir.getFileHandle(segs[segs.length - 1], { create: false });
       state.fileCache.set(pr._pendingPath, pr._pendingNewContent); modifiedFiles.add(pr._pendingPath);
       if (pr._pendingIsNewFile) newFiles.add(pr._pendingPath);
       let vm = '';
@@ -8859,12 +8842,8 @@ Don't force a checklist onto something you're not actually sure about yet — a 
         const isNew = f.k === 'file' && newFiles.has(f.p);
         const isMod = f.k === 'file' && !isNew && modifiedFiles.has(f.p);
 
-        const pEsc = esc(f.p);
-        const clickFn = f.k === 'directory' ? `insertPath(&quot;${pEsc}&quot;)` : `previewFile(&quot;${pEsc}&quot;)`;
-        let ext = '';
-        if (f.k === 'file') {
-          ext = `<div class="ft-acts"><button title="View" onclick="event.stopPropagation();previewFile(&quot;${pEsc}&quot;)"><i class="fas fa-eye"></i></button><button title="Copy path" onclick="event.stopPropagation();navigator.clipboard.writeText(&quot;${pEsc}&quot;);showToast('Copied to clipboard', 'ok')"><i class="fas fa-copy"></i></button><button title="Delete" onclick="event.stopPropagation();if(confirm('Delete ${pEsc}?')){deleteFileSafe(&quot;${pEsc}&quot;, false).then(()=>debouncedFileTreeRefresh())}"><i class="fas fa-trash"></i></button></div>`;
-        }
+        const pEsc=esc(f.p);
+        const ext=f.k==='file'?'<div class="ft-acts"><button title="View" data-ft-action="view"><i class="fas fa-eye"></i></button><button title="Copy path" data-ft-action="copy"><i class="fas fa-copy"></i></button><button title="Delete" data-ft-action="delete"><i class="fas fa-trash"></i></button></div>':'';
         const dotCls = isNew || isMod ? '' : (f.k === 'directory' ? 'dir' : getDotCls(f.n));
         const dotInlineStyle = isNew
           ? 'background:#eab308;box-shadow:0 0 6px #eab308'
@@ -8873,8 +8852,19 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           ? 'color:#eab308;font-weight:600'
           : isMod ? 'color:var(--accent);font-weight:600' : '';
         const titleSuffix = isNew ? ' (new)' : isMod ? ' (modified)' : '';
-        return `<div class="ft-item" style="padding-left:${6 + f.d * 12}px" onclick="${clickFn}" title="${f.p}${titleSuffix}"><div class="ft-main"><span class="dot ${dotCls}" style="${dotInlineStyle}"></span><span class="ft-name" style="${nameInlineStyle}">${esc(f.n)}</span></div>${ext}</div>`;
+        return `<div class="ft-item" style="padding-left:${6 + f.d * 12}px" data-ft-path="${pEsc}" data-ft-kind="${f.k}" title="${pEsc}${titleSuffix}"><div class="ft-main"><span class="dot ${dotCls}" style="${dotInlineStyle}"></span><span class="ft-name" style="${nameInlineStyle}">${esc(f.n)}</span></div>${ext}</div>`;
       }).join('');
+      document.getElementById('file-tree').onclick=async event=>{
+        const item=event.target.closest('[data-ft-path]'); if(!item) return;
+        const path=item.dataset.ftPath,action=event.target.closest('[data-ft-action]')?.dataset.ftAction;
+        try {
+          if(action) event.stopPropagation();
+          if(action==='copy') {await navigator.clipboard.writeText(path);showToast('Copied to clipboard','ok');}
+          else if(action==='delete') {if(confirm('Delete '+path+'?')) {await deleteFileSafe(path,false);debouncedFileTreeRefresh();}}
+          else if(item.dataset.ftKind==='directory') insertPath(path);
+          else await previewFile(path);
+        } catch(error) {showToast(error.message,'err');}
+      };
     }
 
     function insertPath(p) { const i = document.getElementById('msg-input'), pos = i.selectionStart; i.value = i.value.slice(0, pos) + p + i.value.slice(pos); i.focus(); i.selectionStart = i.selectionEnd = pos + p.length; updateSendBtn(); }
@@ -8954,6 +8944,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           state.taskState = c._taskState || null;
       state.runController = null;
       state.verificationState = state.taskState?.verification || null;
+      state.workspaceRevision = state.taskState?.workspaceRevision || 0;
+      state.progressRevision = state.taskState?.progressRevision || 0;
+      state.modelRecoveries = state.taskState?.modelRecoveries || {};
+      state.mutationPaths = state.taskState?.mutationPaths || [];
+      state.artifactRefs = state.taskState?.artifacts || [];
+      state.completion = state.taskState?.completion || null;
           if (c.messages && c.messages.length) {
             state.messages = c.messages;
             switchToChat();
@@ -9025,6 +9021,14 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       }
     }
 
+    async function persistCommandConversation(job,result) {
+      if(!state.activeConvId) throw new Error('Command result has no conversation to save.');
+      saveCurrentConv();
+      const conv=state.conversations.find(c=>c.id===state.activeConvId);
+      if(conv) conv._commandResults=[...(conv._commandResults || []).filter(r=>r.id!==job.commandId),{id:job.commandId,result}].slice(-16);
+      if(!conv || !(await dbSet('conversations',conv))) throw new Error('Command result could not be saved; its recovery receipt was retained.');
+    }
+
     async function doNewConversation() {
       if (!state.running) releaseManagedWorkspace();
       _wsWarningDismissed = false;
@@ -9060,6 +9064,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       state.taskState = null;
       state.runController = null;
       state.verificationState = state.taskState?.verification || null;
+      state.workspaceRevision = state.taskState?.workspaceRevision || 0;
+      state.progressRevision = state.taskState?.progressRevision || 0;
+      state.modelRecoveries = state.taskState?.modelRecoveries || {};
+      state.mutationPaths = state.taskState?.mutationPaths || [];
+      state.artifactRefs = state.taskState?.artifacts || [];
+      state.completion = state.taskState?.completion || null;
       state.currentPlan = null;
       state.planExecuting = false;
       state.planStepIndex = -1;
@@ -9132,6 +9142,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       state.taskState = c._taskState || null;
       state.runController = null;
       state.verificationState = state.taskState?.verification || null;
+      state.workspaceRevision = state.taskState?.workspaceRevision || 0;
+      state.progressRevision = state.taskState?.progressRevision || 0;
+      state.modelRecoveries = state.taskState?.modelRecoveries || {};
+      state.mutationPaths = state.taskState?.mutationPaths || [];
+      state.artifactRefs = state.taskState?.artifacts || [];
+      state.completion = state.taskState?.completion || null;
       await restoreHarnessConversation(c);
       state.planItems = [];
       state.beliefs = [];
@@ -9208,6 +9224,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
           }
         }
         if (typeof deleteRunJournalsForConversation === 'function') await deleteRunJournalsForConversation(id);
+        if (typeof deleteHarnessArtifacts === 'function') await deleteHarnessArtifacts(id);
         if (!(await dbDelete('conversations', id))) throw new Error('Browser database could not be updated');
         // A stale workspace index or legacy cache must never restore a deleted ID.
         localStorage.setItem(DELETED_CONVS_KEY, JSON.stringify([...deletedConvIds]));
@@ -9584,7 +9601,7 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     window.loadSysProfile = function () {
       const p = document.getElementById('s-sys-profile').value;
       if (p === 'default') document.getElementById('s-sys-prompt').value = DEFAULT_SYS;
-      else if (state.sysPromptProfiles[p]) document.getElementById('s-sys-prompt').value = state.sysPromptProfiles[p];
+      else if (state.sysPromptProfiles[p]) document.getElementById('s-sys-prompt').value = migrateSystemPromptTemplate(state.sysPromptProfiles[p]);
     }
     window.saveSysProfile = function () {
       const name = prompt('Name for this system prompt preset:');
@@ -9608,10 +9625,17 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       state.compToken = sessionStorage.getItem('SlopLobster_compToken:' + state.compUrl) || '';
       try {
         const r = localStorage.getItem(SETTINGS_KEY); if (!r) return; const s = JSON.parse(r);
+        if (migrateSavedSystemPrompts(s)) {
+          try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(s)); }
+          catch (error) { console.warn('[SlopLobster] Prompt migration could not be saved; the migrated prompt is active for this session.', error); }
+        }
         if (s.apiUrl) state.apiUrl = s.apiUrl; if (s.compUrl) state.compUrl = s.compUrl;
+        state.apiKey = sessionStorage.getItem(modelApiKeyStorageKey(state.apiUrl)) || '';
         state.compToken = sessionStorage.getItem('SlopLobster_compToken:' + state.compUrl) || '';
-        if (s.backendType) state.backendType = s.backendType;
-        if (s.llamacppVision !== undefined) state.llamacppVision = s.llamacppVision;
+        if (BACKEND_PRESETS[s.backendType]) state.backendType = s.backendType;
+        if (s.backendCapabilities && typeof s.backendCapabilities === 'object') state.backendCapabilities = s.backendCapabilities;
+        if (s.localVision !== undefined) state.localVision = s.localVision;
+        else if (s.llamacppVision !== undefined) state.localVision = s.llamacppVision;
         for (const key of ['maxRunMinutes', 'streamIdleSeconds', 'compactTools', 'compactPrompt', 'journalEnabled']) if (s[key] !== undefined) state[key] = s[key];
         if (s.temp !== undefined) state.temp = s.temp;
         if (s.topP !== undefined) state.topP = s.topP;
@@ -9721,11 +9745,16 @@ Don't force a checklist onto something you're not actually sure about yet — a 
 
     function persistSettings() {
       try {
+        const promptInput = document.getElementById('s-sys-prompt');
+        const promptSettings = {sysPrompt:promptInput.value, sysPromptProfiles:state.sysPromptProfiles};
+        migrateSavedSystemPrompts(promptSettings);
+        promptInput.value = promptSettings.sysPrompt;
         localStorage.setItem(SETTINGS_KEY, JSON.stringify({
           apiUrl: state.apiUrl,
           compUrl: state.compUrl,
           backendType: state.backendType,
-          llamacppVision: state.llamacppVision,
+          backendCapabilities: state.backendCapabilities,
+          localVision: state.localVision,
           temp: state.temp,
           topP: state.topP,
           topK: state.topK,
@@ -9823,19 +9852,36 @@ Don't force a checklist onto something you're not actually sure about yet — a 
     function onBackendTypeChange(val, silent) {
       const hint = document.getElementById('s-backend-hint');
       const urlInp = document.getElementById('s-api-url');
-      const modelLoadSection = document.querySelector('.modal [style*="Model Load Settings"]')?.closest('[style*="border-top"]');
-      const visionField = document.getElementById('s-llamacpp-vision-field');
-      if (val === 'llamacpp') {
-        if (hint) hint.textContent = 'llama.cpp server: no model load/unload via API. Uses /v1/models & /v1/chat/completions. Default port 8080.';
-        if (urlInp && urlInp.value === 'http://localhost:1234') urlInp.value = 'http://localhost:8080';
-        if (modelLoadSection) modelLoadSection.style.opacity = '0.4';
-        if (visionField) visionField.style.display = '';
-      } else {
-        if (hint) hint.textContent = 'LM Studio: full model load/unload support. Default port 1234.';
-        if (urlInp && urlInp.value === 'http://localhost:8080') urlInp.value = 'http://localhost:1234';
-        if (modelLoadSection) modelLoadSection.style.opacity = '';
-        if (visionField) visionField.style.display = 'none';
+      const urlLabel = document.getElementById('s-api-url-label');
+      const urlHint = document.getElementById('s-api-url-hint');
+      const apiKeyHint = document.getElementById('s-api-key-hint');
+      const visionHint = document.getElementById('s-local-vision-hint');
+      const modelLoadSection = document.getElementById('model-load-settings');
+      const visionField = document.getElementById('s-local-vision-field');
+      const preset = BACKEND_PRESETS[val] || BACKEND_PRESETS['openai-compatible'];
+      if (urlInp) {
+        const previousType = urlInp.dataset.backendType || state.backendType;
+        const previousDefault = BACKEND_PRESETS[previousType]?.defaultUrl;
+        const currentUrl = urlInp.value.replace(/\/+$/, '');
+        if (!silent && (!currentUrl || currentUrl === previousDefault)) {
+          urlInp.value = preset.defaultUrl;
+          if (currentUrl !== preset.defaultUrl) restoreModelApiKey(preset.defaultUrl);
+        }
+        urlInp.dataset.backendType = val;
       }
+      if (hint) hint.textContent = preset.hint;
+      if (urlLabel) urlLabel.textContent = val === 'lmstudio' ? 'API URL' : 'Local API base URL';
+      if (urlHint) urlHint.textContent = val === 'lmstudio'
+        ? 'Turn on Enable CORS in LM Studio server settings. The companion session token is separate from the model API.'
+        : `${preset.hint} Use the server root or a base ending in /v1. Enable CORS if the browser cannot connect.`;
+      if (apiKeyHint) apiKeyHint.textContent = val === 'jan'
+        ? 'Jan requires an API key. Stored for this browser tab only.'
+        : 'Optional for local servers with authentication. Stored for this browser tab only.';
+      if (modelLoadSection) modelLoadSection.style.display = val === 'lmstudio' ? '' : 'none';
+      if (visionField) visionField.style.display = val === 'lmstudio' ? 'none' : '';
+      if (visionHint) visionHint.textContent = val === 'llamacpp'
+        ? 'Check this if you started llama.cpp with --mmproj. Vision is also probed via /props when connecting.'
+        : 'Check this if the selected model and local server accept image input.';
     }
 
     function openSettings(defaultTab) {
@@ -9847,10 +9893,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       renderToolToggleList();
       renderSafetyProfiles();
       document.getElementById('s-api-url').value = state.apiUrl; document.getElementById('s-comp-url').value = state.compUrl;
+      document.getElementById('s-api-key').value = state.apiKey || '';
       document.getElementById('s-comp-token').value = state.compToken;
-      document.getElementById('s-backend-type').value = state.backendType || 'lmstudio';
-      onBackendTypeChange(state.backendType || 'lmstudio', true);
-      const _lcvCb = document.getElementById('s-llamacpp-vision'); if (_lcvCb) _lcvCb.checked = !!state.llamacppVision;
+      const selectedBackend = BACKEND_PRESETS[state.backendType] ? state.backendType : 'lmstudio';
+      document.getElementById('s-backend-type').value = selectedBackend;
+      onBackendTypeChange(selectedBackend, true);
+      const _localVisionCb = document.getElementById('s-local-vision'); if (_localVisionCb) _localVisionCb.checked = !!state.localVision;
       document.getElementById('s-temp').value = state.temp; document.getElementById('s-temp-val').textContent = state.temp;
       const _sTopP = document.getElementById('s-top-p'); if (_sTopP) { _sTopP.value = state.topP !== undefined ? state.topP : 0.95; document.getElementById('s-top-p-val').textContent = (state.topP !== undefined ? state.topP : 0.95).toFixed(2); }
       const _sTopK = document.getElementById('s-top-k'); if (_sTopK) { _sTopK.value = state.topK !== undefined ? state.topK : 40; document.getElementById('s-top-k-val').textContent = state.topK !== undefined ? state.topK : 40; }
@@ -9936,8 +9984,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       const u = document.getElementById('s-api-url').value.replace(/\/+$/, '');
       if (!/^https?:\/\/.+/.test(u)) { showToast('Invalid API URL', 'warn'); return; }
       state.apiUrl = u;
-      state.backendType = document.getElementById('s-backend-type').value || 'lmstudio';
-      if (state.backendType === 'llamacpp') { state.llamacppVision = document.getElementById('s-llamacpp-vision')?.checked ?? false; updateVisionUI(); }
+      state.apiKey = document.getElementById('s-api-key').value.trim();
+      if (state.apiKey) sessionStorage.setItem(modelApiKeyStorageKey(u), state.apiKey);
+      else sessionStorage.removeItem(modelApiKeyStorageKey(u));
+      state.backendType = BACKEND_PRESETS[document.getElementById('s-backend-type').value]
+        ? document.getElementById('s-backend-type').value : 'lmstudio';
+      if (state.backendType !== 'lmstudio') { state.localVision = document.getElementById('s-local-vision')?.checked ?? false; updateVisionUI(); }
       const cu = document.getElementById('s-comp-url').value.replace(/\/+$/, '');
       if (!/^https?:\/\/.+/.test(cu)) { showToast('Invalid companion URL', 'warn'); return; }
       state.compUrl = cu;
@@ -10586,6 +10638,12 @@ Don't force a checklist onto something you're not actually sure about yet — a 
       state.taskState = c._taskState || null;
       state.runController = null;
       state.verificationState = state.taskState?.verification || null;
+      state.workspaceRevision = state.taskState?.workspaceRevision || 0;
+      state.progressRevision = state.taskState?.progressRevision || 0;
+      state.modelRecoveries = state.taskState?.modelRecoveries || {};
+      state.mutationPaths = state.taskState?.mutationPaths || [];
+      state.artifactRefs = state.taskState?.artifacts || [];
+      state.completion = state.taskState?.completion || null;
       await restoreHarnessConversation(c);
             toolCallHistory.length = 0;
             textLoopBuffer.length = 0;
@@ -10820,6 +10878,7 @@ Format:
       }
 
       state.runController = HarnessRunState.create();
+      state.modelRecoveries={}; state.workspaceRevision=0; state.progressRevision=0; state.mutationPaths=[]; state.completion=null;
       state.verificationState = null;
       const msg = { role: 'user', content: t || '[Image(s) attached]' };
       if (images.length && state.visionCapable) {
@@ -11401,6 +11460,10 @@ Format:
       }
     }
 
+    function planStepCompleted() {
+      return state.runController?.snapshot().phase==='finished' && ['verified','completed','completed_unverified'].includes(state.completion?.outcome);
+    }
+
     async function executeSinglePlanStep(idx) {
       if (state.running || !state.currentPlan) return;
       state.planExecuting = true;
@@ -11417,13 +11480,15 @@ Format:
       });
       updateContextMeter();
 
+      state.completion=null;
       await agentLoop();
 
-      if (state.planExecuting) {
+      if (state.planExecuting && planStepCompleted()) {
         updatePlanStep(idx, 'done');
         slimStepMessages(stepMsgIdx, state.messages.length);
       }
 
+      if(!planStepCompleted()) updatePlanStep(idx,state.completion?.outcome==='blocked'?'failed':'pending');
       state.planExecuting = false;
       updateSendBtn();
       saveCurrentConv();
@@ -11433,7 +11498,7 @@ Format:
     async function executeAllPlanSteps() {
       if (!state.currentPlan || state.planExecuting) return;
       const plan = state.currentPlan;
-      const startIdx = plan.steps.findIndex(s => s.status === 'pending');
+      const startIdx = plan.steps.findIndex(s => ['pending','failed','stopped'].includes(s.status));
       if (startIdx < 0) return;
 
       state.planExecuting = true;
@@ -11443,6 +11508,7 @@ Format:
       if (execBtn) { execBtn.disabled = true; execBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Executing...'; }
 
       for (let i = startIdx; i < plan.steps.length; i++) {
+        if(plan.steps[i].status==='done') continue;
         if (!state.planExecuting) {
           updatePlanStep(i, 'stopped');
           break;
@@ -11471,6 +11537,7 @@ Format:
 
         /* Run agent loop — exits when LLM stops calling tools */
         try {
+          state.completion=null;
           await agentLoop();
         } catch (e) {
           console.error('[plan] agentLoop error at step', i + 1, e);
@@ -11484,6 +11551,11 @@ Format:
           break;
         }
 
+        if(!planStepCompleted()) {
+          updatePlanStep(i,state.completion?.outcome==='blocked'?'failed':'pending');
+          appendMsg('system','Plan paused at step '+(i+1)+'. Resolve the task outcome before continuing.');
+          break;
+        }
         updatePlanStep(i, 'done');
 
         /* Slim tool results from this step to save context for next step */
@@ -11516,7 +11588,7 @@ Format:
         updatePlanProgress();
         appendMsg('system', 'Plan completed — all ' + plan.steps.length + ' steps finished.');
       } else if (execBtn) {
-        const remaining = plan.steps.filter(s => s.status === 'pending').length;
+        const remaining = plan.steps.filter(s => s.status !== 'done').length;
         if (remaining > 0) {
           execBtn.disabled = false;
           execBtn.innerHTML = '<i class="fas fa-play"></i> Resume (' + remaining + ' left)';
@@ -11583,7 +11655,8 @@ Format:
     function showToast(msg, type = 'info') {
       const el = document.createElement('div'); el.className = `toast ${type}`;
       const icons = { ok: 'check-circle', err: 'exclamation-circle', info: 'info-circle', warn: 'triangle-exclamation' };
-      el.innerHTML = `<i class="fas fa-${icons[type] || 'info-circle'}"></i><span>${msg}</span>`;
+      const icon=document.createElement('i'); icon.className='fas fa-'+(icons[type] || 'info-circle');
+      const text=document.createElement('span'); text.textContent=String(msg ?? ''); el.append(icon,text);
       document.getElementById('toasts').appendChild(el);
       setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, 4000);
     }
@@ -12559,7 +12632,7 @@ Format:
         updateModelMeta();
         updateSendBtn();
         updateWelcomeStatus();
-        await requestModelLoad(newModel);
+        if (state.backendType === 'lmstudio') await requestModelLoad(newModel);
       });
 
       /* ── Model metadata hint ── */

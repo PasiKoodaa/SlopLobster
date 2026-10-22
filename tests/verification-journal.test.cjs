@@ -57,7 +57,7 @@ function verification(responses, saved) {
     execViaCompanion: async command => { commands.push(command); return responses.shift() || result('passed'); },
     recordRunEvent: async (type, detail) => { events.push({ type, detail }); },
     recordHarnessTool: (...args) => records.push(args) };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/verification-ui.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/verification-ui.js'), 'utf8'), ctx);
   return { ctx, commands, events, messages, records };
 }
 test('baseline is captured once, survives resume, and never auto-repairs pre-existing failures', async () => {
@@ -118,7 +118,7 @@ test('the real tool wrapper waits for journal commit before calling its handler'
   const committed = new Promise(resolve => { release = resolve; });
   const ctx = { crypto, HarnessRuntime: H, recordRunEvent: async type => { if (fail) throw new Error('storage unavailable'); if (type === 'tool.started') await committed; },
     noteVerificationMutation() {}, executeToolImpl: async () => { mutations++; return { status: 'ok', output: 'changed' }; } };
-  vm.createContext(ctx); vm.runInContext(source.slice(start, end), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(source.slice(start, end), ctx);
   const operation = ctx.executeTool('write_file', '{"path":"a","content":"b"}');
   await Promise.resolve(); assert.equal(mutations, 0); release(); await operation; assert.equal(mutations, 1);
   fail = true; await assert.rejects(ctx.executeTool('write_file', '{}'), /storage unavailable/); assert.equal(mutations, 1);
@@ -129,7 +129,7 @@ test('approval completion waits for a durable decision before allowing a mutatio
   const run = Runs.create(); run.transition('running'); let release, allowed = false;
   const requested = new Promise(resolve => { release = resolve; });
   const events = [], ctx = { crypto, state: { running: true, runController: run }, recordRunEvent: async type => { events.push(type); if (type === 'approval.requested') await requested; } };
-  vm.createContext(ctx); vm.runInContext(source.slice(start, end), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(source.slice(start, end), ctx);
   const finish = ctx.beginRunApproval({ path: 'a' });
   const decision = finish(true).then(() => { allowed = true; });
   await Promise.resolve(); assert.equal(allowed, false); assert.equal(run.snapshot().phase, 'awaiting_approval');
@@ -171,7 +171,7 @@ test('actual model transport journals completion and failure without executing a
     AbortController, AbortSignal, setTimeout, clearTimeout, console, state: { maxTokens: 100, apiUrl: 'fixture' },
     estimateTokens: s => Math.ceil(s.length / 4), recordRunEvent: async (type, detail) => events.push({ type, detail }),
     fetch: async () => new Response('data: {"choices":[{"delta":{"content":"done"}}]}\n\ndata: [DONE]\n\n') };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
   await ctx.requestModel({ model: 'fixture', stream: true, max_tokens: 50 });
   assert.deepEqual(events.map(e => e.type), ['model.started', 'model.completed']);
   ctx.fetch = async () => new Response('data: malformed\n\n');
@@ -183,7 +183,7 @@ test('command dispatch waits for its journal record and uses the same stable ID 
   const ctx = { crypto, AbortController, AbortSignal, DOMException, state: { activeConvId: 'c', compUrl: 'fixture' },
     dbSet: async () => true, dbDelete: async () => true, redactSecrets: String,
     recordRunEvent: async (type, detail) => { events.push({ type, detail }); if (type === 'command.started') await gate; } };
-  vm.createContext(ctx); vm.runInContext(fs.readFileSync(require.resolve('../src/companion-client.js'), 'utf8'), ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(fs.readFileSync(require.resolve('../src/companion-client.js'), 'utf8'), ctx);
   ctx.commandRequest = async (path, body) => { paths.push(path); return path === '/commands/start' ? { id: body.id } : { status: 'ok', exitCode: 0, events: [], cursor: 0 }; };
   const job = ctx.executeCompanionJob('fixture command', 5);
   await Promise.resolve(); assert.equal(paths.length, 0); release(); assert.equal((await job).exitCode, 0);

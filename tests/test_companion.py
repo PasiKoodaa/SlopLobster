@@ -34,6 +34,23 @@ def wait_for(command_id, terminal=True):
 
 
 class CommandTests(unittest.TestCase):
+    def test_argv_preserves_shell_metacharacters_and_working_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            value = "release notes $(echo injected) 'quoted' & %PATH%"
+            argv = [sys.executable, '-c', 'import os,sys; print(os.getcwd()); print(sys.argv[1])', value]
+            command_id = c.start_command({'command': 'literal argument probe', 'argv': argv, 'cwd': directory, 'timeout': 5})
+            result = wait_for(command_id)
+            self.assertEqual(result['status'], 'ok', result)
+            output = ''.join(event['d'] for event in result['events'])
+            self.assertIn(value, output)
+            self.assertIn(directory, output)
+            with self.assertRaises(ValueError): c.start_command({'id':command_id, 'command':'literal argument probe', 'argv':argv+['changed'], 'cwd':directory, 'timeout':5})
+
+    def test_invalid_argv_cannot_launch_a_command(self):
+        for argv in ([], [''], 'python', ['python', None], ['python', 'bad\0value']):
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                c.start_command({'command':'probe', 'argv':argv, 'timeout':5})
+
     def test_exit_status_and_reconnect_cursor(self):
         command_id = c.start_command({'command': python_command("print('hello'); raise SystemExit(7)"), 'timeout': 5})
         result = wait_for(command_id)
@@ -142,6 +159,19 @@ class AccessTests(unittest.TestCase):
         status, _, result = self.request('/commands/status', headers, {'id': body['id'], 'cursor': 0})
         self.assertEqual(status, 200)
         self.assertEqual(result['exitCode'], 0)
+
+    def test_workspace_challenge_requires_matching_folder_and_nonce(self):
+        headers = {'Authorization':'Bearer ' + c.SESSION_TOKEN}
+        with tempfile.TemporaryDirectory() as directory:
+            marker='.sloplobster-workspace-' + 'a'*36 + '.tmp'
+            nonce='b'*36
+            (Path(directory)/marker).write_text(nonce,encoding='utf-8')
+            body={'cwd':directory,'marker':marker,'nonce':nonce}
+            status,_,result=self.request('/workspace/check',headers,body)
+            self.assertEqual(status,200,result)
+            self.assertEqual(Path(result['cwd']),Path(directory).resolve())
+            self.assertEqual(self.request('/workspace/check',headers,{**body,'nonce':'c'*36})[0],400)
+            self.assertEqual(self.request('/workspace/check',headers,{**body,'marker':'../outside'})[0],400)
 
 
 class EnvironmentTests(unittest.TestCase):

@@ -47,7 +47,7 @@ function harness(opts = {}) {
       return sse([{ choices: [{ delta: { content: said ?? ('finished ' + who + (body.tools ? '' : ' STATUS: COMPLETE')) } }] }]);
     } };
   if (opts.clock) ctx.Date = class extends Date { static now() { return opts.clock.t; } };
-  vm.createContext(ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx));
   vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'), 'utf8'), ctx);
   vm.runInContext(block + '\nglobalThis.__run = runSwarm; globalThis.__trace = buildSwarmTrace; globalThis.__history = swarmHistory;', ctx);
   return { run: ctx.__run, trace: ctx.__trace, history: ctx.__history, env, ctx };

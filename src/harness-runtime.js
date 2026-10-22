@@ -2,7 +2,7 @@
 (function (root) {
   'use strict';
   const readTools = new Set(['read_file', 'read_file_lines', 'read_file_summary', 'view_image',
-    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'web_search', 'fetch_url', 'swarm_history']);
+    'list_directory', 'search_files', 'grep', 'semantic_search', 'get_tool_schema', 'get_reference_sites', 'read_artifact', 'web_search', 'fetch_url', 'swarm_history']);
   function isReadOnly(name) { return readTools.has(name); }
   const coordinators = new Set(['spawn_sub_agent', 'spawn_swarm', 'deep_research', 'ask_user', 'think']);
   let readers = 0, writer = false;
@@ -111,7 +111,9 @@
       run: state.runController?.snapshot() || previous.run || null,
       verification: state.verificationState || previous.verification || null,
       plan: state.currentPlan || null, checklist: state.planItems || [], invariants: state.invariants || [],
-      beliefs: state.beliefs || [], pendingSteering: (state.pendingSteerMessages || []).map(m => m.text) };
+      beliefs: state.beliefs || [], pendingSteering: (state.pendingSteerMessages || []).map(m => m.text),
+      modelRecoveries: state.modelRecoveries || {}, progressRevision: state.progressRevision || 0, workspaceRevision: state.workspaceRevision || 0, mutationPaths: state.mutationPaths || [],
+      artifacts: state.artifactRefs || [], pendingOperations: state.pendingOperations || [], completion: state.completion || null };
   }
 
   function compactMessages(task, summary, progressFile) {
@@ -132,6 +134,9 @@
     const message = String(error?.message || 'Connection failed');
     if (backend === 'lmstudio' && (error?.name === 'TypeError' || /failed to fetch|networkerror/i.test(message))) {
       return 'Cannot access LM Studio from the browser. Check that its server is running and Enable CORS is on in LM Studio server settings. The companion session token only authenticates the companion.';
+    }
+    if (error?.name === 'TypeError' || /failed to fetch|networkerror/i.test(message)) {
+      return 'Cannot access the local model server from the browser. Check its URL, that the server is running, CORS settings, and any required model API key.';
     }
     return message;
   }

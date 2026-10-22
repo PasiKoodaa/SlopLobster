@@ -13,9 +13,9 @@ https://github.com/user-attachments/assets/11ae062c-58f9-4906-9e07-1a31e5d42456
 
 
 
-**Local AI coding agent** — runs entirely on your machine. No accounts, no API keys, no cloud.
+**Local AI coding agent** — runs with a model server on your machine. No cloud account required.
 
-SlopLobster gives you a Claude Code / Cursor-like agent experience powered by any local LLM via [LM Studio](https://lmstudio.ai/). It reads, writes, and edits your files, runs shell commands, searches the web, automates browsers, and manages git — all through a single self-contained HTML file.
+SlopLobster gives you a Claude Code / Cursor-like agent experience powered by a local model server. Built-in choices include [LM Studio](https://lmstudio.ai/), llama.cpp, [vLLM](https://docs.vllm.ai/), [LocalAI](https://localai.io/), [Jan](https://jan.ai/), [GPT4All](https://www.nomic.ai/gpt4all), and text-generation-webui, plus other local servers that expose the OpenAI-compatible API. It reads, writes, and edits your files, runs shell commands, searches the web, automates browsers, and manages git — all through a single self-contained HTML file.
 
 
 ---
@@ -107,7 +107,7 @@ SlopLobster gives you a Claude Code / Cursor-like agent experience powered by an
 └──────────────────┬─────────────────────────────┘
                    │ HTTP
          ┌─────────┴──────────┐
-         │  LM Studio (:1234) │  ← LLM inference (main agent + memory agent)
+         │ Local model server │  ← LLM inference (main agent + memory agent)
          └────────────────────┘
                    │ HTTP
          ┌─────────┴──────────┐
@@ -116,15 +116,18 @@ SlopLobster gives you a Claude Code / Cursor-like agent experience powered by an
          └────────────────────┘
 ```
 
-**Zero backend of its own** — SlopLobster is a pure frontend app. All heavy lifting is done by LM Studio and the companion server.
+**Zero backend of its own** — SlopLobster is a pure frontend app. Model inference is handled by your chosen local server; the companion provides shell, search, and browser tools.
 
 ---
 
 ## Quick Start
 
-### 1. Install LM Studio
+### 1. Start a local model server
 
-Download from [lmstudio.ai](https://lmstudio.ai/). Load a model that supports tool/function calling (recommended): Qwen 3.5 or Gemma 4
+Choose a backend in Settings. Presets are available for LM Studio, llama.cpp, vLLM, LocalAI, Jan, GPT4All, and text-generation-webui. Select **Other OpenAI-compatible local server** for another server that provides `/v1/models` and `/v1/chat/completions`. Enter its local base URL; `/v1` can be included or omitted. Servers that require authentication can use the Model API key field.
+
+Load a model that supports tool/function calling (recommended): Qwen 3.5 or Gemma 4.
+The selected server must expose streaming chat completions and tool calling for SlopLobster's agent tools; support varies by server and model.
 
 **For best results**: use a model with ≥32k context and tool-use training. Check the `🔧` tag in the model selector — it indicates the model reports tool-use capability.
 
@@ -239,7 +242,9 @@ Click ⚙️ in the header to configure:
 
 | Setting | Default | Description |
 |---------|---------|--------------|
-| LM Studio URL | `http://localhost:1234` | LM Studio API endpoint |
+| Backend | LM Studio | Choose LM Studio, llama.cpp, vLLM, LocalAI, Jan, GPT4All, text-generation-webui, or another local OpenAI-compatible server |
+| Model API URL | `http://localhost:1234` | Local server base URL; the default changes with the selected backend |
+| Model API key | (blank) | Optional local-server authentication; kept in this browser tab's session storage |
 | Companion URL | `http://127.0.0.1:8765` | Companion server endpoint |
 | Temperature | 0.3 | Lower = more deterministic |
 | Max Tokens | 60000 | Max response length |
@@ -355,7 +360,7 @@ SlopLobster-companion.py
 SlopLobster uses the OpenAI-compatible tool/function calling API:
 
 1. User sends a message
-2. Message + system prompt + conversation history → LM Studio
+2. Message + system prompt + conversation history → the selected local model server
 3. LLM responds with either text, tool calls, or both
 4. Tool calls are executed locally (file I/O) or via companion (shell, search, browser) — dangerous ones pause for confirmation first, per the permission settings
 5. Tool results (secret-redacted) are appended to history and sent back to the LLM
@@ -400,8 +405,9 @@ Uses a full **Longest Common Subsequence (LCS)** algorithm for precise diffs. Fo
 ## Troubleshooting
 
 **"No models" in selector**
-- Make sure LM Studio is running and a model is loaded
-- Check the API URL in Settings matches LM Studio's port (default 1234)
+- Make sure the selected local server is running and has a model available
+- Check that its `/v1/models` endpoint is reachable at the API URL in Settings
+- Enter an API key if the server requires one, and allow browser CORS requests
 
 **Model selector shows different model than what's loaded**
 - LM Studio's `/v1/models` endpoint lists all downloaded models, not just the loaded one
@@ -457,7 +463,7 @@ Uses a full **Longest Common Subsequence (LCS)** algorithm for precise diffs. Fo
 | Sanitization | DOMPurify |
 | PDF | pdf.js |
 | Screenshots | html2canvas + Screen Capture API |
-| LLM | LM Studio (OpenAI-compatible API) |
+| LLM | Local model server (OpenAI-compatible API) |
 | Shell/Search | Python stdlib + Playwright |
 | Storage | localStorage (conversations, settings) + workspace files (progress/memory) |
 
@@ -476,9 +482,12 @@ Compaction persists a task checkpoint containing the objective, user instruction
 
 ### Development and regression checks
 
-Edit the canonical sources, then run `node scripts/build.mjs`. The distributable `SlopLobster.html` is generated entirely from `src/ui.html`, `src/app.js`, and the runtime modules in `src/`. Model requests live in `src/model-client.js`, strict SSE parsing in `src/model-stream.js`, orchestration in `src/agent-loop.js`, and durable run accounting in `src/run-state.js`. The companion remains canonical outside its generated features block, which comes from `src/companion-features.py` and `src/companion-services.py`. Do not edit generated HTML directly. The old `scripts/swarm-core.js` path forwards to the canonical `src/swarm-core.js` implementation. Users of the distribution do not need Node or a build step.
+Run `npm ci` once to install the pinned build dependency, edit the canonical sources, then run `node scripts/build.mjs`. The build compiles `src/tailwind.css` with `tailwind.config.cjs` into `vendor/tailwind.min.css`, scanning the HTML and JavaScript in `src/` for complete class names. Keep utility class names complete in source strings so they are included in the stylesheet. The app loads this static CSS locally; no Tailwind browser compiler runs. The distributable `SlopLobster.html` is generated entirely from `src/ui.html`, `src/app.js`, and the runtime modules in `src/`. Model requests live in `src/model-client.js`, strict SSE parsing in `src/model-stream.js`, orchestration in `src/agent-loop.js`, durable run accounting in `src/run-state.js`, shared backend policy in `src/backend-core.js`, and mutation receipts in `src/mutation-core.js` / `src/harness-services.js`. The companion remains canonical outside its generated features block, which comes from `src/companion-features.py` and `src/companion-services.py`. Do not edit generated HTML directly. The old `scripts/swarm-core.js` path forwards to the canonical `src/swarm-core.js` implementation. Users of the distribution do not need Node or a build step; distribute the generated HTML together with `vendor/`.
+
+The embedded dev-server preview runs scripts in a sandbox with an opaque origin, preventing preview pages from accessing the SlopLobster document even if they load from the same URL origin. Origin storage, cookies, login flows and API requests that require the site's normal origin may not work inside the embedded preview. Use its **Open in browser** button for those features. Stopping or failing a preview unloads the frame.
 
 ```text
+npm ci
 node scripts/build.mjs
 node scripts/check.mjs
 node scripts/check.mjs --browser
@@ -488,11 +497,13 @@ node scripts/replay-journal.mjs exported-journal.json
 
 The checks require Node 24 and Python 3.10 or later. Set `PYTHON` to select an interpreter. `--skip-python` runs just build and JavaScript checks; `--browser` additionally runs the Windows Chrome/Edge smoke test. CI runs build freshness and the complete JavaScript/Python suites on Windows and Linux, and browser smoke checks on Windows. The tests use scripted model responses and temporary workspaces, with no model download or LM Studio connection.
 
-`evaluate-harness.mjs` exports per-scenario pass/fail results, verified rate and elapsed time for deterministic faults: compaction and reload at the run limit, interrupted streams containing valid-looking mutations, malformed or split SSE events, stalled models, cancellation, command reconciliation, stale approvals and conversation persistence. These are harness reliability measurements; they do not measure live-model quality or inference throughput. To compare local models, paste `tests/fixtures/coding-benchmark.json` into Harness → Evaluations. Its four coding fixtures exercise narrow edits, coordinated changes, instruction scope and filenames with spaces. The existing evaluation report measures verified completion, unintended writes, tokens and time. No model benchmark runs automatically.
+`evaluate-harness.mjs` exports per-scenario pass/fail results, verified rate and elapsed time for deterministic faults: compaction and reload at the run limit, interrupted streams containing valid-looking mutations, malformed or split SSE events, stalled models, cancellation, command reconciliation, stale approvals and conversation persistence. These are harness reliability measurements; they do not measure live-model quality or inference throughput. To compare local models, open Harness > Evaluations. The default benchmark is embedded from `tests/fixtures/coding-benchmark.json`. Its eight fixtures exercise narrow edits, coordinated changes, instruction scope, filenames with spaces, failing tests, empty inputs, decoy files and noisy diagnostics. The existing evaluation report measures verified completion, unintended writes, tokens and time. No model benchmark runs automatically.
 
 Main-agent iteration counts, generated output tokens and active elapsed time are saved with the task. Compaction, Pause/Resume and reload preserve the allowance. A new submitted user task starts a new allowance; resuming an exhausted task requires raising its limit. Settings → General adds an optional active-time limit and a model inactivity timeout. Explicitly paused time is excluded. A reload during generation conservatively charges its saved output reservation and the uncertain elapsed time until recovery; raise the allowance after inspecting the task if necessary. Output allowances are reserved before requests, shared by concurrent workers, and capped by remaining context. Summaries, specialist passes and partial interrupted responses also consume output budget; token counts are labelled estimates when the model server omits usage. Queue token limits apply to each task across resumes and also respect the session cap.
 
 The **Minimal / Low-Context** profile enables concise built-in instructions and a core coding toolset, including test execution. Specialist tools are loaded through `get_tool_schema`; disabled tools remain unavailable. Visible `think` calls can be disabled independently of the model's native reasoning. Custom system prompts are preserved. The context popup shows estimated schema and retrieved-context costs alongside instructions and conversation history. Interrupted or malformed model responses pause the task without executing partial calls; retry requires an explicit resume.
+
+Reference sites are available on demand through `get_reference_sites(query, limit)`, which returns up to six matching links from the local catalogue without fetching their pages. In compact tool mode, load its schema with `get_tool_schema` first. The system prompt contains brief documentation guidance instead of the full catalogue. Saved prompts and presets automatically migrate `{{REFERENCE_SITES}}` to `{{REFERENCE_SECTION}}`, preserving the rest of the text. Unsupported prompt placeholders stop the request before anything is sent to the model and identify what to correct in Settings > System Prompt. Prompt substitutions run once over the template, so placeholder examples inside project memory remain literal data. The prompt cache uses the complete template and dynamic section values, including memory and invariants, to avoid stale instructions after edits of the same length.
 
 ### Baselines and run journals
 
@@ -518,7 +529,7 @@ Open **Harness** in the top toolbar. Options persist in this browser; queue task
 | Automatic knowledge retrieval | Off | Enable to add matching project knowledge to new model turns. |
 | Model evaluations | Manual | Select models, edit fixture tasks/settings, and run a benchmark explicitly. |
 
-Restart the updated companion **1.6.0**, then enter its newly printed session token in Settings. Refresh the HTML page. The companion token belongs to the companion; LM Studio must separately have CORS enabled.
+Restart the updated companion **1.6.0**, then enter its newly printed session token in Settings. Refresh the HTML page. The companion token belongs to the companion; the model server uses its own CORS and optional API key settings.
 
 Isolated tasks use a generated branch and worktree under `.sloplobster/worktrees/`, with their own preview port. Files and shell commands route to that worktree. Worktrees start from committed HEAD; commit desired starting changes first. Review the diff before **Commit & merge**; a changed review or dirty original workspace blocks merging. **Discard** permanently removes the task worktree and branch after confirmation. This is Git isolation, not an operating-system sandbox: approved shell commands still have the user's normal access. MCP tools are omitted while an isolated task is active because their working directory cannot be guaranteed. Preview commands can use `{port}`; the server also sets `PORT`.
 
@@ -545,3 +556,35 @@ Slow browser and embedding requests run in separate, reusable worker processes. 
 The embedding model is cached between batches. CPU inference defaults to two threads; set `SLOPLOBSTER_EMBED_THREADS` before launching the companion to select 1–4 threads. Unchanged MCP configurations reuse their running server, stderr is continuously drained, and failed startup or timed-out communication stops the process tree. Shell output and preview logs are bounded even when a process never prints a newline; excess shell output is discarded with backpressure. Shutdown waits for active shell commands to cancel.
 
 After updating, stop and restart the companion and reload `SlopLobster.html`. If you use the companion downloaded from the GUI, download the updated copy first. A fresh session token appears on restart unless you explicitly configured `SLOPLOBSTER_TOKEN`.
+
+
+### Backend compatibility, completion and recovery
+
+All model passes, including planning, summaries, subagents, workers and evaluations, use a shared streaming client. Local server base URLs accept an optional trailing `/v1`. LM Studio and llama.cpp retain their native sampler fields; other servers receive portable OpenAI-compatible sampler fields. The **Use server sampling** option applies to every ordinary model pass. Evaluation variants explicitly supply their selected settings.
+
+**Settings > General > Check model capabilities** manually checks streaming, tool calling and usage reporting on the selected model. It allows up to 128 output tokens and never executes the returned tool call. Capability observations are saved per server, backend and model. LM Studio is never sent `/v1/tokenize`; exact tokenization is attempted only on llama.cpp's `/tokenize` route. Other servers use reported usage or labelled estimates.
+
+Explicit HTTP 408, 429 and transient server errors receive at most two retries with bounded delays. Authentication errors, dropped connections and interrupted streams are not automatically replayed. Context overflow permits one compaction attempt; truncated tool arguments permit two retries with smaller-edit guidance. Incomplete tool calls never execute, and recovery attempts count toward the existing run allowance and survive reload.
+
+Completion has four outcomes: **verified**, **completed**, **completed with verification outstanding**, and **blocked**. Verification requires a successful recorded check after the latest relevant changes. Configured regression failures and unresolved operations block completion. Unfinished checklist items and acceptance criteria require review. Verification snapshots include hashes of files changed through the harness; external changes to those files invalidate earlier checks. This does not monitor every file in the repository or prove every acceptance criterion.
+
+Native file writes, deletes and moves persist a prepared receipt before changing bytes, then verify the resulting hashes. Resume inspects those receipts and restores missing results without repeating operations. Edits reject changes since a tool read or approval; moves preserve binary bytes and reject existing destinations. Native browser file access cannot provide an atomic transaction against an unrelated external editor, so uncertain outcomes remain blocked. Managed worktree writes also retain the companion's hash comparison.
+
+For uncertain outcomes, open **Harness > Journal**. **Recheck file outcomes** observes the files again. After inspecting the affected files, **Accept current files** records your decision and clears the block without repeating or undoing the operation. New verification is required. Deleting a conversation removes its output artifacts and settled receipts; unresolved receipts remain available for workspace recovery.
+
+Long outputs and errors are saved as redacted artifacts in IndexedDB. Tool results expose their artifact IDs, and the `read_artifact` tool retrieves bounded sections. Compaction keeps task state, recovery counters, pending operations and artifact references separately from its summary, selects error lines as well as recent context, and saves the prior transcript. Artifact content is capped at 4,194,304 characters with explicit truncation metadata. Large artifact bodies use a separate database store so command and mutation recovery do not load them. Older unreferenced outputs are pruned above 128 per conversation; referenced outputs are retained. Storage failures pause new work and preserve the current result in memory.
+
+Loop detection compares complete normalized arguments, output fingerprints and observed workspace progress. Changing diagnostics or actual file changes count as progress; varying timestamps alone do not. Subagents and workers use result fingerprints in their round budgets too.
+
+Evaluation results include backend metadata, retry counts and failure categories. The table and JSON export include tokens spent per verified task, including tokens spent on failures, plus corrections and elapsed time. Evaluations use their own output allowance and the same transport/parser as normal runs. The deterministic fault report covers lost mutation receipts, partial moves, stale reads, artifact recovery and completion decisions. These checks use scripted model replies; live local-model quality comparisons remain manual.
+
+
+### Review fixes: commands, plans and UI
+
+Update both `SlopLobster.html` and `SlopLobster-companion.py`, restart the companion, and pair its new session token. The HTML checks for the companion's structured-argument and workspace-verification capabilities before connecting.
+
+Commands, test commands and dev-server commands honor shell approval settings. Automatic Python syntax checks and `git_add` use argument arrays instead of interpolating paths into shell code. `git_add.paths` accepts one literal path (including spaces), an array of paths, or `"."` for all changes.
+
+Before a command runs in a normal folder, the browser creates a temporary random challenge file and the companion verifies it in the proposed directory. The challenge file is then removed. The companion launch directory works automatically when it matches the selected folder. If it differs, set the selected folder's absolute path in **Harness > Options > Workspace path on the companion computer**. This path is saved per folder; Git isolation still requires a Git repository root. A mismatch blocks execution. Isolated tasks continue using their own task directories.
+
+Virtual `touch` preserves existing files and requests edit approval when creating a new file. Plan execution advances only after a completed run; paused, blocked and failed steps remain resumable. Entirely unavailable tool batches receive error results for each call. Completed command receipts retain their output until the conversation is durably saved, including recovery after the companion restarts. Toast messages display plain text, and file-tree actions use event handlers that preserve filenames containing quotes.

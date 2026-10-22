@@ -36,6 +36,10 @@ def start_command(body):
     command = body.get("command")
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command must be a nonempty string")
+    argv = body.get('argv')
+    if argv is not None and (not isinstance(argv, list) or not 1 <= len(argv) <= 256 or
+                             any(not isinstance(a, str) or '\0' in a for a in argv) or not argv[0]):
+        raise ValueError('argv must contain 1-256 valid string arguments')
     timeout = body.get("timeout", DEFAULT_TIMEOUT)
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 5 <= timeout <= MAX_TIMEOUT:
         raise ValueError("timeout must be between 5 and 600 seconds")
@@ -47,7 +51,7 @@ def start_command(body):
     if task_id:
         task = managed_task(task_id)
         cwd = task['path']
-        if task['kind'] == 'evaluation' and command not in task['checks']:
+        if task['kind'] == 'evaluation' and (argv is not None or command not in task['checks']):
             raise ValueError('Evaluation command is not one of its declared checks')
     if cwd is not None and (not isinstance(cwd, str) or not os.path.isdir(cwd)):
         raise ValueError("cwd must be an existing directory")
@@ -55,7 +59,7 @@ def start_command(body):
         if command_id in _commands:
             # Idempotent reconnect: never execute an existing ID again.
             job = _commands[command_id]
-            if (job['command'], job['cwd'], job['timeout']) != (command, cwd, timeout):
+            if (job['command'], job['cwd'], job['timeout'], job.get('argv')) != (command, cwd, timeout, argv):
                 raise ValueError("command id already belongs to a different request")
             return command_id
         if len(_commands) >= MAX_COMMANDS:
@@ -63,7 +67,7 @@ def start_command(body):
             if completed is None:
                 raise ValueError("too many active commands")
             del _commands[completed]
-        job = dict(taskId=task_id, command=command, cwd=cwd, timeout=timeout, status='running', events=[], chars=0,
+        job = dict(taskId=task_id, command=command, argv=argv, cwd=cwd, timeout=timeout, status='running', events=[], chars=0,
                    exitCode=None, truncated=False, cancel=threading.Event(), lock=threading.Lock())
         _commands[command_id] = job
 
@@ -81,7 +85,10 @@ def start_command(body):
 
     def run():
         try:
-            stream_cmd_fresh(emit, command, cwd=cwd, timeout=timeout, cancel_event=job['cancel'])
+            if argv is not None:
+                stream_cmd_fresh(emit, command, cwd=cwd, timeout=timeout, cancel_event=job['cancel'], argv=argv)
+            else:
+                stream_cmd_fresh(emit, command, cwd=cwd, timeout=timeout, cancel_event=job['cancel'])
             with job['lock']:
                 job['status'] = 'cancelled' if job['cancel'].is_set() else ('ok' if job['exitCode'] == 0 else 'error')
         except Exception as exc:
@@ -658,7 +665,7 @@ def _remove_stray_nul(directory):
     try: os.remove(_extended_path(path)); return True
     except OSError: return False
 
-def _stream_cmd_fresh_impl(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
+def _stream_cmd_fresh_impl(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None, argv=None):
     stripped = cmd.strip()
     first_word = stripped.split(None, 1)[0] if stripped else ''
 
@@ -668,7 +675,11 @@ def _stream_cmd_fresh_impl(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, can
             if shutil.which(alt):
                 cmd = alt + stripped[len(first_word):]
 
-    if WINDOWS_BASH:
+    if argv is not None:
+        kw = dict(args=argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd)
+        if platform.system() != 'Windows': kw['start_new_session'] = True
+        else: kw['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    elif WINDOWS_BASH:
         translated = _translate_for_cmd_bash(cmd)
         kw = dict(args=[WINDOWS_BASH, "-c", translated], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", cwd=cwd)
     elif platform.system() == "Windows":
@@ -753,7 +764,9 @@ def _stream_cmd_fresh_impl(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, can
 
     return full, returncode
 
-def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None):
+def stream_cmd_fresh(write_fn, cmd, cwd=None, timeout=DEFAULT_TIMEOUT, cancel_event=None, argv=None):
+    if argv is not None:
+        return _stream_cmd_fresh_impl(write_fn, cmd, cwd=cwd, timeout=timeout, cancel_event=cancel_event, argv=argv)
     fixed = _fix_nul_redirects(cmd)
     if fixed != cmd:
         write_fn("e", "[companion: rewrote a cmd.exe redirect to nul as /dev/null; this shell is " + SHELL_NAME + ", where \"nul\" would create a file]\n")
@@ -1720,10 +1733,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "version": BUILD_VERSION,
                 "capabilities": sorted(CAPABILITIES),
                 "command_lifecycle": True,
+                "argv_commands": True,
+                "workspace_challenge": True,
                 "platform": platform.system(),
                 "release": platform.release(),
                 "python": platform.python_version(),
                 "python_cmd": PYTHON_CMD,
+                "python_executable": sys.executable,
                 "cwd": os.getcwd(),
                 "shell": SHELL_NAME,
                 "python_env": PYTHON_ENV,
@@ -1742,7 +1758,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _dispatch_post(self):
         if not self._check_access(): return
         path = self.path.split('?')[0]
-        capability = ('command' if path == '/execute' or path.startswith('/commands/') else
+        capability = ('command' if path in ('/execute', '/workspace/check') or path.startswith('/commands/') else
                       'browser' if path.startswith('/browser_') else
                       'mcp' if path.startswith(('/mcp/', '/api/mcp/')) else
                       'dev' if path.startswith('/dev_') else None)
@@ -1771,6 +1787,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 name = 'NotFoundError' if isinstance(exc, FileNotFoundError) else 'TypeMismatchError' if isinstance(exc, (NotADirectoryError, IsADirectoryError)) else 'OperationError'
                 return self.send_json(400, {'error': str(exc), 'errorName': name})
+        if path == '/workspace/check':
+            try:
+                body = self.read_body()
+                cwd = os.path.realpath(body.get('cwd') or os.getcwd())
+                marker, nonce = body.get('marker', ''), body.get('nonce', '')
+                if not re.fullmatch(r'\.sloplobster-workspace-[a-f0-9-]+\.tmp', marker) or not re.fullmatch(r'[a-f0-9-]{36}', nonce):
+                    raise ValueError('Invalid workspace challenge')
+                file = os.path.join(cwd, marker)
+                if os.path.islink(file): raise ValueError('Workspace challenge cannot be a symlink')
+                with open(file, 'r', encoding='utf-8') as stream:
+                    if stream.read(257) != nonce: raise ValueError('Workspace challenge did not match')
+                return self.send_json(200, {'cwd': cwd})
+            except (ValueError, OSError, TypeError) as exc:
+                return self.send_json(400, {'error': str(exc)})
         if path in ('/commands/start', '/commands/status', '/commands/cancel'):
             try:
                 body = self.read_body()

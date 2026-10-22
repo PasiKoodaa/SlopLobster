@@ -83,7 +83,7 @@ test('client uses seconds, resumes output by cursor, and never relaunches after 
       if (url.endsWith('/commands/start')) return { ok: true, json: async () => ({ id: 'job-1' }) };
       throw new Error('connection lost');
     } };
-  vm.createContext(context);
+  vm.createContext(require('./runtime-modules.cjs')(context));
   vm.runInContext(fs.readFileSync(require.resolve('../src/companion-client.js'), 'utf8'), context);
   const result = await vm.runInContext("executeCompanionJob('echo hi', 300)", context);
   assert.equal(result.status, 'unknown');
@@ -113,7 +113,7 @@ test('actual approval handlers reject stale empty files and newly created paths'
   const context = { requireWorkspace: () => {}, sanitizePath: () => ['file.txt'],
     state: { dirHandle: { getFileHandle: async () => handle }, fileCache: new Map(), verifyWrites: false },
     modifiedFiles: new Set(), newFiles: new Set() };
-  vm.createContext(context);
+  vm.createContext(require('./runtime-modules.cjs')(context));
   vm.runInContext(html.slice(start, end), context);
   context.preview = { _pendingPath: 'file.txt', _originalContent: '', _pendingNewContent: 'model change' };
   const edit = await vm.runInContext('applyPendingEdit(preview)', context);
@@ -135,5 +135,5 @@ test('LM Studio browser connection errors explain CORS and separate tokens', () 
   assert.match(hint, /Enable CORS/);
   assert.match(hint, /only authenticates the companion/);
   assert.equal(H.connectionErrorHint(new Error('HTTP 401'), 'lmstudio'), 'HTTP 401');
-  assert.equal(H.connectionErrorHint(new TypeError('Failed to fetch'), 'llamacpp'), 'Failed to fetch');
+  assert.match(H.connectionErrorHint(new TypeError('Failed to fetch'), 'llamacpp'), /local model server.*CORS/);
 });

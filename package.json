@@ -1,0 +1,10 @@
+{
+  "name": "sloplobster",
+  "private": true,
+  "scripts": {
+    "build": "node scripts/build.mjs"
+  },
+  "devDependencies": {
+    "tailwindcss": "3.4.17"
+  }
+}

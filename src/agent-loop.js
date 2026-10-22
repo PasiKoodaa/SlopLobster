@@ -6,6 +6,13 @@
         const active = typeof dbGet === 'function' ? await dbGet('agent_states', 'active_session') : null;
         const saved = active?.convId === state.activeConvId && active.run ? active.run : state.taskState?.run;
         state.runController = HarnessRunState.create(saved);
+        const restored = active?.convId === state.activeConvId ? active : state.taskState || {};
+        state.workspaceRevision = restored.workspaceRevision || 0;
+        state.progressRevision = restored.progressRevision || 0;
+        state.modelRecoveries = restored.modelRecoveries || {};
+        state.mutationPaths = restored.mutationPaths || [];
+        state.artifactRefs = restored.artifactRefs || restored.artifacts || [];
+        state.completion = null;
         if (active?.convId === state.activeConvId && active.verification?.runId === state.runController.snapshot().id) state.verificationState = active.verification;
         if (active?.convId === state.activeConvId && saved?.reservedTokens > 0) {
           const recovered = (active.sessionOutput || 0) + saved.reservedTokens;
@@ -14,7 +21,10 @@
       }
       // Explicit retries and the next approved plan step may follow a completed run.
       // Paused/exhausted runs retain their counters; completed work starts a new allowance.
-      if (state.runController.snapshot().phase === 'finished') state.runController = HarnessRunState.create();
+      if (state.runController.snapshot().phase === 'finished') {
+        state.runController = HarnessRunState.create();
+        state.modelRecoveries = {}; state.verificationState = null; state.workspaceRevision = 0; state.progressRevision = 0; state.mutationPaths = []; state.completion = null;
+      }
       state.runController.transition('recovering');
       state.running = true; updateSendBtn();
       state.abortCtrl = new AbortController();
@@ -25,7 +35,9 @@
       try {
       try {
         if (typeof recordRunEvent === 'function') await recordRunEvent(state.runController.snapshot().iterations ? 'run.resumed' : 'run.started', { run: state.runController.snapshot() });
-        await reconcileCommandJobs(); state.runController.transition('running');
+        await reconcileCommandJobs();
+        if (typeof reconcileWorkspaceMutations === 'function') await reconcileWorkspaceMutations();
+        state.runController.transition('running');
         if (typeof ensureVerificationBaseline === 'function') await ensureVerificationBaseline();
         if (!state.running) return;
       }
@@ -37,7 +49,7 @@
       let iters = 0;
       const compStats = createCompressionStats();
       const SOFT_WARN = Math.floor(state.maxIters * 0.4);
-      const COMPACT_AT = Math.floor(state.maxIters * 0.6);
+      const COMPACT_AT = Math.max(1, Math.floor(state.maxIters * 0.6));
 
       toolCallHistory.length = 0;
       state._envNudgedPairs = new Set();
@@ -87,13 +99,14 @@
         // to estimateConvTokens() which can wildly overestimate when previous compact artifacts
         // ([ORIGINAL TASK], [summary], [CONTINUE WORKING]) are already in state.messages.
         // Waiting until iters > 0 guarantees we have a real token count from the model.
-        const hasRealTokenCount = iters > 0 && tokenTracker.lastPromptTokens > 0;
-        if (state.memoryAgentEnabled && hasRealTokenCount) {
+        const hasContextReading = iters > 0;
+        if (state.memoryAgentEnabled && hasContextReading) {
           const overPct = ctxPct >= state.autoCompactPct;
-          const overTokenThreshold = state.compactTokenThreshold > 0 && tokenTracker.lastPromptTokens >= state.compactTokenThreshold;
+          const measuredTokens = Math.max(tokenTracker.lastPromptTokens, Math.round(ctxPct * state.ctxWindow / 100));
+          const overTokenThreshold = state.compactTokenThreshold > 0 && measuredTokens >= state.compactTokenThreshold;
           if (overPct || overTokenThreshold) {
             const reason = overTokenThreshold && !overPct
-              ? ('token threshold (' + tokenTracker.lastPromptTokens.toLocaleString() + ' ≥ ' + state.compactTokenThreshold.toLocaleString() + ')')
+              ? ('token threshold (' + measuredTokens.toLocaleString() + ' ≥ ' + state.compactTokenThreshold.toLocaleString() + ')')
               : ('context limit (' + Math.round(ctxPct) + '%)');
             const saved = await saveProgressToWorkspace(reason);
             if (!saved) appendMsg('system', '⚠ Could not save progress file — workspace may be disconnected');
@@ -236,6 +249,19 @@
             appendMsg('system', 'Stopped.');
             break;
           }
+          state.modelRecoveries ||= {};
+          if (e.code === 'context_overflow' && state.memoryAgentEnabled && !state.modelRecoveries.context) {
+            state.modelRecoveries.context = 1;
+            appendMsg('system','The model context is full. Saving progress and compacting before one retry.');
+            const saved = await saveProgressToWorkspace('server context overflow');
+            await progressCompact(saved); iters = 0; tokenTracker.reset();
+            if (state.running) continue;
+          }
+          if (e.code === 'truncated_tool_call' && (state.modelRecoveries.truncation || 0) < 2) {
+            state.modelRecoveries.truncation = (state.modelRecoveries.truncation || 0) + 1;
+            state.messages.push({role:'user',content:'[Tool-call recovery] The previous generation hit its output limit. No tool from it was executed. Use smaller targeted edits or shorter tool arguments. Do not assume any file was written.',_harnessContext:true});
+            continue;
+          }
           appendMsg('system', 'Error: ' + e.message);
           break;
         }
@@ -257,7 +283,6 @@
         }
 
         if (!tcs.length) {
-          if (_chatRes.finishReason !== 'length') harnessModelFinished();
           // ── No tool calls: text-only response ──
           state.messages.push(am);
           updateContextMeter();
@@ -282,8 +307,14 @@
           }
 
           finalizeStreamingMsg(cur);
-          if (_chatRes.finishReason !== 'length') state.runController.transition('finished');
-          notifyUser('Agent finished', cur || 'Task complete', 'agent-done');
+          if (_chatRes.finishReason !== 'length') {
+            const completion = typeof assessHarnessCompletion === 'function' ? await assessHarnessCompletion() : { outcome:'completed', reasons:[] };
+            if (completion.outcome === 'blocked') state.runController.transition('paused',completion.reasons.join(' '));
+            else { harnessModelFinished(); state.runController.transition('finished',completion.outcome); }
+            const title = {verified:'Completed and verified',completed:'Completed',completed_unverified:'Completed with verification outstanding',blocked:'Task blocked'}[completion.outcome];
+            appendMsg('system',title + (completion.reasons.length ? ': '+completion.reasons.join(' ') : '.'));
+            notifyUser(title, completion.reasons.join(' ') || cur || title, 'agent-done');
+          }
           break;
         }
 
@@ -462,7 +493,7 @@
           }
           let result;
           try {
-            result = HarnessRuntime.normalizeResult(await executeTool(tc.function.name, tc.function.arguments, toolAbortCtrls[i].signal, toolPanels[i]));
+            result = HarnessRuntime.normalizeResult(await executeTool(tc.function.name, tc.function.arguments, toolAbortCtrls[i].signal, toolPanels[i], tc._operationId));
             const toolFailed = result.status !== 'ok';
             updateToolStatus(toolPanels[i], toolFailed ? 'err' : 'ok');
           } catch (e) {
@@ -619,10 +650,10 @@
               try {
                 actual = await HarnessRuntime.withToolLock('write_file', async () => {
                   if (toolAbortCtrls[i].signal.aborted || !state.running) throw new DOMException('Aborted', 'AbortError');
-                  if (typeof recordRunEvent === 'function') await recordRunEvent('edit.started', { operationId: tc.id, path: pendingPath });
+                  if (typeof recordRunEvent === 'function') await recordRunEvent('edit.started', { operationId: tc._operationId || result._operationId || tc.id, path: pendingPath });
                   const applied = isNewFile ? await applyPendingWrite(result) : await applyPendingEdit(result);
                   if (typeof noteVerificationMutation === 'function') noteVerificationMutation(tc.function.name, applied);
-                  if (typeof recordRunEvent === 'function') await recordRunEvent(applied.status === 'error' ? 'edit.failed' : 'edit.applied', { operationId: tc.id, path: pendingPath, result: applied });
+                  if (typeof recordRunEvent === 'function') await recordRunEvent(applied.status === 'error' ? 'edit.failed' : 'edit.applied', { operationId: tc._operationId || result._operationId || tc.id, path: pendingPath, result: applied });
                   return applied;
                 });
               } catch (approvalErr) {
@@ -632,7 +663,8 @@
                 return { tc, outText: 'Error applying approved change: ' + approvalErr.message, diff: null, searchData: null };
               }
               actual = HarnessRuntime.normalizeResult(actual);
-              recordHarnessTool(tc.function.name, safeParseArgs(tc.function.arguments), actual, tc.id);
+              actual = await archiveToolOutput(tc.function.name,actual,(tc._operationId || result._operationId || tc.id)+':approved');
+              recordHarnessTool(tc.function.name, safeParseArgs(tc.function.arguments), actual, tc.id, tc._operationId || result._operationId);
               if (actual.status !== 'ok') {
                 updateToolStatus(toolPanels[i], 'err'); updateToolResult(toolPanels[i], actual.output);
                 return { tc, outText: actual.output, diff: null, searchData: null, rejected: true };
@@ -644,12 +676,13 @@
                 previewFile(tArgs.path);
                 debouncedFileTreeRefresh();
                 if (state.compConnected && (tArgs.path.endsWith('.py'))) {
-                  const ck = await execViaCompanion('python3 -m py_compile "' + tArgs.path + '" || python -m py_compile "' + tArgs.path + '"', 15);
+                  const ck = await checkPythonFile(tArgs.path,toolAbortCtrls[i].signal);
                   if (typeof ck === 'string' && ck.trim()) actual.output += '\n\n⚠️ SYNTAX CHECK:\n' + ck.trim();
                 }
               }
               updateToolResult(toolPanels[i], actual.output || 'Applied');
-              return { tc, outText: actual.output || 'Applied', diff: actual.diff || null, searchData: null, status: actual.status };
+              toolCallHistory.push(HarnessCore.progressRecord(tc.function.name,tc.function.arguments,actual,state.progressRevision || 0));
+              return { tc, outText: actual.output || 'Applied', diff: actual.diff || null, searchData: null, status: actual.status, artifactId:actual._artifactId };
             } else {
               updateToolStatus(toolPanels[i], 'err');
               updateToolResult(toolPanels[i], 'Rejected — try a different approach.');
@@ -676,17 +709,18 @@
             if (tc.function.name === 'delete_file') sessionChanges.deleted.add(args.path);
             if (tc.function.name === 'move_file') sessionChanges.moved.push({ from: args.source, to: args.destination });
           }
-          const sig = tc.function.name + ':' + (tc.function.arguments || '').slice(0, 100);
+          const progress = HarnessCore.progressRecord(tc.function.name,tc.function.arguments,{...result,output:outText},state.progressRevision || 0);
           const success = result.status === 'ok';
           // NOTE: outText is stored separately from sig (sig is name+args only) so the
           // malformed-argument detector below can actually match on the error message.
-          toolCallHistory.push({ sig, success, outText: (outText || '').slice(0, 300) }); if (toolCallHistory.length > 20) toolCallHistory.shift();
-          return { tc, outText, diff, searchData, status: result.status };
+          toolCallHistory.push(progress); if (toolCallHistory.length > 20) toolCallHistory.shift();
+          return { tc, outText, diff, searchData, status: result.status, artifactId:result._artifactId };
         }).finally(() => batchSignal?.removeEventListener('abort', abortBatch));
 
           const hadEdits = results.some(r => !r.rejected && !r.cancelled &&
             HarnessVerification.requiresRecheck(r.tc.function.name, { status: r.status }));
 
+          const postToolMessages=[];
           /* Detect repeated missing-argument errors — LLM keeps forgetting params */
           if (toolCallHistory.length >= 2) {
             const recent = toolCallHistory.slice(-4);
@@ -712,7 +746,7 @@
               const hint = isTruncation
                 ? '[SYSTEM: Your tool call JSON is being TRUNCATED mid-stream. This happens when old_text or content is too long.\n\nIMMEDIATE FIX:\n• For files >30KB: NEVER use write_file — use edit_file with 5-15 line blocks\n• For edit_file: keep each old_text under 500 characters\n• Split large edits into MULTIPLE edit_file calls (each targeting a different section)\n• Do NOT put entire file contents in a single tool call\n\nDo NOT retry the same call. Split it into smaller pieces.]'
                 : '[SYSTEM: You have sent ' + malformedErrors.length + ' tool calls with missing or malformed arguments.\n\nRULES:\n1. Every tool call MUST have ALL required parameters as valid JSON\n2. If a file is very large (>30KB), do NOT use write_file with the full content — use edit_file instead with small search/replace blocks\n3. Double-check your JSON: every { has a matching }, every " has a matching "\n4. Do NOT retry the same broken call. Fix the argument format first.]';
-              state.messages.push({ role: 'user', content: hint });
+              postToolMessages.push({ role: 'user', content: hint });
               toolCallHistory.length = 0;
             }
           }
@@ -723,13 +757,13 @@
              instead of quietly burning iterations/tokens. */
           if (toolCallHistory.length >= 3) {
             const lastN = toolCallHistory.slice(-3);
-            if (lastN.every(r => r.sig === lastN[0].sig) && lastN[0].sig.split(':')[0] !== 'think') {
+            if (HarnessCore.stalled(toolCallHistory)) {
               const toolName = lastN[0].sig.split(':')[0];
               const wEl = document.createElement('div');
               wEl.className = 'health-warning';
               wEl.innerHTML = `<i class="fas fa-rotate" style="color:var(--red)"></i><span>Agent repeated the same "${esc(toolName)}" call 3 times in a row — stopping the loop</span>`;
               $msg().appendChild(wEl); scrollBottom();
-              state.messages.push({
+              postToolMessages.push({
                 role: 'user',
                 content: `[SYSTEM: You've called ${toolName} with the exact same arguments 3 times in a row with no progress. Do NOT repeat this call again unchanged.\n\nStop and do one of the following:\n1. Explain to the user what's blocking you and why the same approach keeps failing/repeating.\n2. Try a materially different approach (different arguments, different tool, or ask_user if you're missing information you can't infer).\n3. If the previous result actually looked correct, move on to the next step instead of re-verifying the same thing.]`
               });
@@ -767,7 +801,7 @@
                   state._envNudgedPairs = state._envNudgedPairs || new Set();
                   if (!state._envNudgedPairs.has(pairKey)) {
                     state._envNudgedPairs.add(pairKey);
-                    state.messages.push({
+                    postToolMessages.push({
                       role: 'user',
                       content: `[SYSTEM: You just fixed a failing command by switching from "${a}" to "${b}". If this is an environment-specific fact (the right command/tool/version to use in THIS workspace) rather than a one-off typo, call save_memory now so you don't rediscover it the hard way again after this conversation compacts or in a future session here. Skip this if it was just a typo.]`
                     });
@@ -799,7 +833,7 @@
                 });
                 continue;
               }
-              const toolMsg = { role: 'tool', tool_call_id: tc.id, content: compressToolOutput(tc.function.name, r.outText, compStats), _diff: r.diff || null, _searchData: r.searchData || null };
+              const toolMsg = { role: 'tool', tool_call_id: tc.id, content: compressToolOutput(tc.function.name, r.outText, compStats)+(r.artifactId?'\n[Full output: '+r.artifactId+'; use read_artifact to retrieve it.]':''), _operationId:tc._operationId, _status:r.status, _artifactId:r.artifactId, _diff: r.diff || null, _searchData: r.searchData || null };
               if (panel) {
                 if (panel.el._svgPreviewUrl) { toolMsg._svgPreviewUrl = panel.el._svgPreviewUrl; toolMsg._svgText = panel.el._svgText; toolMsg._svgPath = panel.el._svgPath; }
                 if (panel.el._previewDataUrl) { toolMsg._previewDataUrl = panel.el._previewDataUrl; toolMsg._previewPath = panel.el._previewPath; }
@@ -819,6 +853,7 @@
             }
           }
 
+          state.messages.push(...postToolMessages);
           if (state.running && hadEdits && state.autoVerifyCommand && state.compConnected) await verifyAfterChanges();
           if (rpState.activeTab === 'git' && state.compConnected) setTimeout(updateGitPanel, 300);
 
@@ -893,12 +928,12 @@
         }
 
         /* ── Think-only turn (no non-think tools) ── */
-        else if (thinkTcs.length) {
-          for (const tc of thinkTcs) {
-            let thought = '';
-            try { const a = JSON.parse(tc.function.arguments); thought = a.thought || ''; }
-            catch { thought = tc.function.arguments || ''; }
-            state.messages.push({ role: 'tool', tool_call_id: tc.id, content: thought });
+        else {
+          for (const tc of tcs) {
+            let thought='';
+            if(tc.function.name==='think') {try {thought=JSON.parse(tc.function.arguments).thought || '';} catch {thought=tc.function.arguments || '';}}
+            else thought='Error: tool '+tc.function.name+' is unavailable. Choose an available tool.';
+            state.messages.push({role:'tool',tool_call_id:tc.id,content:thought,_status:tc.function.name==='think'?'ok':'error'});
           }
         }
 
@@ -907,6 +942,7 @@
         saveCheckpoint(iters, allModified); // pass cumulative set
         modifiedFiles.clear(); newFiles.clear();
 
+        if(typeof collectCompletedCommandJobs==='function') await collectCompletedCommandJobs();
         updateContextMeter();
       }
 

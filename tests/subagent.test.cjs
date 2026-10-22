@@ -14,7 +14,7 @@ function agent(script, over = {}) {
     createCompressionStats: () => ({}), compressToolOutput: (n, t) => t, redactSecrets: s => s,
     executeTool: async (name, args) => { env.tools.push(name + args); return over.tool ? over.tool(name, args) : { status: 'ok', output: 'ok ' + args }; },
     subAgentChat: async (messages, tools) => { env.chats.push({ tools: tools.map(t => t.function.name), messages: messages.map(m => ({ ...m })) }); return script(env.chats.length, tools, messages); } };
-  vm.createContext(ctx); vm.runInContext(block + '\nglobalThis.__run = runSubAgent;', ctx);
+  vm.createContext(require('./runtime-modules.cjs')(ctx)); vm.runInContext(block + '\nglobalThis.__run = runSubAgent;', ctx);
   return { run: (task, tools, max) => ctx.__run(task, tools, max, undefined, null), env };
 }
 const call = (id, path) => ({ content: '', toolCalls: [{ id: 'c' + id, type: 'function', function: { name: 'read_file', arguments: JSON.stringify({ path }) } }] });

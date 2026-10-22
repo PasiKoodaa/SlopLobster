@@ -56,12 +56,24 @@ async function refreshRunJournals(runId) {
   f.journals = (await dbGetAll('run_journals')).sort((a, b) => b.updated - a.updated);
   f.journalId = runId || (f.journals.some(r => r.id === f.journalId) && f.journalId) || f.journals.find(r => r.convId === state.activeConvId)?.id || f.journals[0]?.id;
   f.journalEvents = f.journalId ? await loadRunJournal(f.journalId) : [];
+  const scope=state.dirHandle ? await verificationScope() : null;
+  f.mutationReceipts=[];
+  for(const record of await dbGetAll('agent_states')) {
+    if(!record.id?.startsWith('mutation:') || !['prepared','unknown'].includes(record.status)) continue;
+    let same=record.scope===scope;
+    if(!same && state.dirHandle && record.workspaceHandle?.isSameEntry) {
+      try {same=await record.workspaceHandle.isSameEntry(state.dirHandle);} catch { }
+    }
+    if(same) f.mutationReceipts.push(record);
+  }
   renderHarnessFeatures();
 }
 function renderRunJournal() {
   const f = harnessFeatureState, events = f.journalEvents || [], replay = HarnessJournal.replay(events);
   return '<p>Durable run timeline. Entries contain redacted, bounded excerpts. Offline replay never executes tools.</p>' +
     featureButton('refresh-journal', 'Refresh') +
+    ((f.mutationReceipts || []).length ? '<article><h3>File operations requiring review</h3><p>Inspect the affected files. Recheck observes their state without repeating changes. Accept current files clears a block after your review.</p>'+featureButton('reconcile-mutations','Recheck file outcomes')+
+      f.mutationReceipts.map(r=>'<details><summary>'+hfEsc(r.kind)+' · '+hfEsc(r.status)+' · '+hfEsc(r.entries.map(e=>e.path).join(', '))+'</summary><pre>'+hfEsc(JSON.stringify({id:r.id,entries:r.entries,error:r.error},null,2))+'</pre>'+featureButton('resolve-mutation','Accept current files',r.id)+'</details>').join('')+'</article>' : '') +
     (f.journals || []).map(r => featureButton('select-journal', (r.objective || r.convId || r.id).slice(0, 65) + ' · ' + (r.phase || 'running'), r.id)).join('') +
     '<article><p>' + hfEsc(replay.eventCount) + ' events · ' + hfEsc(replay.phase) + ' · ' + hfEsc(replay.incomplete.length) + ' unfinished operations</p>' +
     replay.integrityIssues.map(issue => '<p>' + hfEsc(issue) + '</p>').join('') +

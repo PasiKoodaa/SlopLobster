@@ -51,16 +51,29 @@ test('benchmark validation rejects escaping fixture paths and missing assertions
 function uiContext(extra={}) {
   const context={HarnessFeatures:F,HarnessRuntime:H,crypto:{randomUUID:()=>Math.random().toString(16)},console,
     TextEncoder,TextDecoder,Uint8Array,Blob,File,DOMException,AbortController,AbortSignal,URL,performance,
-    atob,btoa,confirm:()=>true,
+    atob,btoa,setTimeout,clearTimeout,HarnessRunState:require('../src/run-state.js'),HarnessModelStream:require('../src/model-stream.js'),
+    estimateTokens:s=>Math.ceil(s.length/3.8),confirm:()=>true,
     state:{activeConvId:'conversation',conversations:[{id:'conversation'}],messages:[{role:'user',content:'Fix it'}],originalTask:'Fix it',planItems:[],fileCache:new Map(),disabledTools:new Set(),dirName:'Project'},
     dbGet:async()=>null,dbSet:async()=>true,
     appendMsg:()=>{},saveCurrentConv:()=>{},showToast:()=>{},refreshFileTree:async()=>{},
     tokenTracker:{totalOutputTokens:10},redactSecrets:s=>s,
     document:{getElementById:()=>null},
     ...extra};
-  vm.createContext(context); vm.runInContext(fs.readFileSync(require.resolve('../src/features-ui.js'),'utf8'),context);
+  vm.createContext(require('./runtime-modules.cjs')(context)); vm.runInContext(fs.readFileSync(require.resolve('../src/features-ui.js'),'utf8'),context);
+  vm.runInContext(fs.readFileSync(require.resolve('../src/model-client.js'),'utf8'),context);
   return context;
 }
+
+test('evidence keeps separate events when local servers reuse tool IDs and updates recovered outcomes',()=>{
+  const context=uiContext();
+  vm.runInContext("harnessFeatureState.currentEvidence='r';harnessFeatureState.data.evidence=[{id:'r',events:[]}];",context);
+  context.recordHarnessTool('write_file',{path:'a'},{status:'ok',output:'saved'},'call_0','first:call_0');
+  context.recordHarnessTool('execute_command',{command:'change'},{status:'unknown',output:'lost response'},'call_0','second:call_0');
+  const report=context.activeEvidence();assert.equal(report.events.length,2);
+  assert.equal(F.evidenceSummary(report.events).issues.length,1);
+  context.resolveHarnessEvidence('call_0',{status:'ok',exitCode:0,output:'recovered'},'second:call_0');
+  assert.equal(F.evidenceSummary(report.events).issues.length,0);assert.equal(report.events[0].output,'saved');
+});
 test('isolation disabled makes no companion call before a normal run',async()=>{
   const context=uiContext({companionFetch:()=>{throw new Error('Unexpected companion call')}});
   assert.equal(await vm.runInContext('beforeHarnessRun()',context),true);
@@ -88,12 +101,11 @@ test('managed file handles read and write through the task adapter',async()=>{
 });
 test('fake model evaluation verifies file assertions and records metrics',async()=>{
   let fixture='bad', cleaned=false, calls=0;
-  const context=uiContext({fetch:async()=>({ok:true,json:async()=>{
+  const context=uiContext({fetch:async()=>{
     calls++;
-    return {usage:{completion_tokens:12,prompt_tokens:40},choices:[{message:calls===1?
-      {role:'assistant',tool_calls:[{id:'call',function:{name:'write_file',arguments:JSON.stringify({path:'greeting.txt',content:'fixed'})}}]}:
-      {role:'assistant',content:'done'}}]};
-  }}),companionFetch:async(url,options)=>{
+    const delta=calls===1?{tool_calls:[{index:0,id:'call',function:{name:'write_file',arguments:JSON.stringify({path:'greeting.txt',content:'fixed'})}}]}:{content:'done'};
+    return new Response('data: '+JSON.stringify({choices:[{delta,finish_reason:calls===1?'tool_calls':'stop'}],usage:{completion_tokens:12,prompt_tokens:40}})+'\n\ndata: [DONE]\n\n');
+  },companionFetch:async(url,options)=>{
     const body=JSON.parse(options.body);
     if(url.endsWith('/evaluations/create')) return {json:async()=>({id:'fixture'})};
     if(url.endsWith('/tasks/file')) {
@@ -109,6 +121,19 @@ test('fake model evaluation verifies file assertions and records metrics',async(
   assert.equal(result.status,'passed'); assert.equal(result.outputTokens,24);
   assert.equal(result.peakContextTokens,40); assert.equal(result.unintendedWrites,0);
   assert.equal(cleaned,true); assert.equal(result.cleanedUp,true);
+});
+
+test('evaluation metrics include tokens consumed by an interrupted response',async()=>{
+  const context=uiContext({fetch:async()=>new Response('data: '+JSON.stringify({choices:[{delta:{content:'partial output before disconnect'}}]})+'\n\n'),
+    companionFetch:async(url)=>{
+      if(url.endsWith('/evaluations/create'))return {json:async()=>({id:'fixture'})};
+      if(url.endsWith('/tasks/discard'))return {json:async()=>({ok:true})};
+      throw Error('Unexpected request '+url);
+    }});
+  context.state.apiUrl='http://localhost:1234';
+  const row=await context.evaluateHarnessModel('model',{}, {name:'interruption',prompt:'fix'}, {tokenBudget:500},new AbortController().signal);
+  assert.equal(row.status,'error');assert.equal(row.failureCategory,'premature_eof');
+  assert.ok(row.outputTokens>0);assert.equal(row.estimatedTokens,true);assert.equal(row.cleanedUp,true);
 });
 
 test('queue parks questions, respects budgets, and resumes without rerunning independent work',async()=>{

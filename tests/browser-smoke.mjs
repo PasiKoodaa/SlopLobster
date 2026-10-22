@@ -43,6 +43,28 @@ try {
  await call('Page.navigate',{url:pathToFileURL(path.resolve('SlopLobster.html')).href},sessionId);
  const deadline=Date.now()+25000;
  while(Date.now()<deadline){if(await evaluate("!!document.getElementById('harness-features')"))break;await new Promise(resolve=>setTimeout(resolve,200));}
+ await evaluate(`(() => {
+   const backends=[...document.getElementById('s-backend-type').options].map(o=>o.value);
+   if(backends.includes('ollama') || backends.length!==8)throw Error('Local backend options are incorrect');
+   if(HARNESS_DEFAULT_BENCHMARK.tasks.length!==8)throw Error('The default benchmark was not embedded');
+   if(!document.getElementById('s-capability-probe') || typeof resolveHarnessMutation!=='function')throw Error('Harness recovery settings are missing');
+ })()`);
+ await evaluate(`(async()=>{
+   const saved={root:state.dirHandle,preview:previewFile,remove:deleteFileSafe,confirm:window.confirm};
+   try {
+     showToast('<img src="data:image/png;base64,broken" onerror="globalThis.toastInjected=true">','err');
+     await new Promise(resolve=>setTimeout(resolve,50));
+     if(globalThis.toastInjected || document.getElementById('toasts').querySelector('img'))throw Error('Toast rendered executable markup');
+     let removed='';
+     state.dirHandle={async *entries(){yield ["John's notes.txt",{kind:'file'}];}};
+     window.confirm=()=>true;deleteFileSafe=async path=>{removed=path;};
+     await refreshFileTree();
+     const button=document.querySelector('.ft-acts [data-ft-action="delete"]');
+     if(!button || button.hasAttribute('onclick'))throw Error('File tree retained an inline handler');
+     button.click();await new Promise(resolve=>setTimeout(resolve,30));
+     if(removed!=="John's notes.txt")throw Error('Apostrophe filename did not reach delete correctly');
+   } finally {state.dirHandle=saved.root;previewFile=saved.preview;deleteFileSafe=saved.remove;window.confirm=saved.confirm;}
+ })()`);
  await evaluate('openHarnessFeatures()');
  if(!await evaluate("document.getElementById('harness-features').open"))throw new Error('Harness dialog did not open');
  for(const tab of ['isolation','evidence','journal','recipes','queue','knowledge','evaluations','options']){
@@ -65,7 +87,7 @@ try {
  await evaluate(`globalThis.originalCompanionFetch=fetch;globalThis.originalGitCheck=checkGitRepo;checkGitRepo=()=>{};fetch=async(url,options={})=>{
   if(String(url)===state.compUrl+'/status') {
    const auth=new Headers(options.headers).get('Authorization');
-   return auth==='Bearer pairing-test-token'?new Response(JSON.stringify({version:'1.6.0',command_lifecycle:true,platform:'Test',release:'',python:'3',cwd:'fixture'}),{status:200,headers:{'Content-Type':'application/json'}}):new Response(JSON.stringify({error:'Pair this companion'}),{status:401,headers:{'Content-Type':'application/json'}});
+   return auth==='Bearer pairing-test-token'?new Response(JSON.stringify({version:'1.6.0',command_lifecycle:true,argv_commands:true,workspace_challenge:true,platform:'Test',release:'',python:'3',cwd:'fixture'}),{status:200,headers:{'Content-Type':'application/json'}}):new Response(JSON.stringify({error:'Pair this companion'}),{status:401,headers:{'Content-Type':'application/json'}});
   }return originalCompanionFetch(url,options);
  };state.compToken='';updateCompanionPairing('missing');`);
  if(!await evaluate("!document.getElementById('companion-pairing').hidden && document.getElementById('companion-pair-title').textContent.includes('not set')"))throw new Error('Missing token has no visible warning');
@@ -95,6 +117,10 @@ try {
      if(result.content!=='Fixture complete'||state.runController.snapshot().outputTokens!==4)throw Error('Main model transport did not account for its response');
      if(!state._lastPromptBreakdown.schemas||state._lastPromptBreakdown.instructions<=0)throw Error('Prompt breakdown is missing');
      await executeTool('get_tool_schema',JSON.stringify({tool_name:'read_file'}));
+     const archived=await archiveToolOutput('browser-fixture',{status:'ok',output:'artifact-body-'.repeat(300)},'browser-artifact');
+     const stored=await dbGet('agent_states',archived._artifactId);
+     if(stored.content!==undefined || !(await dbGet('tool_artifacts',archived._artifactId)))throw Error('Artifact body was not stored separately');
+     if(!(await readHarnessArtifact({artifact_id:archived._artifactId})).output.includes('artifact-body-'))throw Error('Stored output was not retrievable');
      const runId=state.runController.snapshot().id;
      await Promise.all([1,2].map(n=>appendJournalEvent({id:crypto.randomUUID(),version:1,runId,convId:state.activeConvId,objective:'Concurrent append fixture',type:'diagnostic.concurrent',created:Date.now(),detail:{n}})));
      const journal=await loadRunJournal(runId);
@@ -127,9 +153,9 @@ try {
      await agentLoop();
      if(order.join(',')!=='baseline,write,check')throw Error('Baseline was not captured before editing: '+order);
      if(state.verificationState.latest?.comparison.outcome!=='regression')throw Error('New failure was not classified');
-     if(activeEvidence()?.outcome!=='needs_review')throw Error('The regression was incorrectly reported as verified');
+     if(activeEvidence()?.outcome!=='blocked' || state.completion?.outcome!=='blocked')throw Error('The regression did not block completion');
      const events=await loadRunJournal(state.runController.snapshot().id);
-     for(const kind of ['run.started','verification.baseline','tool.started','tool.completed','verification.result','run.finished'])if(!events.some(e=>e.type===kind))throw Error('Missing journal event '+kind);
+     for(const kind of ['run.started','verification.baseline','tool.started','tool.completed','verification.result','run.paused'])if(!events.some(e=>e.type===kind))throw Error('Missing journal event '+kind);
    } finally {streamChat=saved.chat;execViaCompanion=saved.exec;toolHandlers.write_file=saved.write;state.autoVerifyCommand=saved.command;state.compConnected=saved.comp;state.maxIters=saved.max;state.runController=saved.controller;state.taskState=saved.task;state.disabledTools=saved.disabled;}
  })()`);
  const shot=await call('Page.captureScreenshot',{format:'png'},sessionId);
@@ -142,6 +168,7 @@ try {
  await evaluate("deleteConv('keep-test',{stopPropagation(){}})");
  if(await evaluate("dbGetAll('run_journals').then(runs=>runs.some(r=>r.convId==='keep-test'))"))throw new Error('Conversation deletion kept its journals');
  if(await evaluate("dbGetAll('run_events').then(events=>events.some(e=>e.convId==='keep-test'))"))throw new Error('Conversation deletion kept journal events');
+ if(await evaluate("dbGetAll('tool_artifacts').then(records=>records.some(r=>r.convId==='keep-test'))"))throw new Error('Conversation deletion kept output artifacts');
  await evaluate(`(async()=>{
    const database=await getDB();database.close();_dbInstance=null;
    await new Promise((resolve,reject)=>{const r=indexedDB.deleteDatabase(DB_NAME);r.onsuccess=resolve;r.onerror=reject;r.onblocked=()=>reject(Error('Database deletion blocked by another connection'));});
@@ -155,7 +182,7 @@ try {
  await reload();
  const migrationDeadline=Date.now()+10000;
  while(Date.now()<migrationDeadline){if(await evaluate("typeof getDB==='function'"))break;await new Promise(resolve=>setTimeout(resolve,100));}
- if(!await evaluate("getDB().then(db=>db.version===2&&db.objectStoreNames.contains('run_events'))"))throw new Error('Journal database migration did not run');
+ if(!await evaluate("getDB().then(db=>db.version===3&&db.objectStoreNames.contains('run_events')&&db.objectStoreNames.contains('tool_artifacts'))"))throw new Error('Journal database migration did not run');
  if(!await evaluate("dbGet('conversations','legacy-migration-fixture').then(Boolean)"))throw new Error('Journal migration lost an existing conversation');
  if(errors.length)throw new Error(errors.join('\n'));
  console.log('Browser: eight Harness tabs, persisted journal timeline, journal deletion, compact tools, model transport, and token pairing pass.');

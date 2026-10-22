@@ -26,7 +26,7 @@ async function knowledgeEmbeddingScores(records, query, workspace) {
     return scores;
   } catch (error) { hfEmbedCooldown = Date.now() + 60000; return null; } // never block retrieval on a slow or absent model
 }
-function hfBusy() { return state.running || harnessFeatureState.queueRunning || !!harnessFeatureState.evaluationAbort; }
+function hfBusy() { return state.running || state.capabilityProbe || harnessFeatureState.queueRunning || !!harnessFeatureState.evaluationAbort; }
 async function featureRequest(path,body,signal) {
   const response=await companionFetch(state.compUrl+'/features/'+path,{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(body),signal:signal||AbortSignal.timeout(65000)});
@@ -188,6 +188,7 @@ function activeEvidence() { return harnessFeatureState.data.evidence.find(e=>e.i
 async function beforeHarnessRun() {
   const f=harnessFeatureState;
   try {
+    if(state.capabilityProbe) throw new Error('Wait for the model capability check to finish');
     if(f.evaluationAbort) throw new Error('Wait for the evaluation to finish');
     const conv=state.conversations.find(c=>c.id===state.activeConvId);
     f.cancelled=false; f.modelFinished=false; f.currentEvidence=null;
@@ -223,12 +224,14 @@ async function beforeHarnessRun() {
   } catch(error) { appendMsg('system','Cannot start task: '+error.message); return false; }
 }
 function harnessModelFinished() { harnessFeatureState.modelFinished=true; }
-function recordHarnessTool(name,args,result,toolCallId) {
+function recordHarnessTool(name,args,result,toolCallId,operationId) {
   const report=activeEvidence(); if(!report) return;
   const status=result._pendingApproval?'pending':result.status||HarnessRuntime.normalizeResult(result).status;
-  const event={id:toolCallId||hfId(),tool:name,path:args.path||args.destination,command:args.command,status,exitCode:result.exitCode,
-    output:redactSecrets(String(result.output||'')).slice(-6000),created:Date.now(),kind:'tool'};
+  const event={id:operationId||toolCallId||hfId(),toolCallId,tool:name,path:args.path||args.destination,command:args.command,status,exitCode:result.exitCode,
+    output:HarnessCore.excerpt(redactSecrets(String(result.output||'')),6000),created:Date.now(),kind:'tool',workspaceRevision:state.workspaceRevision || 0,artifactId:result._artifactId};
   if(result._verification) event.verification=result._verification;
+  if(result._workspaceStamp) event.workspaceStamp=result._workspaceStamp;
+  if(result._workspaceStale) event.stale=true;
   if(['edit_file','write_file','write_file_chunked','delete_file','move_file'].includes(name)) event.kind='change';
   if(name==='execute_command') event.kind='mutation';
   const recipe=harnessFeatureState.data.recipes.find(r=>r.active);
@@ -240,19 +243,28 @@ function recordHarnessTool(name,args,result,toolCallId) {
   if(result.status==='unknown') report.outcome='blocked';
   saveFeatureData().catch(error=>console.warn(error));
 }
+function resolveHarnessEvidence(toolCallId,result,operationId) {
+  const report=activeEvidence(); if(!report) return;
+  const event=report.events.findLast(e=>operationId?e.id===operationId:toolCallId && (e.toolCallId===toolCallId || e.id===toolCallId));
+  if(!event) return;
+  Object.assign(event,{status:result.status,exitCode:result.exitCode,output:HarnessCore.excerpt(redactSecrets(String(result.output || '')),6000),
+    workspaceRevision:state.workspaceRevision || 0,recovered:true,created:Date.now()});
+  saveFeatureData().catch(error=>console.warn(error));
+}
 async function afterHarnessRun() {
   const f=harnessFeatureState, report=activeEvidence();
   if(report) {
     report.elapsed=(report.elapsed||0)+(Date.now()-report.started)/1000;
     report.outputTokens=(report.outputTokens||0)+tokenTracker.totalOutputTokens;
-    report.summary=HarnessFeatures.evidenceSummary(report.events);
+    report.summary=HarnessFeatures.evidenceSummary(report.events,state.workspaceRevision || 0);
     if(featureTask()?.kind==='worktree') {
       try {
         const changes=await featureRequest('tasks/diff',{taskId:featureTask().id});
         report.changedFiles=changes.changedFiles; report.diff=changes.diff;
       } catch(error) { report.collectionError=error.message; }
     }
-    report.outcome=f.queueTask?.status==='blocked'?'blocked':f.cancelled?'paused':!f.modelFinished?'paused':report.summary.outcome;
+    report.completion=state.completion || null;
+    report.outcome=f.queueTask?.status==='blocked'?'blocked':f.cancelled?'paused':state.completion?.outcome || (!f.modelFinished?'paused':report.summary.outcome);
     report.unresolved=(state.planItems||[]).filter(item=>item.status!=='done');
     if(report.unresolved.length && report.outcome==='verified') report.outcome='needs_review';
     if(f.prefs.evidence) {
@@ -385,7 +397,7 @@ async function startHarnessQueue() {
       await saveFeatureData();
       try { await agentLoop(); }
       finally { Object.assign(state,saved); }
-      if(task.status==='running') task.status=f.cancelled?'paused':'needs_review';
+      if(task.status==='running') task.status=state.completion?.outcome==='blocked'?'blocked':f.cancelled?'paused':'needs_review';
       await saveFeatureData(); renderHarnessFeatures();
       f.queueTask=null;
     }
@@ -394,11 +406,8 @@ async function startHarnessQueue() {
   }
 }
 
-const HARNESS_DEFAULT_BENCHMARK = {
-  tasks:[{name:'Fix a text fixture',prompt:'Fix the typo in greeting.txt. Its exact content must become Hello, lobster! followed by a newline. Use the file tools.',
-    files:{'greeting.txt':'Helo, lobster!\n'},allowedWrites:['greeting.txt'],assertions:[{path:'greeting.txt',equals:'Hello, lobster!\n'}],checks:[]}],
-  variants:[{name:'default',temperature:0.1,maxTokens:2048}],maxIters:16,tokenBudget:4000
-};
+const HARNESS_DEFAULT_BENCHMARK = {}; // Embedded by scripts/build.mjs.
+
 function evaluationToolDefs() {
   const schema=(name,description,properties,required=[])=>({type:'function',function:{name,description,parameters:{type:'object',properties,required}}});
   return [
@@ -444,30 +453,32 @@ async function evaluationTool(taskId,call,signal) {
     content=content.replace(edit.old_text,edit.new_text);
   }
   await request('write',args.path,{expectedHash:previous.hash,base64:featureBase64(new TextEncoder().encode(content))});
-  return {output:'File saved',status:'ok'};
+  return {output:'File saved',status:'ok',changed:content!==new TextDecoder().decode(featureBytes(previous.base64))};
 }
 async function evaluateHarnessModel(model,variant,task,spec,signal) {
   const f=harnessFeatureState, started=performance.now();
   const workspace=await featureRequest('evaluations/create',task,signal);
   const row={id:hfId(),model,variant:variant.name||'default',task:task.name||task.prompt.slice(0,60),taskId:workspace.id,
-    status:'running',outputTokens:0,peakContextTokens:0,interventions:0,humanInterventions:0,trace:[],settings:{...variant},created:Date.now()};
+    status:'running',outputTokens:0,peakContextTokens:0,interventions:0,humanInterventions:0,retries:0,trace:[],settings:{...variant},
+    backend:state.backendType,apiUrl:state.apiUrl,created:Date.now()};
   f.data.evaluations.push(row); renderHarnessFeatures();
   const messages=[{role:'system',content:'Complete the fixture task using the supplied tools. You can only edit fixture files and run its declared checks. Finish when the requested file changes are complete.'},
     {role:'user',content:task.prompt+'\nDeclared checks: '+JSON.stringify(task.checks||[])}];
+  const ledger=HarnessRunState.create();
   let finished=false;
   try {
     const budget=Math.max(256,Math.min(100000,spec.tokenBudget||4000));
+    const history=[];
+    let revision=0;
     for(let iteration=0;iteration<Math.min(100,spec.maxIters||16) && row.outputTokens<budget;iteration++) {
-      const response=await fetch(state.apiUrl+'/v1/chat/completions',{method:'POST',headers:{'Content-Type':'application/json'},signal,
-        body:JSON.stringify({model,messages,stream:false,tools:evaluationToolDefs(),temperature:variant.temperature??0.1,
-          max_tokens:Math.max(1,Math.min(variant.maxTokens||2048,budget-row.outputTokens))})});
-      if(!response.ok) throw new Error('Model HTTP '+response.status);
-      const result=await response.json(), message=result.choices?.[0]?.message;
-      if(!message) throw new Error('Model returned no message');
-      const estimated=Math.ceil(JSON.stringify(message).length/3.8);
-      row.outputTokens+=result.usage?.completion_tokens??estimated;
-      row.estimatedTokens ||= !result.usage;
-      row.peakContextTokens=Math.max(row.peakContextTokens,result.usage?.prompt_tokens??Math.ceil(JSON.stringify(messages).length/3.8));
+      const result=await requestModel({model,messages,stream:true,tools:evaluationToolDefs(),temperature:variant.temperature??0.1,
+        max_tokens:Math.max(1,Math.min(variant.maxTokens||2048,budget-row.outputTokens))},signal,
+        {ledger,tokenLimit:budget,requestPolicy:{useServerSampling:false},onRetry:()=>row.retries++});
+      const message={role:'assistant',content:result.content, ...(result.toolCalls.length?{tool_calls:result.toolCalls}:{})};
+      row.outputTokens+=result.usage.out;
+      row.estimatedTokens ||= result.usage.estimated;
+      row.peakContextTokens=Math.max(row.peakContextTokens,result.usage.in>=0?result.usage.in:HarnessRuntime.estimateRequestTokens(messages,evaluationToolDefs(),estimateTokens));
+      if(result.finishReason==='length') throw Object.assign(new Error('Model reached its output allowance before finishing.'),{code:'output_limit'});
       messages.push(message);
       if(!message.tool_calls?.length) { finished=true; break; }
       for(const call of message.tool_calls) {
@@ -477,8 +488,13 @@ async function evaluateHarnessModel(model,variant,task,spec,signal) {
           if(signal.aborted) throw error;
           row.interventions++; toolResult={status:'error',output:'Error: '+error.message};
         }
-        const output=redactSecrets(String(toolResult.output||'')).slice(-10000);
-        row.trace.push({tool:call.function.name,arguments:redactSecrets(call.function.arguments),output,status:toolResult.status||'ok'});
+        const progress=HarnessCore.progressRecord(call.function.name,call.function.arguments,toolResult,revision);
+        history.push(progress);
+        if(['write_file','edit_file'].includes(call.function.name) && toolResult.status==='ok' && toolResult.changed) revision++;
+        if(HarnessCore.stalled(history)) throw Object.assign(new Error('Repeated tool call without progress.'),{code:'stalled'});
+        const fullOutput=redactSecrets(String(toolResult.output||''));
+        const output=HarnessCore.excerpt(fullOutput,10000);
+        row.trace.push({tool:call.function.name,arguments:redactSecrets(call.function.arguments),output:fullOutput.slice(0,4*1024*1024),truncated:fullOutput.length>4*1024*1024,status:toolResult.status||'ok'});
         messages.push({role:'tool',tool_call_id:call.id,content:output});
       }
       renderHarnessFeatures();
@@ -490,9 +506,13 @@ async function evaluateHarnessModel(model,variant,task,spec,signal) {
     row.unintendedWrites=verification.unintendedWrites.length;
     row.finished=finished;
     row.status=verification.passed && checks.every(c=>c.exitCode===0)?'passed':'failed';
-    if(!finished) row.stopReason='Iteration or token budget reached';
-  } catch(error) { row.status=signal.aborted?'cancelled':'error'; row.error=error.message; }
+    row.capabilities=state.backendCapabilities?.[HarnessBackend.key({...state,model})];
+    if(row.status==='failed') row.failureCategory=verification.unintendedWrites.length?'unintended_writes':checks.some(c=>c.exitCode!==0)?'verification_failed':'assertion_failed';
+    if(!finished) { row.stopReason='Iteration or token budget reached'; row.failureCategory ||= 'budget'; }
+  } catch(error) { row.status=signal.aborted?'cancelled':'error'; row.error=error.message; row.failureCategory=HarnessBackend.classify(error).code; }
   finally {
+    row.outputTokens=ledger.snapshot().outputTokens;
+    row.estimatedTokens ||= ledger.snapshot().estimated;
     row.elapsedSeconds=(performance.now()-started)/1000;
     try {
       for(const id of [...(f.evalCommands||[])]) {
@@ -572,7 +592,7 @@ function renderHarnessFeatures() {
     const labels={isolation:'Create an isolated Git worktree for new tasks',evidence:'Show completion evidence',recipes:'Offer project recipes',queue:'Enable the unattended task queue',knowledge:'Enable searchable session knowledge',autoRetrieve:'Automatically retrieve relevant knowledge before a run'};
     content='<p>Choose which features participate in your workflow. Existing shell, browser, and edit approvals still apply.</p>'+
       Object.entries(labels).map(([key,label])=>'<label class="hf-check"><input type="checkbox" id="hf-option-'+key+'" '+(f.prefs[key]?'checked':'')+'>'+label+'</label>').join('')+
-      featureField('Git project path on the companion computer','hf-project-root',f.prefs.projectRoot)+
+      featureField('Workspace path on the companion computer (Git root for isolation)','hf-project-root',f.prefs.projectRoot)+
       '<p class="hf-muted">Isolation starts from committed HEAD. Uncommitted changes in the original workspace are not copied. Evaluations always start manually.</p>'+
       featureButton('use-cwd','Use companion working directory')+featureButton('save-options','Save options');
   }
@@ -638,10 +658,11 @@ function renderHarnessFeatures() {
     const groups=new Map();
     for(const row of f.data.evaluations.filter(r=>r.status!=='running')) {
       const key=row.model+' / '+row.variant;
-      const group=groups.get(key)||{total:0,passed:0,seconds:0,writes:0};
+      const group=groups.get(key)||{total:0,passed:0,seconds:0,writes:0,tokens:0,interventions:0};
+      group.tokens+=row.outputTokens||0; group.interventions+=(row.interventions||0)+(row.humanInterventions||0);
       group.total++; group.passed+=row.status==='passed'?1:0; group.seconds+=row.elapsedSeconds||0; group.writes+=row.unintendedWrites||0; groups.set(key,group);
     }
-    const aggregate='<h3>Completion rates</h3><table><thead><tr><th>Model / settings</th><th>Verified completion</th><th>Average seconds</th><th>Unintended writes</th></tr></thead><tbody>'+[...groups].map(([key,g])=>'<tr><td>'+hfEsc(key)+'</td><td>'+g.passed+'/'+g.total+' ('+(100*g.passed/g.total).toFixed(0)+'%)</td><td>'+(g.seconds/g.total).toFixed(1)+'</td><td>'+g.writes+'</td></tr>').join('')+'</tbody></table>';
+    const aggregate='<h3>Completion rates</h3><table><thead><tr><th>Model / settings</th><th>Verified completion</th><th>Average seconds</th><th>Tokens per verified task</th><th>Corrections</th><th>Unintended writes</th></tr></thead><tbody>'+[...groups].map(([key,g])=>'<tr><td>'+hfEsc(key)+'</td><td>'+g.passed+'/'+g.total+' ('+(100*g.passed/g.total).toFixed(0)+'%)</td><td>'+(g.seconds/g.total).toFixed(1)+'</td><td>'+(g.passed?Math.round(g.tokens/g.passed):'-')+'</td><td>'+g.interventions+'</td><td>'+g.writes+'</td></tr>').join('')+'</tbody></table>';
     const modelOptions=[...document.getElementById('model-sel').options].filter(o=>o.value && o.textContent!=='No models' && o.textContent!=='Connection failed');
     content='<p>Compare selected models and settings against disposable fixtures. File assertions and declared check exit codes determine success. Evaluations do not edit your project.</p>'+
       '<label>Models<select id="hf-eval-models" multiple size="5">'+modelOptions.map(m=>'<option value="'+hfEsc(m.value)+'" '+(m.value===state.model?'selected':'')+'>'+hfEsc(m.value)+'</option>').join('')+'</select></label>'+
@@ -755,5 +776,7 @@ async function harnessFeatureAction(action,id) {
   if(action==='delete-knowledge') { if(!confirm('Delete this knowledge entry?')) return; f.data.knowledge=f.data.knowledge.filter(r=>r.id!==id); await saveFeatureData(); renderHarnessFeatures(); return; }
   if(action==='start-evaluation') return startHarnessEvaluation();
   if(action==='stop-evaluation') { f.evaluationAbort?.abort(); return; }
-  if(action==='export-evaluation') return downloadHarnessJson('sloplobster-evaluations.json',{benchmark:f.benchmark||HARNESS_DEFAULT_BENCHMARK,results:f.data.evaluations});
+  if(action==='reconcile-mutations') { await reconcileWorkspaceMutations(); return refreshRunJournals(); }
+  if(action==='resolve-mutation') { await resolveHarnessMutation(id); return refreshRunJournals(); }
+  if(action==='export-evaluation') return downloadHarnessJson('sloplobster-evaluations.json',{benchmark:f.benchmark||HARNESS_DEFAULT_BENCHMARK,summary:HarnessCore.evaluationSummary(f.data.evaluations),results:f.data.evaluations});
 }

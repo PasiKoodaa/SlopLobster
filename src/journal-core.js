@@ -45,7 +45,7 @@
     for (const event of ordered) {
       const d = event.detail || {}, id = d.operationId;
       if (/\.(?:started|requested)$/.test(event.type) && id) pending.set(id, event);
-      if (/\.(?:completed|failed|decided|applied|rejected|cancelled|acknowledged)$/.test(event.type) && id) pending.delete(id);
+      if (/\.(?:completed|failed|decided|applied|rejected|cancelled|acknowledged|recovered|resolved)$/.test(event.type) && id) pending.delete(id);
       if (event.type === 'run.started' || event.type === 'run.resumed') phase = 'running';
       if (event.type === 'run.paused') phase = 'paused';
       if (event.type === 'run.finished') phase = 'finished';
